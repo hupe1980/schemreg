@@ -1,0 +1,40 @@
+# cargo-deny configuration for schemreg.
+#
+# Run: cargo deny check
+# Install: cargo install cargo-deny
+
+[advisories]
+# Deny all known vulnerabilities; list specific IDs to ignore intentional exceptions.
+ignore = []
+
+[licenses]
+# Approved SPDX licence identifiers.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "OpenSSL",
+    "CC0-1.0",
+    "Zlib",
+]
+
+[bans]
+# Warn on duplicate versions of the same crate; bump to "deny" when dependencies
+# are fully aligned.
+multiple-versions = "warn"
+# Prevent pulling in native OpenSSL — the crate uses rustls exclusively.
+deny = [
+    { name = "openssl", reason = "use rustls — openssl introduces native-library coupling and a larger attack surface" },
+    { name = "openssl-sys", reason = "use rustls — openssl introduces native-library coupling and a larger attack surface" },
+]
+
+[sources]
+# Only allow crates from crates.io; reject git or path dependencies in published builds.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

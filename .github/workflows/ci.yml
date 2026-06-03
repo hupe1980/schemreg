@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ── Format ───────────────────────────────────────────────────────────────
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  # ── Clippy ───────────────────────────────────────────────────────────────
+  clippy:
+    name: Clippy (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - features: "--all-features"
+          - features: "--no-default-features"
+          - features: "--features confluent"
+          - features: "--features glue"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy ${{ matrix.features }} -- -D warnings
+
+  # ── Security audit ───────────────────────────────────────────────────────
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit
+        run: cargo audit
+
+  # ── Tests ─────────────────────────────────────────────────────────────────
+  test:
+    name: Test / ${{ matrix.rust }} / ${{ matrix.features }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.88"]   # stable + MSRV
+        features:
+          - "--all-features"
+          - "--no-default-features"
+          - "--features confluent"
+          - "--features glue"
+          - "--features native-tls-roots"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust }}-${{ matrix.features }}
+      - name: cargo test
+        run: cargo test ${{ matrix.features }}
+      - name: cargo test --integration
+        run: |
+          cargo test ${{ matrix.features }} --test wire_format
+          cargo test ${{ matrix.features }} --test subject_strategy
+          cargo test ${{ matrix.features }} --test cache
+          cargo test ${{ matrix.features }} --test decoder
+
+  # ── Docs ──────────────────────────────────────────────────────────────────
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+
+  # ── Examples ─────────────────────────────────────────────────────────────
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build examples (no-default-features)
+        run: cargo build --examples --no-default-features
+      - name: Build examples (all-features)
+        run: cargo build --examples --all-features
+      - name: Run glue_roundtrip example
+        run: cargo run --example glue_roundtrip --features glue
+      - name: Run custom_backend example
+        run: cargo run --example custom_backend
+      - name: Run confluent_encode_decode example (confluent feature)
+        run: cargo run --example confluent_encode_decode --features confluent

@@ -1,0 +1,99 @@
+[package]
+name        = "schemreg"
+version     = "0.1.0"
+edition     = "2024"
+rust-version = "1.88"
+authors     = ["hupe1980"]
+description = "Async Confluent + AWS Glue schema registry client — wire format, traits, caching, HTTP"
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/hupe1980/schemreg"
+documentation = "https://docs.rs/schemreg"
+readme      = "README.md"
+keywords    = ["kafka", "schema-registry", "confluent", "avro", "glue"]
+categories  = ["encoding", "network-programming", "asynchronous"]
+
+[features]
+default          = []
+# Enable the built-in Confluent Schema Registry HTTP client, encoder, and decoder.
+confluent        = [
+    "dep:serde",
+    "dep:serde_json",
+    "dep:reqwest",
+    "dep:zeroize",
+    "dep:percent-encoding",
+    "dep:base64",
+]
+# Enable Avro serialisation + Confluent wire-format framing via apache-avro.
+# Pairs AvroSchemaEncoder / AvroSchemaDecoder with any SchemaRegistryClient.
+# Does NOT require the `confluent` feature — the Confluent wire codec is
+# always available and the encoder/decoder accept any SchemaRegistryClient impl.
+avro             = ["dep:apache-avro", "dep:serde"]
+# Enable the AWS Glue Schema Registry SDK client.
+# The Glue wire-format codec (18-byte header, ZLIB) and all Glue types are
+# always available without this feature. Only the AWS SDK client
+# (AwsGlueSchemaRegistry) and ZLIB compression require it.
+glue             = ["dep:aws-sdk-glue", "dep:aws-config", "dep:flate2"]
+# Add the platform-native root certificate store to the HTTPS trust anchors.
+native-tls-roots = ["confluent", "reqwest?/rustls-tls-native-roots"]
+# Use aws-lc-rs as the TLS crypto provider (replaces the default ring backend).
+# Requires the confluent feature.
+aws-lc-rs        = ["confluent", "reqwest?/rustls-tls-webpki-roots", "dep:aws-lc-rs"]
+
+[dependencies]
+# Async runtime
+tokio        = { version = "1", features = ["net", "io-util", "sync", "time"] }
+
+# Concurrent futures utilities (FuturesUnordered for parallel warm_cache)
+futures      = { version = "0.3", default-features = false, features = ["alloc"] }
+
+# Zero-copy buffers
+bytes        = "1"
+
+# Error handling
+thiserror    = "2"
+
+# Logging and tracing
+tracing      = "0.1"
+
+# Synchronization (non-poisoning RwLock)
+parking_lot  = "0.12"
+
+# avro feature
+apache-avro  = { version = "0.21", default-features = false, optional = true }
+
+# confluent + avro feature (serde is shared)
+serde        = { version = "1", features = ["derive"], optional = true }
+serde_json   = { version = "1", optional = true }
+reqwest      = { version = "0.12", features = ["rustls-tls-webpki-roots"], default-features = false, optional = true }
+zeroize      = { version = "1.8", features = ["derive"], optional = true }
+percent-encoding = { version = "2.3", optional = true }
+base64       = { version = "0.22", optional = true }
+aws-lc-rs    = { version = "1", optional = true, default-features = false }
+
+# glue feature
+aws-config   = { version = "1", optional = true, default-features = false,
+                 features = ["credentials-process", "default-https-client", "rt-tokio", "sso"] }
+aws-sdk-glue = { version = "1", optional = true, default-features = false,
+                 features = ["default-https-client", "rt-tokio"] }
+flate2       = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow       = "1"
+
+[[example]]
+name = "avro_roundtrip"
+required-features = ["avro"]
+
+[[example]]
+name = "glue_roundtrip"
+required-features = ["glue"]
+
+[[example]]
+name = "confluent_encode_decode"
+required-features = ["confluent"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
