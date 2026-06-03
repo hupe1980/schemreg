@@ -180,12 +180,12 @@ impl HttpClient {
         };
 
         // Reject oversized responses before buffering by checking Content-Length.
-        if let Some(len) = response.content_length() {
-            if len as usize > MAX_BODY_BYTES {
-                return Err(SchemaRegError::registry(format!(
-                    "response Content-Length ({len} bytes) exceeds the {MAX_BODY_BYTES}-byte limit"
-                )));
-            }
+        if let Some(len) = response.content_length()
+            && len as usize > MAX_BODY_BYTES
+        {
+            return Err(SchemaRegError::registry(format!(
+                "response Content-Length ({len} bytes) exceeds the {MAX_BODY_BYTES}-byte limit"
+            )));
         }
 
         // Stream body chunks. We bail out as soon as we exceed MAX_BODY_BYTES

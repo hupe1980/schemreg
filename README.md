@@ -1,4 +1,4 @@
-# schemreg
+# 🗂️ schemreg
 
 [![Crates.io](https://img.shields.io/crates/v/schemreg.svg)](https://crates.io/crates/schemreg)
 [![docs.rs](https://docs.rs/schemreg/badge.svg)](https://docs.rs/schemreg)
@@ -8,28 +8,29 @@
 
 Async schema registry client for **Confluent Schema Registry** (and Karapace / Apicurio) and **AWS Glue Schema Registry**, with:
 
-- Zero-copy wire-format encode / decode (Confluent 5-byte header, Glue 18-byte header)
-- Transparent in-memory caching with thundering-herd coalescing
-- Pluggable backend via the `SchemaRegistryClient` trait
-- Feature-gated: pull in only what you need
+- ⚡ Zero-copy wire-format encode / decode (Confluent 5-byte header, Glue 18-byte header)
+- 🚀 Transparent in-memory caching with thundering-herd coalescing
+- 🔌 Pluggable backend via the `SchemaRegistryClient` trait
+- 🎯 Feature-gated: pull in only what you need
 
 ---
 
-## Features
+## ✨ Features
 
 | Feature | Enables |
 |---|---|
-| *(none)* | Core types, wire format helpers, traits, Glue wire format |
-| `confluent` | Confluent HTTP client, encoder, decoder, TLS via rustls + webpki-roots |
-| `glue` | AWS Glue SDK client (`AwsGlueSchemaRegistry`), ZLIB compression via flate2 |
-| `native-tls-roots` | rustls-native-certs (implies `confluent`) |
-| `aws-lc-rs` | AWS LC crypto backend instead of ring (implies `confluent`) |
+| *(none)* | 🔧 Core types, wire format helpers, traits, Glue wire format |
+| `confluent` | 🌐 Confluent HTTP client, encoder, decoder, TLS via rustls + webpki-roots |
+| `glue` | ☁️ AWS Glue SDK client (`AwsGlueSchemaRegistry`), ZLIB compression via flate2 |
+| `avro` | 🪶 Avro encode / decode via apache-avro, works with any `SchemaRegistryClient` |
+| `native-tls-roots` | 🔒 rustls-native-certs (implies `confluent`) |
+| `aws-lc-rs` | 🔑 AWS LC crypto backend instead of ring (implies `confluent`) |
 
 ---
 
-## Quick start
+## 🚀 Quick start
 
-### Confluent Schema Registry
+### 🌐 Confluent Schema Registry
 
 ```toml
 # Cargo.toml
@@ -79,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### AWS Glue Schema Registry
+### ☁️ AWS Glue Schema Registry
 
 ```toml
 [dependencies]
@@ -121,9 +122,9 @@ let registry = AwsGlueSchemaRegistry::from_config(&config);
 
 ---
 
-## Wire formats
+## 🔬 Wire formats
 
-### Confluent Schema Registry
+### 🌐 Confluent Schema Registry
 
 ```
 Byte offset  0        1        2        3        4        5 …
@@ -133,7 +134,7 @@ Byte offset  0        1        2        3        4        5 …
              magic    │←──────── 4 bytes ──────────→│
 ```
 
-### AWS Glue Schema Registry
+### ☁️ AWS Glue Schema Registry
 
 ```
 Byte offset  0        1        2                   18        18 …
@@ -148,7 +149,7 @@ Byte offset  0        1        2                   18        18 …
 
 ---
 
-## Custom backend
+## 🔌 Custom backend
 
 Any struct that implements `SchemaRegistryClient` can be used as the backend:
 
@@ -185,7 +186,7 @@ See [`examples/custom_backend.rs`](examples/custom_backend.rs) for a full workin
 
 ---
 
-## Cache management
+## ⚡ Cache management
 
 `CachedSchemaRegistry` exposes the `AnySchemaCache` trait for lifecycle control:
 
@@ -208,7 +209,7 @@ cached.clear_cache();
 
 ---
 
-## Format-agnostic decoding
+## 🔍 Format-agnostic decoding
 
 `WireFormatDecoder` auto-detects the wire format and dispatches to the correct backend:
 
@@ -226,23 +227,25 @@ println!("payload: {} bytes", msg.payload.len());
 
 ---
 
-## Examples
+## 📖 Examples
 
 | Example | Description |
 |---|---|
-| [`confluent_encode_decode`](examples/confluent_encode_decode.rs) | Full encode→decode round-trip with an in-memory stub registry |
-| [`glue_roundtrip`](examples/glue_roundtrip.rs) | Glue wire format encode / decode, optional ZLIB compression |
-| [`custom_backend`](examples/custom_backend.rs) | Implementing `SchemaRegistryClient` + cache + WireFormatDecoder |
+| [`confluent_encode_decode`](examples/confluent_encode_decode.rs) | 🌐 Full encode→decode round-trip with an in-memory stub registry |
+| [`avro_roundtrip`](examples/avro_roundtrip.rs) | 🪶 End-to-end Avro encode → Confluent wire format → decode |
+| [`glue_roundtrip`](examples/glue_roundtrip.rs) | ☁️ Glue wire format encode / decode, optional ZLIB compression |
+| [`custom_backend`](examples/custom_backend.rs) | 🔌 Implementing `SchemaRegistryClient` + cache + WireFormatDecoder |
 
 ```bash
 cargo run --example confluent_encode_decode --features confluent
-cargo run --example glue_roundtrip
+cargo run --example avro_roundtrip --features avro
+cargo run --example glue_roundtrip --features glue
 cargo run --example custom_backend
 ```
 
 ---
 
-## License
+## 📄 License
 
 Licensed under either of:
 

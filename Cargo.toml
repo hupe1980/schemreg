@@ -71,10 +71,8 @@ base64       = { version = "0.22", optional = true }
 aws-lc-rs    = { version = "1", optional = true, default-features = false }
 
 # glue feature
-aws-config   = { version = "1", optional = true, default-features = false,
-                 features = ["credentials-process", "default-https-client", "rt-tokio", "sso"] }
-aws-sdk-glue = { version = "1", optional = true, default-features = false,
-                 features = ["default-https-client", "rt-tokio"] }
+aws-config   = { version = "1", optional = true, default-features = false, features = ["credentials-process", "default-https-client", "rt-tokio", "sso"] }
+aws-sdk-glue = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 flate2       = { version = "1", optional = true }
 
 [dev-dependencies]
