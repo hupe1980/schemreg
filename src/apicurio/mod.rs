@@ -60,16 +60,6 @@ impl ApicurioError {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct VersionMetaData {
-    global_id: i64,
-    artifact_type: String,
-    version: Option<serde_json::Value>, // string or integer depending on Apicurio version
-    group_id: Option<String>,
-    artifact_id: Option<String>,
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateArtifactRequest<'a> {
@@ -94,12 +84,6 @@ struct VersionContentRequest<'a> {
     references: Vec<ArtifactReferenceJson>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateVersionRequest<'a> {
-    content: VersionContentRequest<'a>,
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ArtifactReferenceJson {
@@ -119,7 +103,6 @@ struct CreateArtifactResponse {
 #[serde(rename_all = "camelCase")]
 struct CreateArtifactVersionInfo {
     global_id: i64,
-    version: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -132,7 +115,6 @@ struct ArtifactVersionList {
 #[serde(rename_all = "camelCase")]
 struct ArtifactVersionSummary {
     version: Option<serde_json::Value>,
-    global_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -586,10 +568,10 @@ impl ApicurioSchemaRegistry {
         let list: ArtifactVersionList = self.get_json(&url).await?;
         let mut versions = Vec::with_capacity(list.versions.len());
         for v in list.versions {
-            if let Some(ver_val) = v.version {
-                if let Some(sv) = Self::parse_version(&ver_val) {
-                    versions.push(sv);
-                }
+            if let Some(ver_val) = v.version
+                && let Some(sv) = Self::parse_version(&ver_val)
+            {
+                versions.push(sv);
             }
         }
         Ok(versions)
@@ -653,18 +635,16 @@ impl SchemaRegistryClient for ApicurioSchemaRegistry {
         self.check_compatibility_impl(subject, schema, schema_type, references)
     }
 
-    fn delete_subject<'a>(
+    async fn delete_subject<'a>(
         &'a self,
         subject: &'a str,
         _permanent: bool,
-    ) -> impl std::future::Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
+    ) -> Result<Vec<SchemaVersion>> {
         // Apicurio v3 DELETE /groups/{groupId}/artifacts/{artifactId} is always
         // a permanent delete. The `permanent` flag is not applicable; we treat
         // both modes as a hard delete and return an empty version list.
-        async move {
-            self.delete_artifact(subject).await?;
-            Ok(Vec::new())
-        }
+        self.delete_artifact(subject).await?;
+        Ok(Vec::new())
     }
 
     fn get_subjects(&self) -> impl std::future::Future<Output = Result<Vec<String>>> + Send + '_ {

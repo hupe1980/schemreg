@@ -33,6 +33,8 @@ pub(crate) struct HttpResponse {
     /// Server-dictated retry delay in milliseconds (from a `Retry-After` header).
     pub retry_after_ms: Option<u64>,
     /// All response headers, with names lowercased for case-insensitive lookup.
+    /// Only populated when the `apicurio` feature is enabled.
+    #[cfg(feature = "apicurio")]
     pub headers: HashMap<String, String>,
 }
 
@@ -213,6 +215,7 @@ impl HttpClient {
 
         // Capture all response headers (lowercase names) for consumers like Apicurio
         // that return schema metadata in `X-Registry-*` headers.
+        #[cfg(feature = "apicurio")]
         let headers: HashMap<String, String> = response
             .headers()
             .iter()
@@ -260,6 +263,7 @@ impl HttpClient {
             content_type,
             body: buf.freeze(),
             retry_after_ms,
+            #[cfg(feature = "apicurio")]
             headers,
         })
     }

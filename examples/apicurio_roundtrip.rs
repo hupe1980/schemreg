@@ -10,10 +10,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU32, Ordering},
-};
+use std::sync::{Arc, Mutex};
 
 use schemreg::apicurio::ApicurioSchemaRegistry;
 use schemreg::error::{Result, SchemaRegError};
@@ -150,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
 
     match registry_result {
         Ok(r) => println!("Client built: {r:?}"),
-        Err(e) => println!("Expected build failure (no server): {e}"),
+        Err(e) => println!("Build error (e.g. invalid URL): {e}"),
     }
 
     // ── Use mock registry for encode/decode roundtrip ─────────────────────────

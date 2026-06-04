@@ -76,6 +76,10 @@ use crate::traits::SchemaRegistryClient;
 use crate::types::{EncodeTarget, SchemaId, SchemaReference, SchemaType};
 use crate::wire::{decode_wire_format_bytes, encode_wire_format};
 
+// ── Type aliases ──────────────────────────────────────────────────────────
+
+type InFlightMap = Mutex<HashMap<String, Vec<oneshot::Sender<Result<Arc<EncoderEntry>>>>>>;
+
 // ── Schema helpers ────────────────────────────────────────────────────────
 
 /// Parse an Avro schema JSON string, mapping `apache_avro::Error` to
@@ -135,7 +139,7 @@ pub struct AvroSchemaEncoder<C> {
     /// `subject → (schema_id, parsed schema)` — populated lazily on first use.
     cache: RwLock<HashMap<String, Arc<EncoderEntry>>>,
     /// In-flight coalescing: subjects currently being registered.
-    in_flight: Mutex<HashMap<String, Vec<oneshot::Sender<Result<Arc<EncoderEntry>>>>>>,
+    in_flight: InFlightMap,
 }
 
 impl<C: SchemaRegistryClient> AvroSchemaEncoder<C> {
@@ -180,7 +184,7 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoder<C> {
 
         // We are the leader. Use a drop-guard to cancel waiters on panic/cancellation.
         struct ResolveGuard<'a> {
-            in_flight: &'a Mutex<HashMap<String, Vec<oneshot::Sender<Result<Arc<EncoderEntry>>>>>>,
+            in_flight: &'a InFlightMap,
             subject: &'a str,
             done: bool,
         }

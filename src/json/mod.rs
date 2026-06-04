@@ -79,6 +79,10 @@ use crate::traits::SchemaRegistryClient;
 use crate::types::{EncodeTarget, SchemaId, SchemaReference, SchemaType};
 use crate::wire::{decode_wire_format_bytes, encode_wire_format};
 
+// ── Type aliases ──────────────────────────────────────────────────────────
+
+type InFlightMap = Mutex<HashMap<String, Vec<oneshot::Sender<Result<Arc<EncoderEntry>>>>>>;
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 /// Compile a JSON Schema string into a [`Validator`].
@@ -154,7 +158,7 @@ pub struct JsonSchemaEncoder<C> {
     /// `subject → (schema_id, compiled validator)` — populated lazily.
     cache: RwLock<HashMap<String, Arc<EncoderEntry>>>,
     /// In-flight coalescing: subjects currently being registered.
-    in_flight: Mutex<HashMap<String, Vec<oneshot::Sender<Result<Arc<EncoderEntry>>>>>>,
+    in_flight: InFlightMap,
 }
 
 impl<C: std::fmt::Debug> std::fmt::Debug for JsonSchemaEncoder<C> {
@@ -221,7 +225,7 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoder<C> {
 
         // We are the leader. Use a drop-guard to cancel waiters on panic/cancellation.
         struct ResolveGuard<'a> {
-            in_flight: &'a Mutex<HashMap<String, Vec<oneshot::Sender<Result<Arc<EncoderEntry>>>>>>,
+            in_flight: &'a InFlightMap,
             subject: String,
             done: bool,
         }

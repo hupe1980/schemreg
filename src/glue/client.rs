@@ -77,7 +77,7 @@ impl AwsGlueSchemaRegistry {
                 .schema_version_id(schema_version_id)
                 .send()
                 .await
-                .map_err(|e| crate::error::SchemaRegError::network(e))?;
+                .map_err(crate::error::SchemaRegError::network)?;
 
             match response.status() {
                 Some(aws_sdk_glue::types::SchemaVersionStatus::Available) => {
@@ -157,7 +157,7 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
             .schema_version_id(&id_str)
             .send()
             .await
-            .map_err(|e| crate::error::SchemaRegError::network(e))?;
+            .map_err(crate::error::SchemaRegError::network)?;
 
         let data_format = response
             .data_format()

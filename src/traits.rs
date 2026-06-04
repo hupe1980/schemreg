@@ -19,6 +19,56 @@ use crate::types::{EncodeTarget, Schema, SchemaId, SchemaReference, SchemaType, 
 /// All methods use `async fn` (RPITIT), allowing zero-cost monomorphization at
 /// generic call sites. Object-safe erased wrappers are used internally where
 /// dynamic dispatch is needed (e.g. [`WireFormatDecoder`](crate::WireFormatDecoder)).
+///
+/// # Implementing a custom backend
+///
+/// ```rust
+/// use std::sync::Arc;
+/// use schemreg::{Schema, SchemaId, SchemaReference, SchemaRegistryClient, SchemaType, SchemaVersion};
+/// use schemreg::error::{Result, SchemaRegError};
+///
+/// struct InMemoryRegistry;
+///
+/// impl SchemaRegistryClient for InMemoryRegistry {
+///     async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> {
+///         Err(SchemaRegError::invalid_state(format!("schema {id} not found")))
+///     }
+///     async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
+///         Err(SchemaRegError::invalid_state(format!("subject {subject} not found")))
+///     }
+///     async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Arc<Schema>> {
+///         Err(SchemaRegError::invalid_state(format!("{subject}@{version} not found")))
+///     }
+///     async fn register_schema(
+///         &self, _subject: &str, _schema: &str,
+///         _schema_type: SchemaType, _references: &[SchemaReference],
+///     ) -> Result<SchemaId> {
+///         Ok(SchemaId::from(1u32))
+///     }
+/// }
+/// ```
+///
+/// # Wrapping with a cache
+///
+/// Any `SchemaRegistryClient` implementation can be transparently wrapped with
+/// [`CachedSchemaRegistry`](crate::CachedSchemaRegistry) for in-memory caching
+/// with thundering-herd coalescing:
+///
+/// ```rust
+/// use std::sync::Arc;
+/// use schemreg::CachedSchemaRegistry;
+/// # use schemreg::{Schema, SchemaId, SchemaReference, SchemaRegistryClient, SchemaType, SchemaVersion};
+/// # use schemreg::error::{Result, SchemaRegError};
+/// # struct InMemoryRegistry;
+/// # impl SchemaRegistryClient for InMemoryRegistry {
+/// #     async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> { Err(SchemaRegError::invalid_state("")) }
+/// #     async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> { Err(SchemaRegError::invalid_state("")) }
+/// #     async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Arc<Schema>> { Err(SchemaRegError::invalid_state("")) }
+/// #     async fn register_schema(&self, _: &str, _: &str, _: SchemaType, _: &[SchemaReference]) -> Result<SchemaId> { Ok(SchemaId::from(1u32)) }
+/// # }
+///
+/// let cached = Arc::new(CachedSchemaRegistry::new(InMemoryRegistry));
+/// ```
 pub trait SchemaRegistryClient: Send + Sync {
     /// Retrieve a schema by its globally unique ID.
     ///

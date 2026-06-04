@@ -487,7 +487,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             .await
     }
 
-    /// Invalidate all cached schemas whose `subject` field matches `name`.
+    /// Invalidate all cached schemas whose `subject` field matches `subject`.
     ///
     /// Performs an O(n) scan of the cache. For typical caches holding a
     /// few hundred schemas this is fast. The invalidation bumps the
