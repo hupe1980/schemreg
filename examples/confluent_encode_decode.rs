@@ -64,24 +64,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .read()
                 .get(&id)
                 .map(|s| Arc::new(s.clone()))
-                .ok_or_else(|| SchemaRegError::registry(format!("schema {id} not found")))
+                .ok_or_else(|| SchemaRegError::invalid_state(format!("schema {id} not found")))
         }
 
-        async fn get_latest_schema(&self, subject: &str) -> schemreg::error::Result<Schema> {
+        async fn get_latest_schema(&self, subject: &str) -> schemreg::error::Result<Arc<Schema>> {
             let id = self
                 .by_subject
                 .read()
                 .get(subject)
                 .copied()
-                .ok_or_else(|| SchemaRegError::registry(format!("subject {subject} not found")))?;
-            Ok((*self.get_schema_by_id(id).await?).clone())
+                .ok_or_else(|| {
+                    SchemaRegError::invalid_state(format!("subject {subject} not found"))
+                })?;
+            self.get_schema_by_id(id).await
         }
 
         async fn get_schema_by_version(
             &self,
             subject: &str,
             _version: schemreg::SchemaVersion,
-        ) -> schemreg::error::Result<Schema> {
+        ) -> schemreg::error::Result<Arc<Schema>> {
             self.get_latest_schema(subject).await
         }
 
@@ -149,7 +151,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let framed = encoder
-        .encode(raw_payload.clone(), topic, None, false)
+        .encode(
+            raw_payload.clone(),
+            topic,
+            None,
+            schemreg::EncodeTarget::Value,
+        )
         .await?;
     let schema_id = u32::from_be_bytes([framed[1], framed[2], framed[3], framed[4]]);
     println!(
@@ -176,7 +183,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 7. Second encode reuses cached schema ID ──────────────────────────
 
     let framed2 = encoder
-        .encode(raw_payload.clone(), topic, None, false)
+        .encode(
+            raw_payload.clone(),
+            topic,
+            None,
+            schemreg::EncodeTarget::Value,
+        )
         .await?;
     assert_eq!(framed, framed2, "same schema ID must be reused");
     println!("Schema ID cached - no extra registry call.");

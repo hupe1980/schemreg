@@ -1,6 +1,6 @@
 [package]
 name        = "schemreg"
-version     = "0.1.0"
+version     = "0.2.0"
 edition     = "2024"
 rust-version = "1.88"
 authors     = ["hupe1980"]
@@ -38,13 +38,28 @@ native-tls-roots = ["confluent", "reqwest?/rustls-tls-native-roots"]
 # Use aws-lc-rs as the TLS crypto provider (replaces the default ring backend).
 # Requires the confluent feature.
 aws-lc-rs        = ["confluent", "reqwest?/rustls-tls-webpki-roots", "dep:aws-lc-rs"]
+# Enable JSON Schema encode/decode + Confluent wire-format framing.
+# Uses jsonschema (draft 2020-12) for schema validation and serde_json for
+# serialisation. Pairs JsonSchemaEncoder / JsonSchemaDecoder with any
+# SchemaRegistryClient impl. Does NOT require the `confluent` feature.
+json             = ["dep:jsonschema", "dep:serde", "dep:serde_json"]
+# Enable the native Apicurio Registry v3 HTTP client.
+# Uses the /apis/registry/v3/ REST API endpoints directly (group + artifact ID
+# address model). Supports Avro, JSON Schema, and Protobuf artifact types.
+# Does NOT require the `confluent` feature.
+apicurio         = [
+    "dep:serde",
+    "dep:serde_json",
+    "dep:reqwest",
+    "dep:zeroize",
+    "dep:percent-encoding",
+    "dep:base64",
+]
 
 [dependencies]
 # Async runtime
 tokio        = { version = "1", features = ["net", "io-util", "sync", "time"] }
 
-# Concurrent futures utilities (FuturesUnordered for parallel warm_cache)
-futures      = { version = "0.3", default-features = false, features = ["alloc"] }
 
 # Zero-copy buffers
 bytes        = "1"
@@ -74,6 +89,7 @@ aws-lc-rs    = { version = "1", optional = true, default-features = false }
 aws-config   = { version = "1", optional = true, default-features = false, features = ["credentials-process", "default-https-client", "rt-tokio", "sso"] }
 aws-sdk-glue = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 flate2       = { version = "1", optional = true }
+jsonschema = { version = "0.46.5", optional = true, default-features = false }
 
 [dev-dependencies]
 tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -85,12 +101,19 @@ name = "avro_roundtrip"
 required-features = ["avro"]
 
 [[example]]
+name = "json_roundtrip"
+required-features = ["json"]
+
+[[example]]
 name = "glue_roundtrip"
 required-features = ["glue"]
 
 [[example]]
+name = "apicurio_roundtrip"
+required-features = ["apicurio"]
+
+[[example]]
 name = "confluent_encode_decode"
-required-features = ["confluent"]
 
 [package.metadata.docs.rs]
 all-features = true

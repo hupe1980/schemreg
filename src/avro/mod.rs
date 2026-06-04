@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.1", features = ["avro"] }
+//! schemreg = { version = "0.2", features = ["avro"] }
 //! ```
 //!
 //! # Layered model
@@ -66,13 +66,14 @@ use std::sync::Arc;
 use apache_avro::Schema as AvroSchema;
 use apache_avro::types::Value;
 use bytes::Bytes;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
 use crate::error::{Result, SchemaRegError};
 use crate::subject::SubjectNameStrategy;
 use crate::traits::SchemaRegistryClient;
-use crate::types::{SchemaId, SchemaReference, SchemaType};
+use crate::types::{EncodeTarget, SchemaId, SchemaReference, SchemaType};
 use crate::wire::{decode_wire_format_bytes, encode_wire_format};
 
 // ── Schema helpers ────────────────────────────────────────────────────────
@@ -133,6 +134,8 @@ pub struct AvroSchemaEncoder<C> {
     references: Vec<SchemaReference>,
     /// `subject → (schema_id, parsed schema)` — populated lazily on first use.
     cache: RwLock<HashMap<String, Arc<EncoderEntry>>>,
+    /// In-flight coalescing: subjects currently being registered.
+    in_flight: Mutex<HashMap<String, Vec<oneshot::Sender<Result<Arc<EncoderEntry>>>>>>,
 }
 
 impl<C: SchemaRegistryClient> AvroSchemaEncoder<C> {
@@ -142,13 +145,69 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoder<C> {
     }
 
     /// Resolve subject → schema ID, registering if not already cached.
+    ///
+    /// Uses the same coalescing pattern as [`ConfluentSchemaEncoder`]: concurrent
+    /// callers for the same subject coalesce behind a single leader registration,
+    /// preventing duplicate schema-register RPCs under high concurrency.
     async fn resolve_subject(&self, subject: &str) -> Result<Arc<EncoderEntry>> {
         // Fast path: already cached.
         if let Some(entry) = self.cache.read().get(subject) {
             return Ok(Arc::clone(entry));
         }
-        // Slow path: register with the registry.
-        let schema_id = self
+
+        // Slow path: coalescing lock.
+        let waiter_rx = {
+            let mut in_flight = self.in_flight.lock();
+            // Double-check after acquiring the lock.
+            if let Some(entry) = self.cache.read().get(subject) {
+                return Ok(Arc::clone(entry));
+            }
+            if let Some(waiters) = in_flight.get_mut(subject) {
+                let (tx, rx) = oneshot::channel();
+                waiters.push(tx);
+                Some(rx)
+            } else {
+                in_flight.insert(subject.to_string(), Vec::new());
+                None
+            }
+        };
+
+        if let Some(rx) = waiter_rx {
+            return rx.await.map_err(|_| {
+                SchemaRegError::invalid_state("schema entry resolution cancelled by the leader")
+            })?;
+        }
+
+        // We are the leader. Use a drop-guard to cancel waiters on panic/cancellation.
+        struct ResolveGuard<'a> {
+            in_flight: &'a Mutex<HashMap<String, Vec<oneshot::Sender<Result<Arc<EncoderEntry>>>>>>,
+            subject: &'a str,
+            done: bool,
+        }
+        impl Drop for ResolveGuard<'_> {
+            fn drop(&mut self) {
+                if !self.done {
+                    let waiters = self
+                        .in_flight
+                        .lock()
+                        .remove(self.subject)
+                        .unwrap_or_default();
+                    for tx in waiters {
+                        let _ = tx.send(Err(SchemaRegError::invalid_state(
+                            "Avro schema entry resolution cancelled",
+                        )));
+                    }
+                }
+            }
+        }
+
+        let mut guard = ResolveGuard {
+            in_flight: &self.in_flight,
+            subject,
+            done: false,
+        };
+
+        let result = self
             .registry
             .register_schema(
                 subject,
@@ -156,15 +215,35 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoder<C> {
                 SchemaType::Avro,
                 &self.references,
             )
-            .await?;
-        let entry = Arc::new(EncoderEntry {
-            schema_id,
-            avro_schema: Arc::clone(&self.avro_schema),
-        });
-        self.cache
-            .write()
-            .insert(subject.to_string(), Arc::clone(&entry));
-        Ok(entry)
+            .await
+            .map(|schema_id| {
+                Arc::new(EncoderEntry {
+                    schema_id,
+                    avro_schema: Arc::clone(&self.avro_schema),
+                })
+            });
+
+        let waiters = self.in_flight.lock().remove(subject).unwrap_or_default();
+
+        match &result {
+            Ok(entry) => {
+                self.cache
+                    .write()
+                    .insert(subject.to_string(), Arc::clone(entry));
+                for tx in waiters {
+                    let _ = tx.send(Ok(Arc::clone(entry)));
+                }
+            }
+            Err(e) => {
+                let cloned = e.clone();
+                for tx in waiters {
+                    let _ = tx.send(Err(cloned.clone()));
+                }
+            }
+        }
+
+        guard.done = true;
+        result
     }
 
     /// Serialise `value` to Confluent-framed Avro bytes.
@@ -174,13 +253,13 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoder<C> {
     /// Returns an error if:
     /// - The subject cannot be resolved (registry error or configuration error).
     /// - `value` does not conform to the Avro schema.
-    pub async fn encode(&self, value: Value, topic: &str, is_key: bool) -> Result<Bytes> {
+    pub async fn encode(&self, value: Value, topic: &str, target: EncodeTarget) -> Result<Bytes> {
         let subject = self
             .strategy
-            .subject_name(topic, self.schema_fullname.as_deref(), is_key)?;
+            .subject_name(topic, self.schema_fullname.as_deref(), target)?;
         let entry = self.resolve_subject(&subject).await?;
         let raw = apache_avro::to_avro_datum(&entry.avro_schema, value)
-            .map_err(|e| SchemaRegError::registry(format!("Avro serialization failed: {e}")))?;
+            .map_err(|e| SchemaRegError::wire_format(format!("Avro serialization failed: {e}")))?;
         Ok(encode_wire_format(entry.schema_id, &raw))
     }
 
@@ -197,12 +276,12 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoder<C> {
         &self,
         value: &T,
         topic: &str,
-        is_key: bool,
+        target: EncodeTarget,
     ) -> Result<Bytes> {
         let av_value = apache_avro::to_value(value).map_err(|e| {
-            SchemaRegError::registry(format!("failed to convert value to Avro: {e}"))
+            SchemaRegError::wire_format(format!("failed to convert value to Avro: {e}"))
         })?;
-        self.encode(av_value, topic, is_key).await
+        self.encode(av_value, topic, target).await
     }
 }
 
@@ -281,6 +360,7 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoderBuilder<C> {
             strategy: self.strategy,
             references: self.references,
             cache: RwLock::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -339,7 +419,9 @@ impl<C: SchemaRegistryClient> AvroSchemaDecoder<C> {
         let (schema_id, payload) = decode_wire_format_bytes(&data)?;
         let avro_schema = self.get_avro_schema(schema_id).await?;
         let value = apache_avro::from_avro_datum(&avro_schema, &mut payload.as_ref(), None)
-            .map_err(|e| SchemaRegError::registry(format!("Avro deserialization failed: {e}")))?;
+            .map_err(|e| {
+                SchemaRegError::wire_format(format!("Avro deserialization failed: {e}"))
+            })?;
         Ok(value)
     }
 
@@ -355,7 +437,7 @@ impl<C: SchemaRegistryClient> AvroSchemaDecoder<C> {
     pub async fn decode_de<T: for<'de> Deserialize<'de>>(&self, data: Bytes) -> Result<T> {
         let value = self.decode(data).await?;
         apache_avro::from_value::<T>(&value).map_err(|e| {
-            SchemaRegError::registry(format!(
+            SchemaRegError::wire_format(format!(
                 "failed to deserialize Avro value into target type: {e}"
             ))
         })

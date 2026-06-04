@@ -84,24 +84,30 @@ impl SchemaRegistryClient for InMemorySchemaBackend {
         self.by_id
             .get(&id)
             .map(|s| Arc::new(s.clone()))
-            .ok_or_else(|| SchemaRegError::registry(format!("schema {id} not found")))
+            .ok_or_else(|| SchemaRegError::invalid_state(format!("schema {id} not found")))
     }
 
-    async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
+    async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
         self.by_id
             .values()
             .find(|s| s.subject.as_deref() == Some(subject))
             .cloned()
-            .ok_or_else(|| SchemaRegError::registry(format!("subject {subject} not found")))
+            .map(Arc::new)
+            .ok_or_else(|| SchemaRegError::invalid_state(format!("subject {subject} not found")))
     }
 
-    async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Schema> {
+    async fn get_schema_by_version(
+        &self,
+        subject: &str,
+        version: SchemaVersion,
+    ) -> Result<Arc<Schema>> {
         self.by_id
             .values()
             .find(|s| s.subject.as_deref() == Some(subject) && s.version == Some(version))
             .cloned()
+            .map(Arc::new)
             .ok_or_else(|| {
-                SchemaRegError::registry(format!("subject {subject} v{version} not found"))
+                SchemaRegError::invalid_state(format!("subject {subject} v{version} not found"))
             })
     }
 
@@ -113,7 +119,7 @@ impl SchemaRegistryClient for InMemorySchemaBackend {
         _references: &[SchemaReference],
     ) -> Result<SchemaId> {
         // Read-only backend for this example.
-        Err(SchemaRegError::registry(
+        Err(SchemaRegError::invalid_state(
             "InMemorySchemaBackend: register_schema not implemented",
         ))
     }
@@ -173,7 +179,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         SubjectNameStrategy::RecordName,
         SubjectNameStrategy::TopicRecordName,
     ] {
-        if let Ok(subject) = strategy.subject_name(topic, Some(record), false) {
+        if let Ok(subject) =
+            strategy.subject_name(topic, Some(record), schemreg::EncodeTarget::Value)
+        {
             println!("  {strategy:>25?} -> {subject}");
         }
     }

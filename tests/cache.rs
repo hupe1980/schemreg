@@ -62,28 +62,36 @@ impl SchemaRegistryClient for MockRegistry {
         self.schemas
             .get(&id)
             .map(|s| Arc::new(s.clone()))
-            .ok_or_else(|| schemreg::SchemaRegError::registry(format!("schema {id} not found")))
+            .ok_or_else(|| {
+                schemreg::SchemaRegError::invalid_state(format!("schema {id} not found"))
+            })
     }
 
-    async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
+    async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         self.schemas
             .values()
             .find(|s| s.subject.as_deref() == Some(subject))
             .cloned()
+            .map(Arc::new)
             .ok_or_else(|| {
-                schemreg::SchemaRegError::registry(format!("subject {subject} not found"))
+                schemreg::SchemaRegError::invalid_state(format!("subject {subject} not found"))
             })
     }
 
-    async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Schema> {
+    async fn get_schema_by_version(
+        &self,
+        subject: &str,
+        version: SchemaVersion,
+    ) -> Result<Arc<Schema>> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         self.schemas
             .values()
             .find(|s| s.subject.as_deref() == Some(subject) && s.version == Some(version))
             .cloned()
+            .map(Arc::new)
             .ok_or_else(|| {
-                schemreg::SchemaRegError::registry(format!(
+                schemreg::SchemaRegError::invalid_state(format!(
                     "subject {subject} v{} not found",
                     version.as_i32()
                 ))
@@ -304,7 +312,7 @@ async fn concurrent_cold_miss_single_backend_call() {
             Ok(Arc::new(avro_schema(id.as_u32())))
         }
 
-        async fn get_latest_schema(&self, _subject: &str) -> Result<Schema> {
+        async fn get_latest_schema(&self, _subject: &str) -> Result<Arc<Schema>> {
             unimplemented!()
         }
 
@@ -312,7 +320,7 @@ async fn concurrent_cold_miss_single_backend_call() {
             &self,
             _subject: &str,
             _version: SchemaVersion,
-        ) -> Result<Schema> {
+        ) -> Result<Arc<Schema>> {
             unimplemented!()
         }
 
@@ -398,7 +406,7 @@ async fn cached_delegates_get_latest_schema() {
 
     // get_latest_schema always goes to backend but caches by ID.
     let schema2 = cached.get_schema_by_id(SchemaId::from(5u32)).await.unwrap();
-    assert_eq!(schema, *schema2);
+    assert_eq!(*schema, *schema2);
     // Two backend calls: 1 for get_latest_schema, 0 for get_by_id (cache hit).
     assert_eq!(cached.inner().calls(), 1);
 }
@@ -441,7 +449,7 @@ async fn aborted_leader_unblocks_waiters_with_error() {
             Ok(Arc::new(avro_schema(id.as_u32())))
         }
 
-        async fn get_latest_schema(&self, _subject: &str) -> schemreg::error::Result<Schema> {
+        async fn get_latest_schema(&self, _subject: &str) -> schemreg::error::Result<Arc<Schema>> {
             unimplemented!()
         }
 
@@ -449,7 +457,7 @@ async fn aborted_leader_unblocks_waiters_with_error() {
             &self,
             _subject: &str,
             _version: SchemaVersion,
-        ) -> schemreg::error::Result<Schema> {
+        ) -> schemreg::error::Result<Arc<Schema>> {
             unimplemented!()
         }
 
@@ -496,16 +504,20 @@ async fn aborted_leader_unblocks_waiters_with_error() {
     let _ = leader.await; // JoinError::Cancelled — expected
 
     // Waiters must NOT hang; they should either succeed (if the cache retried)
-    // or return an Err. Under the current implementation they get an Err
+    // or return a schema error. Under the current implementation they get an Err
     // because the in-flight slot is torn down when the leader is dropped.
-    // Either outcome is acceptable; what is NOT acceptable is a hang or panic.
-    let results: Vec<_> = futures::future::join_all(waiter_handles).await;
+    // Either outcome is acceptable; what is NOT acceptable is a hang or a panic.
+    let results =
+        tokio::task::JoinSet::from_iter(waiter_handles.into_iter().map(|h| async move { h.await }))
+            .join_all()
+            .await;
 
-    for r in results {
-        // JoinError means the task itself panicked — that is always a bug.
-        assert!(
-            !r.is_err() || r.unwrap_err().is_panic(),
-            "waiter task must not panic"
-        );
+    for join_result in results {
+        // A JoinError only wraps a panic — that is always a bug.
+        match join_result {
+            Err(e) => panic!("waiter task panicked: {e}"),
+            // The inner Result<Arc<Schema>, _> can be Ok or Err — both are fine.
+            Ok(_inner) => {}
+        }
     }
 }

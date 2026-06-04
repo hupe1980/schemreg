@@ -99,6 +99,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     match detected {
         schemreg::DetectedWireFormat::Glue {
             version_id: vid,
+            compression: _,
             payload_offset,
         } => {
             assert_eq!(vid, version_id);

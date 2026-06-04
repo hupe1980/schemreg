@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 use crate::error::{Result, SchemaRegError};
 use crate::subject::SubjectNameStrategy;
 use crate::traits::{SchemaEncoder, SchemaRegistryClient};
-use crate::types::{SchemaId, SchemaReference, SchemaType};
+use crate::types::{EncodeTarget, SchemaId, SchemaReference, SchemaType};
 use crate::wire::{encode_protobuf_wire_format, encode_wire_format};
 
 /// A [`SchemaEncoder`] that registers schemas with a Confluent-compatible
@@ -126,6 +126,15 @@ impl<C: SchemaRegistryClient> ConfluentSchemaEncoder<C> {
         guard.done = true;
         result
     }
+
+    /// Return the cached schema ID for the given subject, if already resolved.
+    ///
+    /// Returns `None` if the subject has not yet been encoded against (schema
+    /// registration deferred until first [`encode`](crate::SchemaEncoder::encode)
+    /// call).
+    pub fn cached_schema_id(&self, subject: &str) -> Option<SchemaId> {
+        self.id_cache.read().get(subject).copied()
+    }
 }
 
 impl<C: SchemaRegistryClient> fmt::Debug for ConfluentSchemaEncoder<C> {
@@ -144,21 +153,15 @@ impl<C: SchemaRegistryClient> SchemaEncoder for ConfluentSchemaEncoder<C> {
         payload: Bytes,
         topic: &str,
         record_name: Option<&str>,
-        is_key: bool,
+        target: EncodeTarget,
     ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
         let topic = topic.to_string();
         let record_name = record_name.map(str::to_string);
         Box::pin(async move {
             let subject = self
                 .strategy
-                .subject_name(&topic, record_name.as_deref(), is_key)?;
+                .subject_name(&topic, record_name.as_deref(), target)?;
             let id = self.resolve_id(&subject).await?;
-            // Protobuf payloads require a message-index array between the
-            // 5-byte header and the serialized bytes. Use index [0] (the
-            // top-level first message type) which covers the overwhelming
-            // majority of real-world schemas. Callers with nested or
-            // non-zero-indexed messages should pre-frame their bytes with
-            // `encode_protobuf_wire_format` directly.
             let framed = if self.schema_type == SchemaType::Protobuf {
                 encode_protobuf_wire_format(id, &self.protobuf_message_indexes, &payload)
             } else {

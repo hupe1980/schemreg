@@ -33,6 +33,9 @@ jobs:
           - features: "--no-default-features"
           - features: "--features confluent"
           - features: "--features glue"
+          - features: "--features avro"
+          - features: "--features json"
+          - features: "--features apicurio"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,6 +43,19 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy ${{ matrix.features }} -- -D warnings
+
+  # ── Dependency policy ────────────────────────────────────────────────────
+  deny:
+    name: Dependency Policy (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Run cargo deny check
+        run: cargo deny check
 
   # ── Security audit ───────────────────────────────────────────────────────
   audit:
@@ -67,6 +83,9 @@ jobs:
           - "--no-default-features"
           - "--features confluent"
           - "--features glue"
+          - "--features avro"
+          - "--features json"
+          - "--features apicurio"
           - "--features native-tls-roots"
     steps:
       - uses: actions/checkout@v4
@@ -111,5 +130,5 @@ jobs:
         run: cargo run --example glue_roundtrip --features glue
       - name: Run custom_backend example
         run: cargo run --example custom_backend
-      - name: Run confluent_encode_decode example (confluent feature)
-        run: cargo run --example confluent_encode_decode --features confluent
+      - name: Run apicurio_roundtrip example
+        run: cargo run --example apicurio_roundtrip --features apicurio

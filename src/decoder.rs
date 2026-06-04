@@ -203,7 +203,7 @@ impl WireFormatDecoder {
                 payload_offset,
             } => {
                 let Some(client) = self.confluent.as_deref() else {
-                    return Err(SchemaRegError::registry(
+                    return Err(SchemaRegError::invalid_state(
                         "Confluent-framed message received but no Confluent registry backend is configured",
                     ));
                 };
@@ -233,28 +233,38 @@ impl WireFormatDecoder {
             #[cfg(feature = "glue")]
             DetectedWireFormat::Glue {
                 version_id,
+                compression,
                 payload_offset,
             } => {
                 let Some(client) = self.glue.as_deref() else {
-                    return Err(SchemaRegError::registry(
+                    return Err(SchemaRegError::invalid_state(
                         "Glue-framed message received but no Glue registry backend is configured",
                     ));
                 };
 
-                let raw_payload = data.slice(payload_offset..);
+                // Decompress according to the header byte (F-01 fix).
+                let raw = &data[payload_offset..];
+                let payload = match compression {
+                    crate::glue::GlueCompression::None => data.slice(payload_offset..),
+                    crate::glue::GlueCompression::Zlib => {
+                        let decompressed = crate::glue::decompress_zlib(raw)?;
+                        bytes::Bytes::from(decompressed)
+                    }
+                };
+
                 let schema = client.get_schema_by_version_id(version_id).await?;
                 let schema_format = SchemaFormat::from(schema.data_format);
 
                 Ok(DecodedMessage {
                     schema_format,
-                    payload: raw_payload,
+                    payload,
                     schema_metadata: Some(SchemaMetadata::Glue(schema)),
                     protobuf_message_indexes: None,
                 })
             }
 
             #[cfg(not(feature = "glue"))]
-            DetectedWireFormat::Glue { .. } => Err(SchemaRegError::registry(
+            DetectedWireFormat::Glue { .. } => Err(SchemaRegError::not_supported(
                 "Glue-framed message received but schemreg was compiled without the `glue` feature",
             )),
 
@@ -306,26 +316,30 @@ mod tests {
             )))
         }
 
-        async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
-            Ok(Schema::new(
-                SchemaId::from(1u32),
-                SchemaType::Avro,
-                r#"{"type":"string"}"#,
-            )
-            .with_subject(subject, 1i32))
+        async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
+            Ok(Arc::new(
+                Schema::new(
+                    SchemaId::from(1u32),
+                    SchemaType::Avro,
+                    r#"{"type":"string"}"#,
+                )
+                .with_subject(subject, 1i32),
+            ))
         }
 
         async fn get_schema_by_version(
             &self,
             subject: &str,
             version: crate::types::SchemaVersion,
-        ) -> Result<Schema> {
-            Ok(Schema::new(
-                SchemaId::from(1u32),
-                SchemaType::Avro,
-                r#"{"type":"string"}"#,
-            )
-            .with_subject(subject, version))
+        ) -> Result<Arc<Schema>> {
+            Ok(Arc::new(
+                Schema::new(
+                    SchemaId::from(1u32),
+                    SchemaType::Avro,
+                    r#"{"type":"string"}"#,
+                )
+                .with_subject(subject, version),
+            ))
         }
 
         async fn register_schema(
@@ -412,19 +426,21 @@ mod tests {
                 "syntax=\"proto3\"; message Foo {}",
             )))
         }
-        async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
-            Ok(Schema::new(SchemaId::from(1u32), SchemaType::Protobuf, "")
-                .with_subject(subject, 1i32))
+        async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
+            Ok(Arc::new(
+                Schema::new(SchemaId::from(1u32), SchemaType::Protobuf, "")
+                    .with_subject(subject, 1i32),
+            ))
         }
         async fn get_schema_by_version(
             &self,
             subject: &str,
             v: crate::types::SchemaVersion,
-        ) -> Result<Schema> {
-            Ok(
+        ) -> Result<Arc<Schema>> {
+            Ok(Arc::new(
                 Schema::new(SchemaId::from(1u32), SchemaType::Protobuf, "")
                     .with_subject(subject, v),
-            )
+            ))
         }
         async fn register_schema(
             &self,

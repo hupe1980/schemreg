@@ -24,7 +24,7 @@ fn default_is_topic_name() {
 #[test]
 fn topic_name_value() {
     let s = SubjectNameStrategy::TopicName
-        .subject_name("orders", None, false)
+        .subject_name("orders", None, schemreg::EncodeTarget::Value)
         .unwrap();
     assert_eq!(s, "orders-value");
 }
@@ -32,7 +32,7 @@ fn topic_name_value() {
 #[test]
 fn topic_name_key() {
     let s = SubjectNameStrategy::TopicName
-        .subject_name("orders", None, true)
+        .subject_name("orders", None, schemreg::EncodeTarget::Key)
         .unwrap();
     assert_eq!(s, "orders-key");
 }
@@ -41,7 +41,11 @@ fn topic_name_key() {
 fn topic_name_ignores_record_name() {
     // record_name is irrelevant for TopicName — it must not be used.
     let s = SubjectNameStrategy::TopicName
-        .subject_name("orders", Some("com.example.Order"), false)
+        .subject_name(
+            "orders",
+            Some("com.example.Order"),
+            schemreg::EncodeTarget::Value,
+        )
         .unwrap();
     assert_eq!(s, "orders-value");
 }
@@ -49,7 +53,7 @@ fn topic_name_ignores_record_name() {
 #[test]
 fn topic_name_hyphenated_topic() {
     let s = SubjectNameStrategy::TopicName
-        .subject_name("my-service-events", None, false)
+        .subject_name("my-service-events", None, schemreg::EncodeTarget::Value)
         .unwrap();
     assert_eq!(s, "my-service-events-value");
 }
@@ -57,7 +61,7 @@ fn topic_name_hyphenated_topic() {
 #[test]
 fn topic_name_dotted_topic() {
     let s = SubjectNameStrategy::TopicName
-        .subject_name("org.company.orders", None, true)
+        .subject_name("org.company.orders", None, schemreg::EncodeTarget::Key)
         .unwrap();
     assert_eq!(s, "org.company.orders-key");
 }
@@ -66,7 +70,7 @@ fn topic_name_dotted_topic() {
 fn topic_name_empty_topic() {
     // Empty topic is unusual but should produce "-value" / "-key".
     let s = SubjectNameStrategy::TopicName
-        .subject_name("", None, false)
+        .subject_name("", None, schemreg::EncodeTarget::Value)
         .unwrap();
     assert_eq!(s, "-value");
 }
@@ -76,7 +80,11 @@ fn topic_name_empty_topic() {
 #[test]
 fn record_name_uses_record() {
     let s = SubjectNameStrategy::RecordName
-        .subject_name("orders", Some("com.example.Order"), false)
+        .subject_name(
+            "orders",
+            Some("com.example.Order"),
+            schemreg::EncodeTarget::Value,
+        )
         .unwrap();
     assert_eq!(s, "com.example.Order");
 }
@@ -85,10 +93,10 @@ fn record_name_uses_record() {
 fn record_name_ignores_key_flag() {
     // key/value distinction is irrelevant for RecordName.
     let key = SubjectNameStrategy::RecordName
-        .subject_name("orders", Some("Order"), true)
+        .subject_name("orders", Some("Order"), schemreg::EncodeTarget::Key)
         .unwrap();
     let val = SubjectNameStrategy::RecordName
-        .subject_name("orders", Some("Order"), false)
+        .subject_name("orders", Some("Order"), schemreg::EncodeTarget::Value)
         .unwrap();
     assert_eq!(key, val);
 }
@@ -96,10 +104,10 @@ fn record_name_ignores_key_flag() {
 #[test]
 fn record_name_ignores_topic() {
     let a = SubjectNameStrategy::RecordName
-        .subject_name("topic-a", Some("MyRecord"), false)
+        .subject_name("topic-a", Some("MyRecord"), schemreg::EncodeTarget::Value)
         .unwrap();
     let b = SubjectNameStrategy::RecordName
-        .subject_name("topic-b", Some("MyRecord"), false)
+        .subject_name("topic-b", Some("MyRecord"), schemreg::EncodeTarget::Value)
         .unwrap();
     assert_eq!(a, b, "subject must not depend on topic for RecordName");
 }
@@ -107,7 +115,7 @@ fn record_name_ignores_topic() {
 #[test]
 fn record_name_missing_record_name_is_error() {
     let err = SubjectNameStrategy::RecordName
-        .subject_name("orders", None, false)
+        .subject_name("orders", None, schemreg::EncodeTarget::Value)
         .unwrap_err();
     let msg = err.to_string();
     assert!(
@@ -121,7 +129,7 @@ fn record_name_missing_record_name_is_error() {
 #[test]
 fn topic_record_name_combines_both() {
     let s = SubjectNameStrategy::TopicRecordName
-        .subject_name("orders", Some("Order"), false)
+        .subject_name("orders", Some("Order"), schemreg::EncodeTarget::Value)
         .unwrap();
     assert_eq!(s, "orders-Order");
 }
@@ -130,10 +138,10 @@ fn topic_record_name_combines_both() {
 fn topic_record_name_key_flag_does_not_affect_subject() {
     // key/value is irrelevant for TopicRecordName.
     let key = SubjectNameStrategy::TopicRecordName
-        .subject_name("orders", Some("Order"), true)
+        .subject_name("orders", Some("Order"), schemreg::EncodeTarget::Key)
         .unwrap();
     let val = SubjectNameStrategy::TopicRecordName
-        .subject_name("orders", Some("Order"), false)
+        .subject_name("orders", Some("Order"), schemreg::EncodeTarget::Value)
         .unwrap();
     assert_eq!(key, val);
 }
@@ -141,7 +149,11 @@ fn topic_record_name_key_flag_does_not_affect_subject() {
 #[test]
 fn topic_record_name_fully_qualified() {
     let s = SubjectNameStrategy::TopicRecordName
-        .subject_name("payments", Some("com.example.Payment"), false)
+        .subject_name(
+            "payments",
+            Some("com.example.Payment"),
+            schemreg::EncodeTarget::Value,
+        )
         .unwrap();
     assert_eq!(s, "payments-com.example.Payment");
 }
@@ -149,7 +161,7 @@ fn topic_record_name_fully_qualified() {
 #[test]
 fn topic_record_name_missing_record_name_is_error() {
     let err = SubjectNameStrategy::TopicRecordName
-        .subject_name("orders", None, false)
+        .subject_name("orders", None, schemreg::EncodeTarget::Value)
         .unwrap_err();
     let msg = err.to_string();
     assert!(
@@ -163,7 +175,7 @@ fn topic_record_name_missing_record_name_is_error() {
 #[test]
 fn topic_name_unicode_topic() {
     let s = SubjectNameStrategy::TopicName
-        .subject_name("eventos-pédidos", None, false)
+        .subject_name("eventos-pédidos", None, schemreg::EncodeTarget::Value)
         .unwrap();
     assert_eq!(s, "eventos-pédidos-value");
 }
@@ -171,7 +183,7 @@ fn topic_name_unicode_topic() {
 #[test]
 fn record_name_unicode_record() {
     let s = SubjectNameStrategy::RecordName
-        .subject_name("t", Some("Événement"), false)
+        .subject_name("t", Some("Événement"), schemreg::EncodeTarget::Value)
         .unwrap();
     assert_eq!(s, "Événement");
 }
@@ -182,8 +194,12 @@ fn record_name_unicode_record() {
 fn strategy_is_clone() {
     let s = SubjectNameStrategy::TopicName;
     let copy = s.clone();
-    let _ = s.subject_name("t", None, false).unwrap();
-    let _ = copy.subject_name("t", None, false).unwrap();
+    let _ = s
+        .subject_name("t", None, schemreg::EncodeTarget::Value)
+        .unwrap();
+    let _ = copy
+        .subject_name("t", None, schemreg::EncodeTarget::Value)
+        .unwrap();
 }
 
 #[test]

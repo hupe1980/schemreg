@@ -226,6 +226,7 @@ fn glue_roundtrip_nil_uuid() {
         detected,
         DetectedWireFormat::Glue {
             version_id: nil,
+            compression: GlueCompression::None,
             payload_offset: 18
         }
     );
@@ -263,6 +264,7 @@ fn detect_glue_happy() {
         detect_wire_format(&framed),
         DetectedWireFormat::Glue {
             version_id: id,
+            compression: GlueCompression::None,
             payload_offset: 18
         }
     );

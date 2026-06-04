@@ -77,24 +77,19 @@ impl AwsGlueSchemaRegistry {
                 .schema_version_id(schema_version_id)
                 .send()
                 .await
-                .map_err(|e| {
-                    crate::error::SchemaRegError::registry_with_source(
-                        "failed to get schema version status",
-                        e,
-                    )
-                })?;
+                .map_err(|e| crate::error::SchemaRegError::network(e))?;
 
             match response.status() {
                 Some(aws_sdk_glue::types::SchemaVersionStatus::Available) => {
                     return Ok(response);
                 }
                 Some(aws_sdk_glue::types::SchemaVersionStatus::Failure) => {
-                    return Err(crate::error::SchemaRegError::registry(
+                    return Err(crate::error::SchemaRegError::invalid_state(
                         "schema version registration failed (status: FAILURE)",
                     ));
                 }
                 Some(aws_sdk_glue::types::SchemaVersionStatus::Deleting) => {
-                    return Err(crate::error::SchemaRegError::registry(
+                    return Err(crate::error::SchemaRegError::invalid_state(
                         "schema version is being deleted",
                     ));
                 }
@@ -105,7 +100,7 @@ impl AwsGlueSchemaRegistry {
                 }
             }
         }
-        Err(crate::error::SchemaRegError::registry(format!(
+        Err(crate::error::SchemaRegError::invalid_state(format!(
             "schema version did not reach AVAILABLE status after {} attempts",
             self.poll_max_attempts
         )))
@@ -116,7 +111,7 @@ impl AwsGlueSchemaRegistry {
             aws_sdk_glue::types::DataFormat::Avro => Ok(GlueDataFormat::Avro),
             aws_sdk_glue::types::DataFormat::Json => Ok(GlueDataFormat::Json),
             aws_sdk_glue::types::DataFormat::Protobuf => Ok(GlueDataFormat::Protobuf),
-            other => Err(crate::error::SchemaRegError::registry(format!(
+            other => Err(crate::error::SchemaRegError::invalid_state(format!(
                 "unsupported Glue data format: {other}"
             ))),
         }
@@ -132,7 +127,7 @@ impl AwsGlueSchemaRegistry {
 
     fn parse_version_id(s: &str) -> Result<GlueSchemaVersionId> {
         s.parse::<GlueSchemaVersionId>().map_err(|e| {
-            crate::error::SchemaRegError::registry(format!(
+            crate::error::SchemaRegError::invalid_state(format!(
                 "invalid schema version ID from registry: {e}"
             ))
         })
@@ -162,17 +157,12 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
             .schema_version_id(&id_str)
             .send()
             .await
-            .map_err(|e| {
-                crate::error::SchemaRegError::registry_with_source(
-                    "failed to get schema version",
-                    e,
-                )
-            })?;
+            .map_err(|e| crate::error::SchemaRegError::network(e))?;
 
         let data_format = response
             .data_format()
             .ok_or_else(|| {
-                crate::error::SchemaRegError::registry(
+                crate::error::SchemaRegError::invalid_state(
                     "schema version response missing data_format",
                 )
             })
@@ -181,7 +171,7 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
         let schema_definition = response
             .schema_definition()
             .ok_or_else(|| {
-                crate::error::SchemaRegError::registry(
+                crate::error::SchemaRegError::invalid_state(
                     "schema version response missing schema_definition",
                 )
             })?
@@ -237,7 +227,7 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
         match register_result {
             Ok(response) => {
                 let version_id_str = response.schema_version_id().ok_or_else(|| {
-                    crate::error::SchemaRegError::registry(
+                    crate::error::SchemaRegError::invalid_state(
                         "register response missing schema_version_id",
                     )
                 })?;
@@ -245,11 +235,7 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
             }
             Err(register_err) => {
                 if !self.auto_register {
-                    return Err(crate::error::SchemaRegError::registry_with_source(
-                        "failed to register schema version (schema may not exist, \
-                         enable auto_register to create it)",
-                        register_err,
-                    ));
+                    return Err(crate::error::SchemaRegError::network(register_err));
                 }
 
                 // Auto-register — create the schema (first version).
@@ -271,7 +257,7 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
                 match create_result {
                     Ok(response) => {
                         let version_id_str = response.schema_version_id().ok_or_else(|| {
-                            crate::error::SchemaRegError::registry(
+                            crate::error::SchemaRegError::invalid_state(
                                 "create schema response missing schema_version_id",
                             )
                         })?;
@@ -286,14 +272,14 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
                             .send()
                             .await
                             .map_err(|e| {
-                                crate::error::SchemaRegError::registry(format!(
+                                crate::error::SchemaRegError::invalid_state(format!(
                                     "failed to register schema version \
                                      (create also failed: {create_err}): {e}"
                                 ))
                             })?;
 
                         let version_id_str = fallback.schema_version_id().ok_or_else(|| {
-                            crate::error::SchemaRegError::registry(
+                            crate::error::SchemaRegError::invalid_state(
                                 "register response missing schema_version_id",
                             )
                         })?;

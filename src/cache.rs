@@ -33,6 +33,34 @@ fn schema_lookup_cancelled_error(id: SchemaId) -> SchemaRegError {
     ))
 }
 
+/// Error returned when [`CachedSchemaRegistry::warm_cache`] fails to load one
+/// or more schema IDs.
+///
+/// Successfully fetched IDs **are** cached; only the failures are listed here.
+/// Callers can inspect [`failures`](WarmCacheError::failures) to decide
+/// whether to retry individual IDs or abort.
+#[derive(Debug, Clone)]
+pub struct WarmCacheError {
+    /// The IDs that could not be fetched, along with the per-ID error.
+    pub failures: Vec<(SchemaId, SchemaRegError)>,
+}
+
+impl fmt::Display for WarmCacheError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "warm_cache failed for {} schema ID(s):",
+            self.failures.len()
+        )?;
+        for (id, e) in &self.failures {
+            write!(f, " id {id}: {e};")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for WarmCacheError {}
+
 /// Caching wrapper around any [`SchemaRegistryClient`].
 ///
 /// Caches schema-ID-to-schema lookups in memory. Because a schema ID is
@@ -189,29 +217,36 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         self.clear_cache();
     }
 
-    /// Pre-fetch a set of schema IDs into the cache in parallel.
+    /// Pre-fetch a set of schema IDs into the cache.
     ///
-    /// All IDs are fetched concurrently via the coalescing layer; duplicate
-    /// IDs are deduplicated automatically.
+    /// Duplicate IDs are deduplicated automatically. Each ID is fetched
+    /// sequentially through the coalescing layer; this guarantees that no
+    /// duplicate backend requests are issued even under concurrent callers.
+    ///
+    /// Unlike the original `futures::FuturesUnordered`-based implementation,
+    /// this version does **not** fail fast: all IDs are attempted and the full
+    /// list of failures is returned as a [`WarmCacheError`]. IDs that load
+    /// successfully are available in the cache even when some IDs fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WarmCacheError`] when one or more IDs could not be fetched.
     pub async fn warm_cache(
         &self,
         schema_ids: impl IntoIterator<Item = impl Into<SchemaId>>,
-    ) -> Result<()> {
-        use futures::StreamExt as _;
-        let unique: Vec<SchemaId> = schema_ids
-            .into_iter()
-            .map(Into::into)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let mut futs: futures::stream::FuturesUnordered<_> = unique
-            .into_iter()
-            .map(|id| self.get_schema_by_id_impl(id))
-            .collect();
-        while let Some(result) = futs.next().await {
-            result?;
+    ) -> std::result::Result<(), WarmCacheError> {
+        let unique: HashSet<SchemaId> = schema_ids.into_iter().map(Into::into).collect();
+        let mut failures: Vec<(SchemaId, SchemaRegError)> = Vec::new();
+        for id in unique {
+            if let Err(e) = self.get_schema_by_id_impl(id).await {
+                failures.push((id, e));
+            }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WarmCacheError { failures })
+        }
     }
 
     async fn get_schema_by_id_impl(&self, id: SchemaId) -> Result<Arc<Schema>> {
@@ -370,22 +405,30 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         arc_result
     }
 
-    async fn get_latest_schema_impl(&self, subject: &str) -> Result<Schema> {
+    async fn get_latest_schema_impl(&self, subject: &str) -> Result<Arc<Schema>> {
         let observed_generation = self.invalidation_generation.load(Ordering::SeqCst);
-        let schema = self.inner.get_latest_schema(subject).await?;
-        self.insert_cache_entry_if_current(schema.id, schema.clone(), observed_generation);
-        Ok(schema)
+        let arc_schema = self.inner.get_latest_schema(subject).await?;
+        self.insert_cache_entry_if_current(
+            arc_schema.id,
+            Arc::clone(&arc_schema),
+            observed_generation,
+        );
+        Ok(arc_schema)
     }
 
     async fn get_schema_by_version_impl(
         &self,
         subject: &str,
         version: SchemaVersion,
-    ) -> Result<Schema> {
+    ) -> Result<Arc<Schema>> {
         let observed_generation = self.invalidation_generation.load(Ordering::SeqCst);
-        let schema = self.inner.get_schema_by_version(subject, version).await?;
-        self.insert_cache_entry_if_current(schema.id, schema.clone(), observed_generation);
-        Ok(schema)
+        let arc_schema = self.inner.get_schema_by_version(subject, version).await?;
+        self.insert_cache_entry_if_current(
+            arc_schema.id,
+            Arc::clone(&arc_schema),
+            observed_generation,
+        );
+        Ok(arc_schema)
     }
 
     async fn register_schema_impl(
@@ -413,7 +456,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
     ///
     /// This inherent method mirrors [`SchemaRegistryClient::get_latest_schema`]
     /// so callers of `CachedSchemaRegistry` do not need to import the trait.
-    pub async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
+    pub async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
         self.get_latest_schema_impl(subject).await
     }
 
@@ -425,7 +468,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         &self,
         subject: &str,
         version: SchemaVersion,
-    ) -> Result<Schema> {
+    ) -> Result<Arc<Schema>> {
         self.get_schema_by_version_impl(subject, version).await
     }
 
@@ -444,16 +487,49 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             .await
     }
 
-    fn insert_cache_entry(&self, id: SchemaId, schema: Schema) {
+    /// Invalidate all cached schemas whose `subject` field matches `name`.
+    ///
+    /// Performs an O(n) scan of the cache. For typical caches holding a
+    /// few hundred schemas this is fast. The invalidation bumps the
+    /// generation counter and cancels any in-flight fetches for matched IDs.
+    pub fn invalidate_subject(&self, subject: &str) {
+        let ids: Vec<SchemaId> = self
+            .cache
+            .read()
+            .iter()
+            .filter(|(_, s)| s.subject.as_deref() == Some(subject))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.invalidate(id);
+        }
+    }
+
+    fn insert_cache_entry_if_current(
+        &self,
+        id: SchemaId,
+        schema: Arc<Schema>,
+        observed_generation: u64,
+    ) {
+        // Acquire write lock first, then re-check the generation inside it to
+        // close the TOCTOU window that existed when the check was done outside.
         let mut cache = self.cache.write();
 
-        // Fast path: update existing entry without touching insertion_order.
-        if let Some(existing) = cache.get_mut(&id) {
-            *existing = Arc::new(schema);
+        if self.invalidation_generation.load(Ordering::SeqCst) != observed_generation {
+            debug!(
+                schema_id = id.as_u32(),
+                "schema fetch completed after invalidation; skipping cache insert"
+            );
             return;
         }
 
-        // New entry: evict oldest if bounded.
+        // Fast path: update existing entry.
+        if let Some(existing) = cache.get_mut(&id) {
+            *existing = schema;
+            return;
+        }
+
+        // New entry with optional LRU-style eviction.
         if let Some(max_entries) = self.max_entries {
             let mut insertion_order = self.insertion_order.write();
             if cache.len() >= max_entries
@@ -463,25 +539,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             }
             insertion_order.push_back(id);
         }
-
-        cache.insert(id, Arc::new(schema));
-    }
-
-    fn insert_cache_entry_if_current(
-        &self,
-        id: SchemaId,
-        schema: Schema,
-        observed_generation: u64,
-    ) {
-        if self.invalidation_generation.load(Ordering::SeqCst) != observed_generation {
-            debug!(
-                schema_id = id.as_u32(),
-                "schema fetch completed after invalidation; skipping cache insert"
-            );
-            return;
-        }
-
-        self.insert_cache_entry(id, schema);
+        cache.insert(id, schema);
     }
 }
 
@@ -499,11 +557,15 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
         self.get_schema_by_id_impl(id).await
     }
 
-    async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
+    async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
         self.get_latest_schema_impl(subject).await
     }
 
-    async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Schema> {
+    async fn get_schema_by_version(
+        &self,
+        subject: &str,
+        version: SchemaVersion,
+    ) -> Result<Arc<Schema>> {
         self.get_schema_by_version_impl(subject, version).await
     }
 
@@ -576,7 +638,11 @@ impl<C: SchemaRegistryClient> AnySchemaCache for CachedSchemaRegistry<C> {
         &'a self,
         ids: &'a [Self::Id],
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move { Self::warm_cache(self, ids.iter().copied()).await })
+        Box::pin(async move {
+            Self::warm_cache(self, ids.iter().copied())
+                .await
+                .map_err(|e| SchemaRegError::invalid_state(e.to_string()))
+        })
     }
 }
 
@@ -630,26 +696,30 @@ mod tests {
             )))
         }
 
-        async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
-            Ok(Schema::new(
-                SchemaId::from(100u32),
-                crate::types::SchemaType::Avro,
-                r#"{"type":"string"}"#,
-            )
-            .with_subject(subject, 1i32))
+        async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
+            Ok(Arc::new(
+                Schema::new(
+                    SchemaId::from(100u32),
+                    crate::types::SchemaType::Avro,
+                    r#"{"type":"string"}"#,
+                )
+                .with_subject(subject, 1i32),
+            ))
         }
 
         async fn get_schema_by_version(
             &self,
             subject: &str,
             version: SchemaVersion,
-        ) -> Result<Schema> {
-            Ok(Schema::new(
-                SchemaId::from(100u32),
-                crate::types::SchemaType::Avro,
-                r#"{"type":"string"}"#,
-            )
-            .with_subject(subject, version))
+        ) -> Result<Arc<Schema>> {
+            Ok(Arc::new(
+                Schema::new(
+                    SchemaId::from(100u32),
+                    crate::types::SchemaType::Avro,
+                    r#"{"type":"string"}"#,
+                )
+                .with_subject(subject, version),
+            ))
         }
 
         async fn register_schema(
@@ -723,7 +793,7 @@ mod tests {
             )))
         }
 
-        async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
+        async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
             self.get_latest_calls.fetch_add(1, AtomicOrdering::SeqCst);
             self.started.notify_waiters();
             self.waiting_calls.fetch_add(1, AtomicOrdering::SeqCst);
@@ -732,19 +802,21 @@ mod tests {
                 .acquire()
                 .await
                 .expect("blocking registry release permit");
-            Ok(Schema::new(
-                SchemaId::from(100u32),
-                crate::types::SchemaType::Avro,
-                r#"{"type":"string"}"#,
-            )
-            .with_subject(subject, 1i32))
+            Ok(Arc::new(
+                Schema::new(
+                    SchemaId::from(100u32),
+                    crate::types::SchemaType::Avro,
+                    r#"{"type":"string"}"#,
+                )
+                .with_subject(subject, 1i32),
+            ))
         }
 
         async fn get_schema_by_version(
             &self,
             subject: &str,
             version: SchemaVersion,
-        ) -> Result<Schema> {
+        ) -> Result<Arc<Schema>> {
             self.get_by_version_calls
                 .fetch_add(1, AtomicOrdering::SeqCst);
             self.started.notify_waiters();
@@ -754,12 +826,14 @@ mod tests {
                 .acquire()
                 .await
                 .expect("blocking registry release permit");
-            Ok(Schema::new(
-                SchemaId::from(100u32),
-                crate::types::SchemaType::Avro,
-                r#"{"type":"string"}"#,
-            )
-            .with_subject(subject, version))
+            Ok(Arc::new(
+                Schema::new(
+                    SchemaId::from(100u32),
+                    crate::types::SchemaType::Avro,
+                    r#"{"type":"string"}"#,
+                )
+                .with_subject(subject, version),
+            ))
         }
 
         async fn register_schema(
