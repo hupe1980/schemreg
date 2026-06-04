@@ -35,7 +35,7 @@ impl SchemaRegistryClient for MockConfluentRegistry {
         Ok(Arc::new(self.schema.clone()))
     }
 
-    async fn get_latest_schema(&self, _subject: &str) -> Result<Schema> {
+    async fn get_latest_schema(&self, _subject: &str) -> Result<Arc<Schema>> {
         unimplemented!()
     }
 
@@ -43,7 +43,7 @@ impl SchemaRegistryClient for MockConfluentRegistry {
         &self,
         _subject: &str,
         _version: SchemaVersion,
-    ) -> Result<Schema> {
+    ) -> Result<Arc<Schema>> {
         unimplemented!()
     }
 

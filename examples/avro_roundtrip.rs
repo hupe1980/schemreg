@@ -15,7 +15,7 @@ use bytes::Bytes;
 use schemreg::avro::{AvroSchemaDecoder, AvroSchemaEncoder};
 use schemreg::traits::SchemaRegistryClient;
 use schemreg::types::{Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion};
-use schemreg::{Result, SchemaRegError};
+use schemreg::{EncodeTarget, Result, SchemaRegError};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -42,10 +42,10 @@ impl SchemaRegistryClient for MockRegistry {
             .schemas
             .get(&id)
             .map(|def| Arc::new(Schema::new(id, SchemaType::Avro, def.clone())))
-            .ok_or_else(|| SchemaRegError::registry(format!("schema {id} not found")))
+            .ok_or_else(|| SchemaRegError::invalid_state(format!("schema {id} not found")))
     }
 
-    async fn get_latest_schema(&self, _subject: &str) -> Result<Schema> {
+    async fn get_latest_schema(&self, _subject: &str) -> Result<Arc<Schema>> {
         Err(SchemaRegError::not_supported("not implemented in mock"))
     }
 
@@ -53,7 +53,7 @@ impl SchemaRegistryClient for MockRegistry {
         &self,
         _subject: &str,
         _version: SchemaVersion,
-    ) -> Result<Schema> {
+    ) -> Result<Arc<Schema>> {
         Err(SchemaRegError::not_supported("not implemented in mock"))
     }
 
@@ -107,7 +107,9 @@ async fn main() -> anyhow::Result<()> {
     ]);
 
     println!("Encoding: {original:?}");
-    let framed: Bytes = encoder.encode(original.clone(), "orders", false).await?;
+    let framed: Bytes = encoder
+        .encode(original.clone(), "orders", EncodeTarget::Value)
+        .await?;
     println!(
         "Framed bytes ({} total): magic={:#04x} schema_id={}",
         framed.len(),
@@ -144,7 +146,9 @@ async fn main() -> anyhow::Result<()> {
         item: "Gadget".into(),
         amount: 49.95,
     };
-    let framed2 = encoder2.encode_ser(&order, "orders", false).await?;
+    let framed2 = encoder2
+        .encode_ser(&order, "orders", EncodeTarget::Value)
+        .await?;
 
     let decoder2 = AvroSchemaDecoder::new(registry2);
     let roundtripped: OrderSerde = decoder2.decode_de(framed2).await?;

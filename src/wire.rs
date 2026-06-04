@@ -45,7 +45,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use crate::error::{Result, SchemaRegError};
 use crate::glue::{
     GLUE_COMPRESSION_NONE_BYTE, GLUE_COMPRESSION_ZLIB_BYTE, GLUE_HEADER_SIZE,
-    GLUE_HEADER_VERSION_BYTE, GlueSchemaVersionId,
+    GLUE_HEADER_VERSION_BYTE, GlueCompression, GlueSchemaVersionId,
 };
 use crate::types::SchemaId;
 
@@ -347,6 +347,8 @@ pub enum DetectedWireFormat {
     Glue {
         /// Glue schema version UUID.
         version_id: GlueSchemaVersionId,
+        /// Compression algorithm indicated in the header byte.
+        compression: GlueCompression,
         /// Offset where payload bytes start.
         payload_offset: usize,
     },
@@ -407,10 +409,16 @@ pub fn detect_wire_format(data: &[u8]) -> DetectedWireFormat {
                 return DetectedWireFormat::InvalidGlue;
             }
 
+            let compression = if compression == GLUE_COMPRESSION_NONE_BYTE {
+                GlueCompression::None
+            } else {
+                GlueCompression::Zlib
+            };
             let mut version_bytes = [0u8; 16];
             version_bytes.copy_from_slice(&data[2..GLUE_HEADER_SIZE]);
             DetectedWireFormat::Glue {
                 version_id: GlueSchemaVersionId::from_bytes(version_bytes),
+                compression,
                 payload_offset: GLUE_HEADER_SIZE,
             }
         }

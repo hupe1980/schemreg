@@ -6,7 +6,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![MSRV: 1.88](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://releases.rs/docs/1.88.0/)
 
-Async schema registry client for **Confluent Schema Registry** (and Karapace / Apicurio) and **AWS Glue Schema Registry**, with:
+Async schema registry client for **Confluent Schema Registry** (and Karapace), **Apicurio Registry v3**, and **AWS Glue Schema Registry**, with:
 
 - ⚡ Zero-copy wire-format encode / decode (Confluent 5-byte header, Glue 18-byte header)
 - 🚀 Transparent in-memory caching with thundering-herd coalescing
@@ -21,8 +21,10 @@ Async schema registry client for **Confluent Schema Registry** (and Karapace / A
 |---|---|
 | *(none)* | 🔧 Core types, wire format helpers, traits, Glue wire format |
 | `confluent` | 🌐 Confluent HTTP client, encoder, decoder, TLS via rustls + webpki-roots |
+| `apicurio` | 🗂️ Native Apicurio Registry v3 HTTP client (`ApicurioSchemaRegistry`) |
 | `glue` | ☁️ AWS Glue SDK client (`AwsGlueSchemaRegistry`), ZLIB compression via flate2 |
 | `avro` | 🪶 Avro encode / decode via apache-avro, works with any `SchemaRegistryClient` |
+| `json` | 📋 JSON Schema encode / decode, works with any `SchemaRegistryClient` |
 | `native-tls-roots` | 🔒 rustls-native-certs (implies `confluent`) |
 | `aws-lc-rs` | 🔑 AWS LC crypto backend instead of ring (implies `confluent`) |
 
@@ -35,7 +37,7 @@ Async schema registry client for **Confluent Schema Registry** (and Karapace / A
 ```toml
 # Cargo.toml
 [dependencies]
-schemreg = { version = "0.1", features = ["confluent"] }
+schemreg = { version = "0.2", features = ["confluent"] }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 ```
@@ -84,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-schemreg = { version = "0.1", features = ["glue"] }
+schemreg = { version = "0.2", features = ["glue"] }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 ```
@@ -154,19 +156,20 @@ Byte offset  0        1        2                   18        18 …
 Any struct that implements `SchemaRegistryClient` can be used as the backend:
 
 ```rust
+use std::sync::Arc;
 use schemreg::{Schema, SchemaId, SchemaReference, SchemaRegistryClient, SchemaType, SchemaVersion};
 use schemreg::error::Result;
 
 struct MyRegistry { /* ... */ }
 
 impl SchemaRegistryClient for MyRegistry {
-    async fn get_schema_by_id(&self, id: SchemaId) -> Result<Schema> {
+    async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> {
         todo!()
     }
-    async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
+    async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
         todo!()
     }
-    async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Schema> {
+    async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Arc<Schema>> {
         todo!()
     }
     async fn register_schema(
@@ -235,12 +238,14 @@ println!("payload: {} bytes", msg.payload.len());
 | [`avro_roundtrip`](examples/avro_roundtrip.rs) | 🪶 End-to-end Avro encode → Confluent wire format → decode |
 | [`glue_roundtrip`](examples/glue_roundtrip.rs) | ☁️ Glue wire format encode / decode, optional ZLIB compression |
 | [`custom_backend`](examples/custom_backend.rs) | 🔌 Implementing `SchemaRegistryClient` + cache + WireFormatDecoder |
+| [`apicurio_roundtrip`](examples/apicurio_roundtrip.rs) | 🗂️ Apicurio Registry v3 encode→decode round-trip with a mock registry |
 
 ```bash
 cargo run --example confluent_encode_decode --features confluent
 cargo run --example avro_roundtrip --features avro
 cargo run --example glue_roundtrip --features glue
 cargo run --example custom_backend
+cargo run --example apicurio_roundtrip --features apicurio
 ```
 
 ---

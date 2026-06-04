@@ -1,5 +1,7 @@
-//! Async HTTP client backed by [`reqwest`].
+//! Shared async HTTP client used by Confluent and Apicurio registry connectors.
 
+#[cfg(feature = "apicurio")]
+use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -31,6 +33,10 @@ pub(crate) struct HttpResponse {
     pub body: Bytes,
     /// Server-dictated retry delay in milliseconds (from a `Retry-After` header).
     pub retry_after_ms: Option<u64>,
+    /// All response headers, with names lowercased for case-insensitive lookup.
+    /// Only populated when the `apicurio` feature is enabled.
+    #[cfg(feature = "apicurio")]
+    pub headers: HashMap<String, String>,
 }
 
 /// Returns `true` if the HTTP status code warrants a retry.
@@ -39,7 +45,20 @@ fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
 }
 
-/// Async HTTP client used by the Confluent Schema Registry connector.
+/// Configuration for building an [`HttpClient`].
+///
+/// Used by [`HttpClient::with_config`]. Extend this struct when new connection
+/// options are needed so call sites only need to set the fields they care about.
+pub(crate) struct HttpClientConfig {
+    /// Request timeout (applies to the entire request including redirect follows).
+    pub timeout: Option<Duration>,
+    /// Additional root CA certificates to trust (e.g. private CA bundles).
+    pub root_certificates: Vec<reqwest::Certificate>,
+    /// Client identity for mutual TLS (mTLS).
+    pub identity: Option<reqwest::Identity>,
+}
+
+/// Async HTTP client used by the schema registry connectors.
 ///
 /// Backed by [`reqwest::Client`], which provides connection pooling, automatic
 /// redirect following, TLS via rustls, and configurable request timeouts.
@@ -50,9 +69,28 @@ pub(crate) struct HttpClient {
 impl HttpClient {
     /// Build a client that trusts the platform-bundled WebPKI root CAs.
     pub fn with_webpki_roots(timeout: Option<Duration>) -> Result<Self> {
+        Self::with_config(HttpClientConfig {
+            timeout,
+            root_certificates: Vec::new(),
+            identity: None,
+        })
+    }
+
+    /// Build a client with full transport configuration.
+    ///
+    /// Supports optional custom CA certificates and a client identity for mTLS.
+    /// Falls back to `with_webpki_roots` behaviour when the extra fields are
+    /// left at their defaults.
+    pub fn with_config(config: HttpClientConfig) -> Result<Self> {
         let mut builder = Client::builder();
-        if let Some(t) = timeout {
+        if let Some(t) = config.timeout {
             builder = builder.timeout(t);
+        }
+        for cert in config.root_certificates {
+            builder = builder.add_root_certificate(cert);
+        }
+        if let Some(identity) = config.identity {
+            builder = builder.identity(identity);
         }
         let client = builder
             .build()
@@ -154,10 +192,7 @@ impl HttpClient {
             builder = builder.body(b.to_vec());
         }
 
-        let response = builder
-            .send()
-            .await
-            .map_err(|e| SchemaRegError::registry(format!("HTTP request failed: {e}")))?;
+        let response = builder.send().await.map_err(SchemaRegError::network)?;
 
         let status = response.status().as_u16();
         let content_type = response
@@ -179,11 +214,25 @@ impl HttpClient {
             None
         };
 
+        // Capture all response headers (lowercase names) for consumers like Apicurio
+        // that return schema metadata in `X-Registry-*` headers.
+        #[cfg(feature = "apicurio")]
+        let headers: HashMap<String, String> = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+            })
+            .collect();
+
         // Reject oversized responses before buffering by checking Content-Length.
         if let Some(len) = response.content_length()
             && len as usize > MAX_BODY_BYTES
         {
-            return Err(SchemaRegError::registry(format!(
+            return Err(SchemaRegError::invalid_state(format!(
                 "response Content-Length ({len} bytes) exceeds the {MAX_BODY_BYTES}-byte limit"
             )));
         }
@@ -195,14 +244,12 @@ impl HttpClient {
         let mut response = response;
 
         loop {
-            let chunk = response.chunk().await.map_err(|e| {
-                SchemaRegError::registry(format!("failed to read response body: {e}"))
-            })?;
+            let chunk = response.chunk().await.map_err(SchemaRegError::network)?;
             match chunk {
                 Some(bytes) => {
                     total += bytes.len();
                     if total > MAX_BODY_BYTES {
-                        return Err(SchemaRegError::registry(format!(
+                        return Err(SchemaRegError::invalid_state(format!(
                             "response body exceeds the {MAX_BODY_BYTES}-byte limit"
                         )));
                     }
@@ -217,6 +264,8 @@ impl HttpClient {
             content_type,
             body: buf.freeze(),
             retry_after_ms,
+            #[cfg(feature = "apicurio")]
+            headers,
         })
     }
 }

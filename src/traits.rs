@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::error::Result;
-use crate::types::{Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion};
+use crate::types::{EncodeTarget, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion};
 
 /// Async client interface for a schema registry.
 ///
@@ -19,6 +19,56 @@ use crate::types::{Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion}
 /// All methods use `async fn` (RPITIT), allowing zero-cost monomorphization at
 /// generic call sites. Object-safe erased wrappers are used internally where
 /// dynamic dispatch is needed (e.g. [`WireFormatDecoder`](crate::WireFormatDecoder)).
+///
+/// # Implementing a custom backend
+///
+/// ```rust
+/// use std::sync::Arc;
+/// use schemreg::{Schema, SchemaId, SchemaReference, SchemaRegistryClient, SchemaType, SchemaVersion};
+/// use schemreg::error::{Result, SchemaRegError};
+///
+/// struct InMemoryRegistry;
+///
+/// impl SchemaRegistryClient for InMemoryRegistry {
+///     async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> {
+///         Err(SchemaRegError::invalid_state(format!("schema {id} not found")))
+///     }
+///     async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
+///         Err(SchemaRegError::invalid_state(format!("subject {subject} not found")))
+///     }
+///     async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Arc<Schema>> {
+///         Err(SchemaRegError::invalid_state(format!("{subject}@{version} not found")))
+///     }
+///     async fn register_schema(
+///         &self, _subject: &str, _schema: &str,
+///         _schema_type: SchemaType, _references: &[SchemaReference],
+///     ) -> Result<SchemaId> {
+///         Ok(SchemaId::from(1u32))
+///     }
+/// }
+/// ```
+///
+/// # Wrapping with a cache
+///
+/// Any `SchemaRegistryClient` implementation can be transparently wrapped with
+/// [`CachedSchemaRegistry`](crate::CachedSchemaRegistry) for in-memory caching
+/// with thundering-herd coalescing:
+///
+/// ```rust
+/// use std::sync::Arc;
+/// use schemreg::CachedSchemaRegistry;
+/// # use schemreg::{Schema, SchemaId, SchemaReference, SchemaRegistryClient, SchemaType, SchemaVersion};
+/// # use schemreg::error::{Result, SchemaRegError};
+/// # struct InMemoryRegistry;
+/// # impl SchemaRegistryClient for InMemoryRegistry {
+/// #     async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> { Err(SchemaRegError::invalid_state("")) }
+/// #     async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> { Err(SchemaRegError::invalid_state("")) }
+/// #     async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Arc<Schema>> { Err(SchemaRegError::invalid_state("")) }
+/// #     async fn register_schema(&self, _: &str, _: &str, _: SchemaType, _: &[SchemaReference]) -> Result<SchemaId> { Ok(SchemaId::from(1u32)) }
+/// # }
+///
+/// let cached = Arc::new(CachedSchemaRegistry::new(InMemoryRegistry));
+/// ```
 pub trait SchemaRegistryClient: Send + Sync {
     /// Retrieve a schema by its globally unique ID.
     ///
@@ -31,17 +81,23 @@ pub trait SchemaRegistryClient: Send + Sync {
     ) -> impl Future<Output = Result<Arc<Schema>>> + Send + '_;
 
     /// Retrieve the latest schema registered under the given subject.
+    ///
+    /// Returns an `Arc<Schema>` to allow callers to hold a zero-copy
+    /// reference without cloning the schema bytes.
     fn get_latest_schema<'a>(
         &'a self,
         subject: &'a str,
-    ) -> impl Future<Output = Result<Schema>> + Send + 'a;
+    ) -> impl Future<Output = Result<Arc<Schema>>> + Send + 'a;
 
     /// Retrieve a specific version of a schema under a subject.
+    ///
+    /// Returns an `Arc<Schema>` to allow callers to hold a zero-copy
+    /// reference without cloning the schema bytes.
     fn get_schema_by_version<'a>(
         &'a self,
         subject: &'a str,
         version: SchemaVersion,
-    ) -> impl Future<Output = Result<Schema>> + Send + 'a;
+    ) -> impl Future<Output = Result<Arc<Schema>>> + Send + 'a;
 
     /// Register a schema under the given subject.
     ///
@@ -129,14 +185,14 @@ impl<T: SchemaRegistryClient + ?Sized> SchemaRegistryClient for &T {
     fn get_latest_schema<'a>(
         &'a self,
         subject: &'a str,
-    ) -> impl Future<Output = crate::error::Result<crate::types::Schema>> + Send + 'a {
+    ) -> impl Future<Output = crate::error::Result<Arc<crate::types::Schema>>> + Send + 'a {
         T::get_latest_schema(self, subject)
     }
     fn get_schema_by_version<'a>(
         &'a self,
         subject: &'a str,
         version: crate::types::SchemaVersion,
-    ) -> impl Future<Output = crate::error::Result<crate::types::Schema>> + Send + 'a {
+    ) -> impl Future<Output = crate::error::Result<Arc<crate::types::Schema>>> + Send + 'a {
         T::get_schema_by_version(self, subject, version)
     }
     fn register_schema<'a>(
@@ -187,14 +243,14 @@ impl<T: SchemaRegistryClient + ?Sized> SchemaRegistryClient for std::sync::Arc<T
     fn get_latest_schema<'a>(
         &'a self,
         subject: &'a str,
-    ) -> impl Future<Output = crate::error::Result<crate::types::Schema>> + Send + 'a {
+    ) -> impl Future<Output = crate::error::Result<Arc<crate::types::Schema>>> + Send + 'a {
         T::get_latest_schema(self, subject)
     }
     fn get_schema_by_version<'a>(
         &'a self,
         subject: &'a str,
         version: crate::types::SchemaVersion,
-    ) -> impl Future<Output = crate::error::Result<crate::types::Schema>> + Send + 'a {
+    ) -> impl Future<Output = crate::error::Result<Arc<crate::types::Schema>>> + Send + 'a {
         T::get_schema_by_version(self, subject, version)
     }
     fn register_schema<'a>(
@@ -286,7 +342,7 @@ pub trait AnySchemaCache: Send + Sync {
 /// use std::pin::Pin;
 /// use std::future::Future;
 /// use bytes::Bytes;
-/// use schemreg::SchemaEncoder;
+/// use schemreg::{SchemaEncoder, EncodeTarget};
 /// use schemreg::error::Result;
 ///
 /// struct NoopEncoder;
@@ -297,7 +353,7 @@ pub trait AnySchemaCache: Send + Sync {
 ///         payload: Bytes,
 ///         _topic: &str,
 ///         _record_name: Option<&str>,
-///         _is_key: bool,
+///         _target: EncodeTarget,
 ///     ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
 ///         Box::pin(async move { Ok(payload) })
 ///     }
@@ -310,14 +366,14 @@ pub trait SchemaEncoder: Send + Sync {
     /// `topic` is the target topic name. `record_name` is the schema record
     /// name (used by [`SubjectNameStrategy::RecordName`](crate::SubjectNameStrategy::RecordName)
     /// and [`SubjectNameStrategy::TopicRecordName`](crate::SubjectNameStrategy::TopicRecordName);
-    /// pass `None` for the `TopicName` strategy). `is_key` distinguishes
+    /// pass `None` for the `TopicName` strategy). `target` distinguishes
     /// key vs value subjects.
     fn encode(
         &self,
         payload: Bytes,
         topic: &str,
         record_name: Option<&str>,
-        is_key: bool,
+        target: EncodeTarget,
     ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
 }
 
@@ -332,7 +388,7 @@ pub trait SchemaEncoder: Send + Sync {
 /// use std::pin::Pin;
 /// use std::future::Future;
 /// use bytes::Bytes;
-/// use schemreg::SchemaDecoder;
+/// use schemreg::{SchemaDecoder, EncodeTarget};
 /// use schemreg::error::Result;
 ///
 /// struct StripPrefixDecoder;
@@ -342,7 +398,7 @@ pub trait SchemaEncoder: Send + Sync {
 ///         &self,
 ///         payload: Bytes,
 ///         _topic: &str,
-///         _is_key: bool,
+///         _target: EncodeTarget,
 ///     ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
 ///         Box::pin(async move {
 ///             // Strip a 4-byte proprietary header.
@@ -355,13 +411,13 @@ pub trait SchemaDecoder: Send + Sync {
     /// Decode a wire-framed payload, returning the raw inner bytes.
     ///
     /// `payload` is the raw bytes (key or value).
-    /// `topic` is the source topic name. `is_key` is `true` for key
-    /// payloads and `false` for value payloads.
+    /// `topic` is the source topic name. `target` is [`EncodeTarget::Key`]
+    /// for key payloads and [`EncodeTarget::Value`] for value payloads.
     fn decode(
         &self,
         payload: Bytes,
         topic: &str,
-        is_key: bool,
+        target: EncodeTarget,
     ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
 }
 
@@ -396,14 +452,14 @@ pub trait DynSchemaRegistryClient: Send + Sync {
     fn get_latest_schema<'a>(
         &'a self,
         subject: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>>;
 
     /// Retrieve a specific version of a schema under a subject.
     fn get_schema_by_version<'a>(
         &'a self,
         subject: &'a str,
         version: SchemaVersion,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>>;
 
     /// Register a schema under the given subject.
     fn register_schema<'a>(
@@ -453,14 +509,14 @@ impl<T: SchemaRegistryClient> DynSchemaRegistryClient for T {
     fn get_latest_schema<'a>(
         &'a self,
         subject: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>> {
         Box::pin(SchemaRegistryClient::get_latest_schema(self, subject))
     }
     fn get_schema_by_version<'a>(
         &'a self,
         subject: &'a str,
         version: SchemaVersion,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>> {
         Box::pin(SchemaRegistryClient::get_schema_by_version(
             self, subject, version,
         ))

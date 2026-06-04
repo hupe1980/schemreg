@@ -74,6 +74,33 @@ const UUID_SIZE: usize = 16;
 
 // ── Types ────────────────────────────────────────────────────────────────
 
+/// Error returned when [`CachedGlueSchemaRegistry::warm_cache`] fails to
+/// load one or more version IDs.
+///
+/// Successfully fetched IDs **are** cached. Callers can inspect
+/// [`failures`](WarmGlueCacheError::failures) to decide whether to retry.
+#[derive(Debug, Clone)]
+pub struct WarmGlueCacheError {
+    /// The version IDs that could not be fetched, along with the per-ID error.
+    pub failures: Vec<(GlueSchemaVersionId, SchemaRegError)>,
+}
+
+impl fmt::Display for WarmGlueCacheError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "warm_cache failed for {} Glue schema version ID(s):",
+            self.failures.len()
+        )?;
+        for (id, e) in &self.failures {
+            write!(f, " id {id}: {e};")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for WarmGlueCacheError {}
+
 /// Schema version identifier used by the AWS Glue Schema Registry.
 ///
 /// Internally a 128-bit UUID stored as big-endian bytes.
@@ -142,13 +169,13 @@ impl FromStr for GlueSchemaVersionId {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let bytes = s.as_bytes();
         if bytes.len() != 36 {
-            return Err(SchemaRegError::registry(format!(
+            return Err(SchemaRegError::invalid_state(format!(
                 "invalid UUID: expected 36 characters, got {}",
                 bytes.len()
             )));
         }
         if bytes[8] != b'-' || bytes[13] != b'-' || bytes[18] != b'-' || bytes[23] != b'-' {
-            return Err(SchemaRegError::registry(
+            return Err(SchemaRegError::invalid_state(
                 "invalid UUID format: expected dashes at positions 8, 13, 18, 23",
             ));
         }
@@ -157,7 +184,7 @@ impl FromStr for GlueSchemaVersionId {
         let mut uuid_bytes = [0u8; UUID_SIZE];
         for (i, &pos) in hex_positions.iter().enumerate() {
             uuid_bytes[i] = parse_hex_byte(bytes[pos], bytes[pos + 1]).ok_or_else(|| {
-                SchemaRegError::registry("invalid UUID: non-hexadecimal character")
+                SchemaRegError::invalid_state("invalid UUID: non-hexadecimal character")
             })?;
         }
         Ok(Self(uuid_bytes))
@@ -250,7 +277,7 @@ impl FromStr for GlueDataFormat {
         } else if s.eq_ignore_ascii_case("PROTOBUF") {
             Ok(Self::Protobuf)
         } else {
-            Err(SchemaRegError::registry(format!(
+            Err(SchemaRegError::invalid_state(format!(
                 "unknown Glue data format: '{s}'"
             )))
         }
@@ -416,7 +443,7 @@ fn compress_zlib(_data: &[u8]) -> Result<Vec<u8>> {
 const MAX_DECOMPRESSED_SIZE: usize = 128 * 1024 * 1024;
 
 #[cfg(feature = "glue")]
-fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
     let decoder = ZlibDecoder::new(data);
     let mut limited = decoder.take(MAX_DECOMPRESSED_SIZE as u64 + 1);
     let mut decompressed = Vec::new();
@@ -434,7 +461,7 @@ fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(feature = "glue"))]
-fn decompress_zlib(_data: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn decompress_zlib(_data: &[u8]) -> Result<Vec<u8>> {
     Err(SchemaRegError::wire_format(
         "Glue ZLIB decompression requires the `glue` Cargo feature",
     ))
@@ -713,26 +740,33 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         self.clear_cache();
     }
 
-    /// Pre-fetch a set of schema version IDs into the cache in parallel.
+    /// Pre-fetch a set of schema version IDs into the cache.
     ///
-    /// All IDs are fetched concurrently via the coalescing layer; duplicate
-    /// IDs in the slice are deduplicated automatically.
-    pub async fn warm_cache(&self, version_ids: &[GlueSchemaVersionId]) -> Result<()> {
-        use futures::StreamExt as _;
-        let unique: Vec<GlueSchemaVersionId> = version_ids
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let mut futs: futures::stream::FuturesUnordered<_> = unique
-            .into_iter()
-            .map(|id| self.get_schema_by_version_id_impl(id))
-            .collect();
-        while let Some(result) = futs.next().await {
-            result?;
+    /// Duplicate IDs are deduplicated automatically. Each ID is fetched
+    /// sequentially through the coalescing layer. Unlike the previous
+    /// `futures::FuturesUnordered`-based implementation, failures are
+    /// collected instead of failing fast; see [`WarmGlueCacheError`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WarmGlueCacheError`] if one or more IDs could not be fetched.
+    /// IDs that loaded successfully remain in the cache.
+    pub async fn warm_cache(
+        &self,
+        version_ids: &[GlueSchemaVersionId],
+    ) -> std::result::Result<(), WarmGlueCacheError> {
+        let unique: HashSet<GlueSchemaVersionId> = version_ids.iter().copied().collect();
+        let mut failures: Vec<(GlueSchemaVersionId, SchemaRegError)> = Vec::new();
+        for id in unique {
+            if let Err(e) = self.get_schema_by_version_id_impl(id).await {
+                failures.push((id, e));
+            }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WarmGlueCacheError { failures })
+        }
     }
 
     async fn get_schema_by_version_id_impl(
@@ -937,6 +971,10 @@ impl<C: GlueSchemaRegistryClient> AnySchemaCache for CachedGlueSchemaRegistry<C>
         &'a self,
         ids: &'a [Self::Id],
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move { Self::warm_cache(self, ids).await })
+        Box::pin(async move {
+            Self::warm_cache(self, ids)
+                .await
+                .map_err(|e| SchemaRegError::invalid_state(e.to_string()))
+        })
     }
 }

@@ -35,20 +35,48 @@ impl std::error::Error for ArcError {
 #[non_exhaustive]
 #[derive(Debug, Clone, Error)]
 pub enum SchemaRegError {
-    /// Schema registry communication or API error.
+    /// Transport-level failure: TLS, DNS, connection timeout, I/O error.
     ///
-    /// Covers HTTP transport errors, unexpected responses, and API-level
-    /// failures. The `source` field preserves the underlying cause (e.g.
-    /// a TLS handshake failure or a JSON parse error) so callers can
-    /// distinguish transport errors from API failures without matching on
-    /// the message string.
-    #[error("schema registry error: {message}")]
-    Registry {
-        /// Human-readable error message.
+    /// These are retryable by callers that implement retry / circuit-breaker logic.
+    #[error("network error: {0}")]
+    Network(ArcError),
+
+    /// The registry rejected the request for authentication / authorisation
+    /// reasons (HTTP 401 or 403).
+    ///
+    /// These are **not** retryable without credential rotation.
+    #[error("authentication error: HTTP {status} — {message}")]
+    Auth {
+        /// HTTP status code (401 or 403).
+        status: u16,
+        /// Message from the registry response body (sanitised).
         message: String,
-        /// Underlying cause, if any.
-        #[source]
-        source: Option<ArcError>,
+    },
+
+    /// The registry returned a structured API error with a numeric error code.
+    ///
+    /// Confluent error codes follow a `4XXYY` pattern:
+    /// - `40401`: subject not found
+    /// - `40402`: version not found
+    /// - `40403`: schema not found
+    /// - `42201`–`42203`: schema compatibility / validation errors
+    #[error("registry API error {error_code}: {message}")]
+    Api {
+        /// Confluent-style integer error code.
+        error_code: i32,
+        /// Human-readable message from the registry.
+        message: String,
+    },
+
+    /// A non-JSON or unrecognised HTTP error response from the registry.
+    ///
+    /// Includes the HTTP status and a sanitised preview of the response body.
+    #[error("HTTP error: {message}")]
+    Http {
+        /// HTTP status code.
+        status: u16,
+        /// Sanitised body preview.
+        message: String,
     },
 
     /// Configuration error (invalid URL, missing required field, etc.).
@@ -72,24 +100,36 @@ pub enum SchemaRegError {
 }
 
 impl SchemaRegError {
-    /// Create a registry error without an underlying cause.
+    /// Create a network transport error.
     #[cold]
-    pub fn registry(message: impl Into<String>) -> Self {
-        Self::Registry {
+    pub fn network<E: std::error::Error + Send + Sync + 'static>(source: E) -> Self {
+        Self::Network(ArcError::new(source))
+    }
+
+    /// Create an authentication error.
+    #[cold]
+    pub fn auth(status: u16, message: impl Into<String>) -> Self {
+        Self::Auth {
+            status,
             message: message.into(),
-            source: None,
         }
     }
 
-    /// Create a registry error with an underlying cause.
+    /// Create a structured API error.
     #[cold]
-    pub fn registry_with_source<E: std::error::Error + Send + Sync + 'static>(
-        message: impl Into<String>,
-        source: E,
-    ) -> Self {
-        Self::Registry {
+    pub fn api(error_code: i32, message: impl Into<String>) -> Self {
+        Self::Api {
+            error_code,
             message: message.into(),
-            source: Some(ArcError::new(source)),
+        }
+    }
+
+    /// Create an HTTP error (non-JSON error body).
+    #[cold]
+    pub fn http(status: u16, message: impl Into<String>) -> Self {
+        Self::Http {
+            status,
+            message: message.into(),
         }
     }
 
@@ -121,48 +161,71 @@ impl SchemaRegError {
 
     // ── Predicate helpers ─────────────────────────────────────────────────
 
-    /// Returns `true` if this is a [`SchemaRegError::Registry`] variant
-    /// (HTTP or API-level error).
+    /// Returns `true` if this is a transport-level [`Network`](Self::Network) error.
+    ///
+    /// Network errors are typically retryable.
     #[must_use]
-    pub fn is_registry_error(&self) -> bool {
-        matches!(self, Self::Registry { .. })
+    pub fn is_network_error(&self) -> bool {
+        matches!(self, Self::Network(_))
     }
 
-    /// Returns `true` if this is a [`SchemaRegError::Config`] variant.
+    /// Returns `true` if this is an [`Auth`](Self::Auth) error (HTTP 401/403).
+    ///
+    /// Auth errors require credential rotation and should **not** be retried.
+    #[must_use]
+    pub fn is_auth_error(&self) -> bool {
+        matches!(self, Self::Auth { .. })
+    }
+
+    /// Returns `true` if this is a structured [`Api`](Self::Api) error from the registry.
+    #[must_use]
+    pub fn is_api_error(&self) -> bool {
+        matches!(self, Self::Api { .. })
+    }
+
+    /// Returns `true` if this is a [`Config`](Self::Config) variant.
     #[must_use]
     pub fn is_config_error(&self) -> bool {
         matches!(self, Self::Config { .. })
     }
 
-    /// Returns `true` if this is a [`SchemaRegError::WireFormat`] variant.
+    /// Returns `true` if this is a [`WireFormat`](Self::WireFormat) variant.
     #[must_use]
     pub fn is_wire_format_error(&self) -> bool {
         matches!(self, Self::WireFormat(_))
     }
 
-    /// Returns `true` if this is a [`SchemaRegError::NotSupported`] variant.
+    /// Returns `true` if this is a [`NotSupported`](Self::NotSupported) variant.
     #[must_use]
     pub fn is_not_supported(&self) -> bool {
         matches!(self, Self::NotSupported(_))
     }
 
-    /// Returns `true` if the error message suggests a "not found" response
-    /// from the Confluent Schema Registry (error codes 404xx).
+    /// Returns `true` if this is an [`InvalidState`](Self::InvalidState) variant.
+    #[must_use]
+    pub fn is_invalid_state(&self) -> bool {
+        matches!(self, Self::InvalidState(_))
+    }
+
+    /// Returns `true` if the error represents a "not found" response from the
+    /// Confluent Schema Registry (API error codes 40401, 40402, 40403).
     ///
-    /// The Confluent Schema Registry returns structured error codes such as
-    /// `40401` (subject not found), `40402` (version not found), and `40403`
-    /// (schema not found). This helper avoids matching on the error message
-    /// string directly.
+    /// Uses the numeric `error_code` field — no string matching.
     #[must_use]
     pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Api { error_code, .. } if (40401..=40403).contains(error_code))
+    }
+
+    /// Returns `true` if the error is likely transient and safe to retry.
+    ///
+    /// Network errors and HTTP throttling/unavailability responses
+    /// (429 Too Many Requests, 503 Service Unavailable) are considered
+    /// retryable. Auth and configuration errors are not.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Registry { message, .. } => {
-                // Confluent error codes: 40401, 40402, 40403
-                message.contains("(error code 404")
-                    || message.contains("Subject not found")
-                    || message.contains("Version not found")
-                    || message.contains("Schema not found")
-            }
+            Self::Network(_) => true,
+            Self::Http { status, .. } => matches!(status, 429 | 503),
             _ => false,
         }
     }

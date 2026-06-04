@@ -1,7 +1,6 @@
 //! Confluent Schema Registry HTTP client.
 
 pub mod encoder;
-mod http;
 
 pub use encoder::{ConfluentSchemaEncoder, ConfluentSchemaEncoderBuilder};
 
@@ -14,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use base64::Engine as _;
 
 use crate::error::{Result, SchemaRegError};
+use crate::http::HttpClient;
 use crate::traits::SchemaRegistryClient;
 use crate::types::{Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion};
-use http::HttpClient;
 
 const SCHEMA_REGISTRY_CONTENT_TYPE: &str = "application/vnd.schemaregistry.v1+json";
 const ERROR_BODY_PREVIEW_LIMIT: usize = 512;
@@ -176,8 +175,9 @@ impl ConfluentSchemaRegistry {
             schema_type: schema_type.as_str(),
             references: Self::to_reference_json(references),
         };
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|e| SchemaRegError::registry_with_source("failed to serialise request", e))?;
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+            SchemaRegError::invalid_state(format!("failed to serialise request: {e}"))
+        })?;
         let result: CompatibilityResponse = self.http_post(&url, &body_bytes).await?;
         Ok(result.is_compatible)
     }
@@ -241,30 +241,36 @@ impl ConfluentSchemaRegistry {
             match content_type {
                 Some(ct) if ct.contains("json") => {}
                 Some(ct) => {
-                    return Err(SchemaRegError::registry(format!(
-                        "unexpected Content-Type '{ct}' from schema registry (expected JSON)"
-                    )));
+                    return Err(SchemaRegError::http(
+                        status,
+                        format!(
+                            "unexpected Content-Type '{ct}' from schema registry (expected JSON)"
+                        ),
+                    ));
                 }
                 None => {
-                    return Err(SchemaRegError::registry(
+                    return Err(SchemaRegError::http(
+                        status,
                         "missing Content-Type header from schema registry (expected JSON)",
                     ));
                 }
             }
             serde_json::from_slice(body).map_err(|e| {
-                SchemaRegError::registry_with_source("failed to parse schema registry response", e)
+                SchemaRegError::invalid_state(format!(
+                    "failed to parse schema registry response: {e}"
+                ))
             })
+        } else if status == 401 || status == 403 {
+            let message = serde_json::from_slice::<ErrorResponse>(body)
+                .map(|e| e.message)
+                .unwrap_or_else(|_| format!("HTTP {status}"));
+            Err(SchemaRegError::auth(status, message))
         } else if let Ok(err) = serde_json::from_slice::<ErrorResponse>(body) {
-            Err(SchemaRegError::registry(format!(
-                "{} (error code {})",
-                err.message, err.error_code
-            )))
+            Err(SchemaRegError::api(err.error_code, err.message))
         } else {
             let body_str = String::from_utf8_lossy(body);
             let preview = sanitized_error_body_preview(&body_str);
-            Err(SchemaRegError::registry(format!(
-                "HTTP {status}: {preview}"
-            )))
+            Err(SchemaRegError::http(status, preview))
         }
     }
 
@@ -383,24 +389,28 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
         }))
     }
 
-    async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
+    async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
         let url = format!(
             "{}/subjects/{}/versions/latest",
             self.base_url,
             percent_encode(subject)
         );
         let body: SchemaBySubjectResponse = self.http_get(&url).await?;
-        Self::schema_from_subject_response(body)
+        Self::schema_from_subject_response(body).map(Arc::new)
     }
 
-    async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Schema> {
+    async fn get_schema_by_version(
+        &self,
+        subject: &str,
+        version: SchemaVersion,
+    ) -> Result<Arc<Schema>> {
         let url = format!(
             "{}/subjects/{}/versions/{version}",
             self.base_url,
             percent_encode(subject)
         );
         let body: SchemaBySubjectResponse = self.http_get(&url).await?;
-        Self::schema_from_subject_response(body)
+        Self::schema_from_subject_response(body).map(Arc::new)
     }
 
     async fn register_schema(
@@ -421,8 +431,9 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
             schema_type: schema_type.as_str(),
             references: refs,
         };
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|e| SchemaRegError::registry_with_source("failed to serialise request", e))?;
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+            SchemaRegError::invalid_state(format!("failed to serialise request: {e}"))
+        })?;
         let result: RegisterSchemaResponse = self.http_post(&url, &body_bytes).await?;
         Ok(result.id)
     }
@@ -505,7 +516,9 @@ static PATH_SEGMENT_ENCODE_SET: percent_encoding::AsciiSet = percent_encoding::C
     .add(b']')
     // Characters not valid in a segment per RFC 3986
     .add(b'\\')
-    .add(b'^');
+    .add(b'^')
+    // @ must be encoded in path segments per RFC 3986 §3.3
+    .add(b'@');
 
 fn percent_encode(input: &str) -> String {
     percent_encoding::utf8_percent_encode(input, &PATH_SEGMENT_ENCODE_SET).to_string()
@@ -518,6 +531,10 @@ pub struct ConfluentSchemaRegistryBuilder {
     url: Option<String>,
     auth: RegistryAuth,
     request_timeout: Option<Duration>,
+    /// Additional root CA certificates to trust (e.g. for private CAs).
+    root_certificates: Vec<reqwest::Certificate>,
+    /// Client certificate + private key for mTLS.
+    identity: Option<reqwest::Identity>,
 }
 
 impl Default for ConfluentSchemaRegistryBuilder {
@@ -526,6 +543,8 @@ impl Default for ConfluentSchemaRegistryBuilder {
             url: None,
             auth: RegistryAuth::None,
             request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            root_certificates: Vec::new(),
+            identity: None,
         }
     }
 }
@@ -566,6 +585,25 @@ impl ConfluentSchemaRegistryBuilder {
         self
     }
 
+    /// Add a custom root CA certificate to trust.
+    ///
+    /// Useful when the registry uses a private certificate authority (e.g. an
+    /// internal PKI). Can be called multiple times to trust several CAs.
+    pub fn add_root_certificate(mut self, cert: reqwest::Certificate) -> Self {
+        self.root_certificates.push(cert);
+        self
+    }
+
+    /// Set a client certificate and private key for mutual TLS (mTLS).
+    ///
+    /// Use this when the registry requires client-certificate authentication.
+    /// Build the [`reqwest::Identity`] from a PEM bundle using
+    /// [`reqwest::Identity::from_pem`].
+    pub fn identity(mut self, identity: reqwest::Identity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
     /// Build the [`ConfluentSchemaRegistry`] client.
     pub fn build(self) -> Result<ConfluentSchemaRegistry> {
         let url = self
@@ -584,7 +622,11 @@ impl ConfluentSchemaRegistryBuilder {
             ));
         }
 
-        let client = HttpClient::with_webpki_roots(self.request_timeout)?;
+        let client = HttpClient::with_config(crate::http::HttpClientConfig {
+            timeout: self.request_timeout,
+            root_certificates: self.root_certificates,
+            identity: self.identity,
+        })?;
 
         Ok(ConfluentSchemaRegistry {
             client,

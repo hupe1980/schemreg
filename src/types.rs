@@ -157,7 +157,7 @@ impl FromStr for SchemaType {
         } else if s.eq_ignore_ascii_case("JSON") {
             Ok(Self::Json)
         } else {
-            Err(SchemaRegError::registry(format!(
+            Err(SchemaRegError::invalid_state(format!(
                 "unknown schema type: '{s}'"
             )))
         }
@@ -256,6 +256,46 @@ impl Schema {
     }
 }
 
+/// Whether a payload is a Kafka record key or value.
+///
+/// Replaces the bare `is_key: bool` parameter in encoder/decoder APIs. Using a
+/// named enum eliminates the "boolean trap" where callers transpose the argument
+/// and silently register schemas under the wrong subject.
+///
+/// # Example
+///
+/// ```rust
+/// use schemreg::EncodeTarget;
+///
+/// let target = EncodeTarget::Value;
+/// assert!(!target.is_key());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum EncodeTarget {
+    /// The payload is a Kafka record key (subject suffix `-key`).
+    Key,
+    /// The payload is a Kafka record value (subject suffix `-value`).
+    #[default]
+    Value,
+}
+
+impl EncodeTarget {
+    /// Returns `true` if this is [`EncodeTarget::Key`].
+    #[inline]
+    pub fn is_key(self) -> bool {
+        matches!(self, Self::Key)
+    }
+}
+
+impl std::fmt::Display for EncodeTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Key => f.write_str("key"),
+            Self::Value => f.write_str("value"),
+        }
+    }
+}
+
 // ── Compile-time Send + Sync assertions ────────────────────────────────
 
 const _: () = {
@@ -263,9 +303,81 @@ const _: () = {
     fn check() {
         assert_send_sync::<Schema>();
         assert_send_sync::<SchemaReference>();
+        assert_send_sync::<ArtifactId>();
     }
     let _ = check;
 };
+
+// ── ArtifactId ────────────────────────────────────────────────────────────
+
+/// Identifies an Apicurio Registry artifact by group and artifact ID.
+///
+/// In Apicurio Registry v3, all artifacts are scoped to a group. The canonical
+/// default group name is `"default"` and is used when no explicit group is
+/// provided.
+///
+/// # Subject string encoding
+///
+/// `ArtifactId` can be serialised to and parsed from a subject string of the
+/// form `"{group}/{artifact}"`. Single-component subjects (no `/`) use the
+/// default group `"default"`.
+///
+/// ```rust
+/// use schemreg::ArtifactId;
+///
+/// let id = ArtifactId::default_group("orders-value");
+/// assert_eq!(id.to_subject(), "default/orders-value");
+///
+/// let parsed = ArtifactId::from_subject("mygroup/orders-value");
+/// assert_eq!(parsed.group, "mygroup");
+/// assert_eq!(parsed.artifact, "orders-value");
+///
+/// // Single-component → default group
+/// let bare = ArtifactId::from_subject("payments-value");
+/// assert_eq!(bare.group, "default");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ArtifactId {
+    /// The group containing the artifact. Defaults to `"default"`.
+    pub group: String,
+    /// The artifact identifier within the group.
+    pub artifact: String,
+}
+
+impl ArtifactId {
+    /// Create an `ArtifactId` with explicit group and artifact.
+    pub fn new(group: impl Into<String>, artifact: impl Into<String>) -> Self {
+        Self {
+            group: group.into(),
+            artifact: artifact.into(),
+        }
+    }
+
+    /// Create an `ArtifactId` in the Apicurio default group (`"default"`).
+    pub fn default_group(artifact: impl Into<String>) -> Self {
+        Self::new("default", artifact)
+    }
+
+    /// Parse from a subject string of the form `"{group}/{artifact}"` or
+    /// `"{artifact}"` (uses the default group `"default"`).
+    pub fn from_subject(subject: &str) -> Self {
+        match subject.split_once('/') {
+            Some((group, artifact)) => Self::new(group, artifact),
+            None => Self::default_group(subject),
+        }
+    }
+
+    /// Encode as a subject string `"{group}/{artifact}"`.
+    pub fn to_subject(&self) -> String {
+        format!("{}/{}", self.group, self.artifact)
+    }
+}
+
+impl fmt::Display for ArtifactId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.group, self.artifact)
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
