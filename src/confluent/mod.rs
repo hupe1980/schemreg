@@ -597,8 +597,8 @@ impl ConfluentSchemaRegistryBuilder {
     /// Set a client certificate and private key for mutual TLS (mTLS).
     ///
     /// Use this when the registry requires client-certificate authentication.
-    /// Build the [`reqwest::Identity`] from a PEM or PKCS#12 bundle using
-    /// [`reqwest::Identity::from_pem`] or [`reqwest::Identity::from_pkcs12_der`].
+    /// Build the [`reqwest::Identity`] from a PEM bundle using
+    /// [`reqwest::Identity::from_pem`].
     pub fn identity(mut self, identity: reqwest::Identity) -> Self {
         self.identity = Some(identity);
         self

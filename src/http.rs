@@ -1,5 +1,6 @@
 //! Shared async HTTP client used by Confluent and Apicurio registry connectors.
 
+#[cfg(feature = "apicurio")]
 use std::collections::HashMap;
 use std::time::Duration;
 
