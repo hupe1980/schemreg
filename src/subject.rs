@@ -6,6 +6,12 @@ use std::sync::Arc;
 use crate::error::{Result, SchemaRegError};
 use crate::types::EncodeTarget;
 
+/// A type-erased custom subject-name function.
+///
+/// Takes `(topic, record_name, target)` and returns the subject string.
+pub type CustomSubjectFn =
+    Arc<dyn Fn(&str, Option<&str>, EncodeTarget) -> Result<String> + Send + Sync>;
+
 /// Strategy for deriving registry subject names from topics and records.
 ///
 /// The subject name determines where schemas are registered and looked up.
@@ -81,7 +87,7 @@ pub enum SubjectNameStrategy {
     /// let subject = strategy.subject_name("orders", None, EncodeTarget::Value).unwrap();
     /// assert_eq!(subject, "prefix-orders-value");
     /// ```
-    Custom(Arc<dyn Fn(&str, Option<&str>, EncodeTarget) -> Result<String> + Send + Sync>),
+    Custom(CustomSubjectFn),
 }
 
 impl std::fmt::Debug for SubjectNameStrategy {
