@@ -30,13 +30,12 @@ mod client;
 pub use client::{AwsGlueSchemaRegistry, AwsGlueSchemaRegistryBuilder};
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
 #[cfg(feature = "glue")]
@@ -45,15 +44,14 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 #[cfg(feature = "glue")]
 use flate2::write::ZlibEncoder;
-use parking_lot::{Mutex, RwLock};
 #[cfg(feature = "glue")]
 use std::io::{Read, Write};
-use tokio::sync::oneshot;
 
-use tracing::debug;
-
+use crate::cache_inner::InMemoryCache;
 use crate::error::{Result, SchemaRegError};
 use crate::traits::AnySchemaCache;
+
+// `futures` is an unconditional dependency of schemreg (used for join_all in warm_cache).
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -588,20 +586,7 @@ impl<T: GlueSchemaRegistryClient> DynGlueSchemaRegistryClient for T {
 /// Caching wrapper around any [`GlueSchemaRegistryClient`].
 pub struct CachedGlueSchemaRegistry<C> {
     inner: C,
-    cache: RwLock<HashMap<GlueSchemaVersionId, Arc<GlueSchema>>>,
-    insertion_order: RwLock<VecDeque<GlueSchemaVersionId>>,
-    max_entries: Option<usize>,
-    in_flight_token: AtomicU64,
-    /// Monotonic counter bumped on every `invalidate` / `clear_cache` call.
-    /// Used to detect cache insertions that raced past an invalidation.
-    invalidation_generation: AtomicU64,
-    in_flight: Mutex<HashMap<GlueSchemaVersionId, GlueInFlightEntry>>,
-}
-
-#[derive(Default)]
-struct GlueInFlightEntry {
-    token: u64,
-    waiters: Vec<oneshot::Sender<Result<Arc<GlueSchema>>>>,
+    cache: InMemoryCache<GlueSchemaVersionId, GlueSchema>,
 }
 
 /// Default maximum number of cached Glue schema entries.
@@ -612,23 +597,9 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
     ///
     /// Defaults to [`DEFAULT_MAX_GLUE_CACHE_ENTRIES`] (1 000) entries,
     /// evicting the oldest entry on each insert once the limit is reached.
-    /// Use [`with_max_entries`](Self::with_max_entries) or
-    /// [`with_capacity`](Self::with_capacity) to override.
+    /// Use [`with_max_entries`](Self::with_max_entries) to override.
     pub fn new(inner: C) -> Self {
         Self::with_max_entries(inner, DEFAULT_MAX_GLUE_CACHE_ENTRIES)
-    }
-
-    /// Wrap the given client with a pre-allocated cache.
-    pub fn with_capacity(inner: C, capacity: usize) -> Self {
-        Self {
-            inner,
-            cache: RwLock::new(HashMap::with_capacity(capacity)),
-            insertion_order: RwLock::new(VecDeque::with_capacity(capacity)),
-            max_entries: None,
-            in_flight_token: AtomicU64::new(0),
-            invalidation_generation: AtomicU64::new(0),
-            in_flight: Mutex::new(HashMap::new()),
-        }
     }
 
     /// Wrap the given client with a bounded in-memory cache.
@@ -636,12 +607,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         let max_entries = max_entries.max(1);
         Self {
             inner,
-            cache: RwLock::new(HashMap::with_capacity(max_entries)),
-            insertion_order: RwLock::new(VecDeque::with_capacity(max_entries)),
-            max_entries: Some(max_entries),
-            in_flight_token: AtomicU64::new(0),
-            invalidation_generation: AtomicU64::new(0),
-            in_flight: Mutex::new(HashMap::new()),
+            cache: InMemoryCache::new(Some(max_entries), glue_schema_lookup_cancelled_error),
         }
     }
 
@@ -652,100 +618,34 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
 
     /// Number of schemas currently in the cache.
     pub fn cache_len(&self) -> usize {
-        self.cache.read().len()
+        self.cache.len()
     }
 
     /// Returns `true` if the cache contains no schemas.
     pub fn cache_is_empty(&self) -> bool {
-        self.cache.read().is_empty()
-    }
-
-    fn clear_cache_storage(&self) {
-        self.cache.write().clear();
-        self.insertion_order.write().clear();
-    }
-
-    fn insert_cache_entry(&self, id: GlueSchemaVersionId, schema: Arc<GlueSchema>) {
-        let mut cache = self.cache.write();
-        debug!(version_id = %id, "glue schema cache miss — fetched from registry");
-        if let Some(existing) = cache.get_mut(&id) {
-            *existing = schema;
-            return;
-        }
-        if let Some(max_entries) = self.max_entries {
-            let mut insertion_order = self.insertion_order.write();
-            if cache.len() >= max_entries
-                && let Some(evicted) = insertion_order.pop_front()
-            {
-                cache.remove(&evicted);
-            }
-            insertion_order.push_back(id);
-        }
-        cache.insert(id, schema);
-    }
-
-    fn insert_cache_entry_if_current(
-        &self,
-        id: GlueSchemaVersionId,
-        schema: Arc<GlueSchema>,
-        observed_generation: u64,
-    ) {
-        if self.invalidation_generation.load(Ordering::SeqCst) != observed_generation {
-            debug!(
-                version_id = %id,
-                "glue schema fetch completed after invalidation; skipping cache insert"
-            );
-            return;
-        }
-        self.insert_cache_entry(id, schema);
+        self.cache.is_empty()
     }
 
     /// Clear the schema cache.
     pub fn clear_cache(&self) {
-        self.invalidation_generation.fetch_add(1, Ordering::SeqCst);
-
-        let cancelled: Vec<_> = self.in_flight.lock().drain().collect();
-        self.clear_cache_storage();
-
-        for (id, entry) in cancelled {
-            for waiter in entry.waiters {
-                let _ = waiter.send(Err(glue_schema_lookup_cancelled_error(id)));
-            }
-        }
+        self.cache.clear();
     }
 
     /// Remove a single schema version ID from the cache.
     pub fn invalidate(&self, version_id: GlueSchemaVersionId) {
-        self.invalidation_generation.fetch_add(1, Ordering::SeqCst);
-
-        let waiters = self
-            .in_flight
-            .lock()
-            .remove(&version_id)
-            .map(|entry| entry.waiters)
-            .unwrap_or_default();
-
-        self.cache.write().remove(&version_id);
-        self.insertion_order
-            .write()
-            .retain(|cached_id| *cached_id != version_id);
-
-        for waiter in waiters {
-            let _ = waiter.send(Err(glue_schema_lookup_cancelled_error(version_id)));
-        }
+        self.cache.invalidate(version_id);
     }
 
     /// Remove all cached schemas.
     pub fn invalidate_all(&self) {
-        self.clear_cache();
+        self.cache.clear();
     }
 
     /// Pre-fetch a set of schema version IDs into the cache.
     ///
-    /// Duplicate IDs are deduplicated automatically. Each ID is fetched
-    /// sequentially through the coalescing layer. Unlike the previous
-    /// `futures::FuturesUnordered`-based implementation, failures are
-    /// collected instead of failing fast; see [`WarmGlueCacheError`].
+    /// Duplicate IDs are deduplicated automatically. Up to 16 IDs are fetched
+    /// in parallel per chunk. Failures are collected instead of failing fast;
+    /// see [`WarmGlueCacheError`].
     ///
     /// # Errors
     ///
@@ -755,13 +655,33 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         &self,
         version_ids: &[GlueSchemaVersionId],
     ) -> std::result::Result<(), WarmGlueCacheError> {
+        const WARM_CONCURRENCY: usize = 16;
+
         let unique: HashSet<GlueSchemaVersionId> = version_ids.iter().copied().collect();
+        if unique.is_empty() {
+            return Ok(());
+        }
+
+        let ids: Vec<GlueSchemaVersionId> = unique.into_iter().collect();
         let mut failures: Vec<(GlueSchemaVersionId, SchemaRegError)> = Vec::new();
-        for id in unique {
-            if let Err(e) = self.get_schema_by_version_id_impl(id).await {
-                failures.push((id, e));
+
+        for chunk in ids.chunks(WARM_CONCURRENCY) {
+            let futs = chunk.iter().map(|&id| async move {
+                (
+                    id,
+                    self.cache
+                        .get_or_fetch(id, || self.inner.get_schema_by_version_id(id))
+                        .await,
+                )
+            });
+            let results = futures::future::join_all(futs).await;
+            for (id, result) in results {
+                if let Err(e) = result {
+                    failures.push((id, e));
+                }
             }
         }
+
         if failures.is_empty() {
             Ok(())
         } else {
@@ -769,142 +689,14 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         }
     }
 
-    async fn get_schema_by_version_id_impl(
-        &self,
-        id: GlueSchemaVersionId,
-    ) -> Result<Arc<GlueSchema>> {
-        // Fast path: read lock only.
-        if let Some(schema) = self.cache.read().get(&id) {
-            debug!(version_id = %id, "glue schema cache hit");
-            return Ok(Arc::clone(schema));
-        }
-
-        let (waiter_rx, leader_token) = {
-            let mut in_flight = self.in_flight.lock();
-            if let Some(schema) = self.cache.read().get(&id) {
-                debug!(version_id = %id, "glue schema cache hit (double-checked)");
-                return Ok(Arc::clone(schema));
-            }
-
-            if let Some(entry) = in_flight.get_mut(&id) {
-                let (tx, rx) = oneshot::channel();
-                entry.waiters.push(tx);
-                (Some(rx), None)
-            } else {
-                let token = self.in_flight_token.fetch_add(1, Ordering::SeqCst) + 1;
-                in_flight.insert(
-                    id,
-                    GlueInFlightEntry {
-                        token,
-                        waiters: Vec::new(),
-                    },
-                );
-                (None, Some(token))
-            }
-        };
-
-        if let Some(rx) = waiter_rx {
-            return rx
-                .await
-                .map_err(|_| glue_schema_lookup_cancelled_error(id))?;
-        }
-
-        struct InFlightGlueFetchGuard<'a> {
-            in_flight: &'a Mutex<HashMap<GlueSchemaVersionId, GlueInFlightEntry>>,
-            id: GlueSchemaVersionId,
-            token: u64,
-            completed: bool,
-        }
-
-        impl Drop for InFlightGlueFetchGuard<'_> {
-            fn drop(&mut self) {
-                if self.completed {
-                    return;
-                }
-                let waiters = {
-                    let mut in_flight = self.in_flight.lock();
-                    if matches!(in_flight.get(&self.id), Some(entry) if entry.token == self.token) {
-                        in_flight
-                            .remove(&self.id)
-                            .map(|entry| entry.waiters)
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    }
-                };
-
-                for waiter in waiters {
-                    let _ = waiter.send(Err(glue_schema_lookup_cancelled_error(self.id)));
-                }
-            }
-        }
-
-        let Some(leader_token) = leader_token else {
-            return Err(glue_schema_lookup_cancelled_error(id));
-        };
-
-        let mut guard = InFlightGlueFetchGuard {
-            in_flight: &self.in_flight,
-            id,
-            token: leader_token,
-            completed: false,
-        };
-
-        let observed_generation = self.invalidation_generation.load(Ordering::SeqCst);
-        let result = self.inner.get_schema_by_version_id(id).await;
-        if let Ok(schema) = &result {
-            let should_insert = {
-                let in_flight = self.in_flight.lock();
-                matches!(in_flight.get(&id), Some(entry) if entry.token == leader_token)
-            };
-
-            if should_insert {
-                self.insert_cache_entry_if_current(id, Arc::clone(schema), observed_generation);
-            } else {
-                debug!(
-                    version_id = %id,
-                    "glue schema fetch completed after invalidation; skipping cache insert"
-                );
-            }
-        }
-
-        let waiters = {
-            let mut in_flight = self.in_flight.lock();
-            if matches!(in_flight.get(&id), Some(entry) if entry.token == leader_token) {
-                in_flight
-                    .remove(&id)
-                    .map(|entry| entry.waiters)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        };
-
-        for waiter in waiters {
-            let _ = waiter.send(result.clone());
-        }
-        guard.completed = true;
-
-        result
-    }
-
-    async fn register_schema_impl(
-        &self,
-        schema_name: &str,
-        schema: &str,
-        data_format: GlueDataFormat,
-    ) -> Result<GlueSchemaVersionId> {
-        self.inner
-            .register_schema(schema_name, schema, data_format)
-            .await
-    }
-
     /// Retrieve a schema by its version ID.
     pub async fn get_schema_by_version_id(
         &self,
         id: GlueSchemaVersionId,
     ) -> Result<Arc<GlueSchema>> {
-        self.get_schema_by_version_id_impl(id).await
+        self.cache
+            .get_or_fetch(id, || self.inner.get_schema_by_version_id(id))
+            .await
     }
 
     /// Register a schema version under the given schema name.
@@ -914,7 +706,8 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         schema: &str,
         data_format: GlueDataFormat,
     ) -> Result<GlueSchemaVersionId> {
-        self.register_schema_impl(schema_name, schema, data_format)
+        self.inner
+            .register_schema(schema_name, schema, data_format)
             .await
     }
 }
@@ -922,15 +715,15 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
 impl<C> fmt::Debug for CachedGlueSchemaRegistry<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CachedGlueSchemaRegistry")
-            .field("cache_len", &self.cache.read().len())
-            .field("max_entries", &self.max_entries)
+            .field("cache_len", &self.cache.len())
+            .field("cache", &self.cache)
             .finish()
     }
 }
 
 impl<C: GlueSchemaRegistryClient> GlueSchemaRegistryClient for CachedGlueSchemaRegistry<C> {
     async fn get_schema_by_version_id(&self, id: GlueSchemaVersionId) -> Result<Arc<GlueSchema>> {
-        self.get_schema_by_version_id_impl(id).await
+        self.get_schema_by_version_id(id).await
     }
 
     async fn register_schema(
@@ -939,8 +732,7 @@ impl<C: GlueSchemaRegistryClient> GlueSchemaRegistryClient for CachedGlueSchemaR
         schema: &str,
         data_format: GlueDataFormat,
     ) -> Result<GlueSchemaVersionId> {
-        self.register_schema_impl(schema_name, schema, data_format)
-            .await
+        self.register_schema(schema_name, schema, data_format).await
     }
 }
 

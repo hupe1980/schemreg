@@ -12,20 +12,18 @@
 //! outgoing request is made; all other callers wait for the result. This
 //! prevents thundering-herd spikes on cold-start.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use parking_lot::{Mutex, RwLock};
-use tokio::sync::oneshot;
-use tracing::debug;
-
+use crate::cache_inner::InMemoryCache;
 use crate::error::{Result, SchemaRegError};
 use crate::traits::{AnySchemaCache, SchemaRegistryClient};
-use crate::types::{Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion};
+use crate::types::{
+    CompatibilityLevel, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion,
+};
 
 fn schema_lookup_cancelled_error(id: SchemaId) -> SchemaRegError {
     SchemaRegError::invalid_state(format!(
@@ -90,26 +88,8 @@ impl std::error::Error for WarmCacheError {}
 /// let same = cached.get_schema_by_id(1).await.unwrap();
 /// ```
 pub struct CachedSchemaRegistry<C> {
-    /// The inner registry client.
     inner: C,
-    /// Schema ID → Schema cache. Entries are immutable once inserted.
-    cache: RwLock<HashMap<SchemaId, Arc<Schema>>>,
-    /// Insertion order for bounded-cache eviction.
-    insertion_order: RwLock<VecDeque<SchemaId>>,
-    /// Optional maximum number of cached entries.
-    max_entries: Option<usize>,
-    /// Monotonic token used to identify distinct in-flight lookup generations.
-    in_flight_token: AtomicU64,
-    /// Monotonic generation for invalidation-sensitive cache insertions.
-    invalidation_generation: AtomicU64,
-    /// Waiters for coalescing concurrent cold misses by schema ID.
-    in_flight: Mutex<HashMap<SchemaId, SchemaInFlightEntry>>,
-}
-
-#[derive(Default)]
-struct SchemaInFlightEntry {
-    token: u64,
-    waiters: Vec<oneshot::Sender<Result<Arc<Schema>>>>,
+    cache: InMemoryCache<SchemaId, Schema>,
 }
 
 /// Default maximum number of cached schema entries, matching the Java client default.
@@ -120,23 +100,8 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
     ///
     /// Defaults to a maximum of 1,000 entries, evicting the oldest entry on
     /// each insert once the limit is reached.
-    /// Use [`with_max_entries`](Self::with_max_entries) to override or
-    /// [`with_capacity`](Self::with_capacity) for a pre-allocated unbounded cache.
     pub fn new(inner: C) -> Self {
         Self::with_max_entries(inner, DEFAULT_MAX_CACHE_ENTRIES)
-    }
-
-    /// Wrap the given client with a pre-allocated cache.
-    pub fn with_capacity(inner: C, capacity: usize) -> Self {
-        Self {
-            inner,
-            cache: RwLock::new(HashMap::with_capacity(capacity)),
-            insertion_order: RwLock::new(VecDeque::with_capacity(capacity)),
-            max_entries: None,
-            in_flight_token: AtomicU64::new(0),
-            invalidation_generation: AtomicU64::new(0),
-            in_flight: Mutex::new(HashMap::new()),
-        }
     }
 
     /// Wrap the given client with a bounded in-memory cache.
@@ -146,12 +111,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         let max_entries = max_entries.max(1);
         Self {
             inner,
-            cache: RwLock::new(HashMap::with_capacity(max_entries)),
-            insertion_order: RwLock::new(VecDeque::with_capacity(max_entries)),
-            max_entries: Some(max_entries),
-            in_flight_token: AtomicU64::new(0),
-            invalidation_generation: AtomicU64::new(0),
-            in_flight: Mutex::new(HashMap::new()),
+            cache: InMemoryCache::new(Some(max_entries), schema_lookup_cancelled_error),
         }
     }
 
@@ -162,86 +122,66 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
     /// Number of schemas currently in the cache.
     pub fn cache_len(&self) -> usize {
-        self.cache.read().len()
+        self.cache.len()
     }
 
     /// Returns `true` if the cache contains no schemas.
     pub fn cache_is_empty(&self) -> bool {
-        self.cache.read().is_empty()
-    }
-
-    fn clear_cache_storage(&self) {
-        self.cache.write().clear();
-        self.insertion_order.write().clear();
+        self.cache.is_empty()
     }
 
     /// Clear the schema cache.
     pub fn clear_cache(&self) {
-        self.invalidation_generation.fetch_add(1, Ordering::SeqCst);
-
-        let cancelled: Vec<_> = self.in_flight.lock().drain().collect();
-        self.clear_cache_storage();
-
-        for (id, entry) in cancelled {
-            for waiter in entry.waiters {
-                let _ = waiter.send(Err(schema_lookup_cancelled_error(id)));
-            }
-        }
+        self.cache.clear();
     }
 
     /// Remove a single schema ID from the cache.
     pub fn invalidate(&self, schema_id: impl Into<SchemaId>) {
-        let schema_id = schema_id.into();
-        self.invalidation_generation.fetch_add(1, Ordering::SeqCst);
-
-        // Cancel any coalesced waiters so invalidation is observable immediately.
-        let waiters = self
-            .in_flight
-            .lock()
-            .remove(&schema_id)
-            .map(|entry| entry.waiters)
-            .unwrap_or_default();
-
-        self.cache.write().remove(&schema_id);
-        self.insertion_order
-            .write()
-            .retain(|cached_id| *cached_id != schema_id);
-
-        for waiter in waiters {
-            let _ = waiter.send(Err(schema_lookup_cancelled_error(schema_id)));
-        }
+        self.cache.invalidate(schema_id.into());
     }
 
     /// Remove all cached schemas.
     pub fn invalidate_all(&self) {
-        self.clear_cache();
+        self.cache.clear();
     }
 
-    /// Pre-fetch a set of schema IDs into the cache.
+    /// Pre-fetch a set of schema IDs into the cache with bounded concurrency.
     ///
-    /// Duplicate IDs are deduplicated automatically. Each ID is fetched
-    /// sequentially through the coalescing layer; this guarantees that no
-    /// duplicate backend requests are issued even under concurrent callers.
-    ///
-    /// Unlike the original `futures::FuturesUnordered`-based implementation,
-    /// this version does **not** fail fast: all IDs are attempted and the full
-    /// list of failures is returned as a [`WarmCacheError`]. IDs that load
-    /// successfully are available in the cache even when some IDs fail.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`WarmCacheError`] when one or more IDs could not be fetched.
+    /// Duplicate IDs are deduplicated automatically. Up to 16 IDs are fetched
+    /// in parallel per chunk via `futures::future::join_all`. All IDs are
+    /// attempted regardless of individual failures; the full set of failures
+    /// is returned as a [`WarmCacheError`].
     pub async fn warm_cache(
         &self,
         schema_ids: impl IntoIterator<Item = impl Into<SchemaId>>,
     ) -> std::result::Result<(), WarmCacheError> {
+        const WARM_CONCURRENCY: usize = 16;
+
         let unique: HashSet<SchemaId> = schema_ids.into_iter().map(Into::into).collect();
+        if unique.is_empty() {
+            return Ok(());
+        }
+
+        let ids: Vec<SchemaId> = unique.into_iter().collect();
         let mut failures: Vec<(SchemaId, SchemaRegError)> = Vec::new();
-        for id in unique {
-            if let Err(e) = self.get_schema_by_id_impl(id).await {
-                failures.push((id, e));
+
+        for chunk in ids.chunks(WARM_CONCURRENCY) {
+            let futs = chunk.iter().map(|&id| async move {
+                (
+                    id,
+                    self.cache
+                        .get_or_fetch(id, || self.inner.get_schema_by_id(id))
+                        .await,
+                )
+            });
+            let results = futures::future::join_all(futs).await;
+            for (id, result) in results {
+                if let Err(e) = result {
+                    failures.push((id, e));
+                }
             }
         }
+
         if failures.is_empty() {
             Ok(())
         } else {
@@ -249,189 +189,51 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         }
     }
 
-    async fn get_schema_by_id_impl(&self, id: SchemaId) -> Result<Arc<Schema>> {
-        // Fast path: read lock only.
-        if let Some(schema) = self.cache.read().get(&id) {
-            debug!(schema_id = id.as_u32(), "schema cache hit");
-            return Ok(Arc::clone(schema));
+    /// Invalidate all cached schemas whose `subject` field matches `subject`.
+    ///
+    /// Performs an O(n) scan of the cache.
+    pub fn invalidate_subject(&self, subject: &str) {
+        let ids: Vec<SchemaId> = self
+            .cache
+            .keys_matching(|s: &Schema| s.subject.as_deref() == Some(subject));
+        for id in ids {
+            self.cache.invalidate(id);
         }
-
-        let (waiter_rx, leader_token) = {
-            let mut in_flight = self.in_flight.lock();
-            if let Some(schema) = self.cache.read().get(&id) {
-                return Ok(Arc::clone(schema));
-            }
-
-            if let Some(entry) = in_flight.get_mut(&id) {
-                let (tx, rx) = oneshot::channel();
-                entry.waiters.push(tx);
-                (Some(rx), None)
-            } else {
-                let token = self.in_flight_token.fetch_add(1, Ordering::SeqCst) + 1;
-                in_flight.insert(
-                    id,
-                    SchemaInFlightEntry {
-                        token,
-                        waiters: Vec::new(),
-                    },
-                );
-                (None, Some(token))
-            }
-        };
-
-        if let Some(rx) = waiter_rx {
-            return rx.await.map_err(|_| schema_lookup_cancelled_error(id))?;
-        }
-
-        struct InFlightSchemaFetchGuard<'a> {
-            in_flight: &'a Mutex<HashMap<SchemaId, SchemaInFlightEntry>>,
-            id: SchemaId,
-            token: u64,
-            completed: bool,
-        }
-
-        impl Drop for InFlightSchemaFetchGuard<'_> {
-            fn drop(&mut self) {
-                if self.completed {
-                    return;
-                }
-                let waiters = {
-                    let mut in_flight = self.in_flight.lock();
-                    if matches!(in_flight.get(&self.id), Some(entry) if entry.token == self.token) {
-                        in_flight
-                            .remove(&self.id)
-                            .map(|entry| entry.waiters)
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    }
-                };
-
-                for waiter in waiters {
-                    let _ = waiter.send(Err(schema_lookup_cancelled_error(self.id)));
-                }
-            }
-        }
-
-        let Some(leader_token) = leader_token else {
-            return Err(schema_lookup_cancelled_error(id));
-        };
-
-        let mut guard = InFlightSchemaFetchGuard {
-            in_flight: &self.in_flight,
-            id,
-            token: leader_token,
-            completed: false,
-        };
-
-        // Snapshot the invalidation generation *before* hitting the backend so
-        // that any `invalidate()` / `clear_cache()` call issued concurrently
-        // (or racing with our write below) is observable.
-        let gen_before = self.invalidation_generation.load(Ordering::SeqCst);
-
-        let result = self.inner.get_schema_by_id(id).await;
-        let arc_result: Result<Arc<Schema>> = if let Ok(schema) = &result {
-            // Cache only if:
-            //   1. this lookup is still the active leader for this ID (not superseded by
-            //      invalidation/eviction), AND
-            //   2. the invalidation generation has not advanced since we began the fetch.
-            // Condition (2) is checked *inside* the write lock to close the TOCTOU window
-            // between the in_flight token check and the actual cache insertion.
-            let should_insert = {
-                let in_flight = self.in_flight.lock();
-                matches!(in_flight.get(&id), Some(entry) if entry.token == leader_token)
-            };
-
-            if should_insert {
-                let mut cache = self.cache.write();
-                debug!(
-                    schema_id = id.as_u32(),
-                    "schema cache miss — fetched from registry"
-                );
-
-                // Re-check the generation inside the write lock.  If invalidate() ran
-                // between the in_flight check above and acquiring the write lock, we
-                // must not insert a stale entry.
-                if self.invalidation_generation.load(Ordering::SeqCst) != gen_before {
-                    debug!(
-                        schema_id = id.as_u32(),
-                        "schema fetch completed after invalidation; skipping cache insert"
-                    );
-                    Ok(Arc::clone(schema))
-                } else if let Some(existing) = cache.get(&id) {
-                    Ok(Arc::clone(existing))
-                } else {
-                    if let Some(max_entries) = self.max_entries {
-                        let mut insertion_order = self.insertion_order.write();
-                        if cache.len() >= max_entries
-                            && let Some(evicted) = insertion_order.pop_front()
-                        {
-                            cache.remove(&evicted);
-                        }
-                        insertion_order.push_back(id);
-                    }
-                    let arc = Arc::clone(schema);
-                    cache.insert(id, Arc::clone(&arc));
-                    Ok(arc)
-                }
-            } else {
-                debug!(
-                    schema_id = id.as_u32(),
-                    "schema fetch completed after invalidation; skipping cache insert"
-                );
-                Ok(Arc::clone(schema))
-            }
-        } else {
-            Err(result.unwrap_err())
-        };
-
-        let waiters = {
-            let mut in_flight = self.in_flight.lock();
-            if matches!(in_flight.get(&id), Some(entry) if entry.token == leader_token) {
-                in_flight
-                    .remove(&id)
-                    .map(|entry| entry.waiters)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        };
-
-        for waiter in waiters {
-            let _ = waiter.send(arc_result.as_ref().map(Arc::clone).map_err(|e| e.clone()));
-        }
-        guard.completed = true;
-
-        arc_result
     }
 
-    async fn get_latest_schema_impl(&self, subject: &str) -> Result<Arc<Schema>> {
-        let observed_generation = self.invalidation_generation.load(Ordering::SeqCst);
-        let arc_schema = self.inner.get_latest_schema(subject).await?;
-        self.insert_cache_entry_if_current(
-            arc_schema.id,
-            Arc::clone(&arc_schema),
-            observed_generation,
-        );
-        Ok(arc_schema)
+    // ── Inherent duplicates for trait-free callers ────────────────────────
+
+    /// Retrieve a schema by its globally unique ID.
+    pub async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> {
+        self.cache
+            .get_or_fetch(id, || self.inner.get_schema_by_id(id))
+            .await
     }
 
-    async fn get_schema_by_version_impl(
+    /// Retrieve the latest schema registered under the given subject.
+    pub async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
+        let generation = self.cache.generation();
+        let schema = self.inner.get_latest_schema(subject).await?;
+        self.cache
+            .insert_if_current(schema.id, Arc::clone(&schema), generation);
+        Ok(schema)
+    }
+
+    /// Retrieve a specific version of a schema under a subject.
+    pub async fn get_schema_by_version(
         &self,
         subject: &str,
         version: SchemaVersion,
     ) -> Result<Arc<Schema>> {
-        let observed_generation = self.invalidation_generation.load(Ordering::SeqCst);
-        let arc_schema = self.inner.get_schema_by_version(subject, version).await?;
-        self.insert_cache_entry_if_current(
-            arc_schema.id,
-            Arc::clone(&arc_schema),
-            observed_generation,
-        );
-        Ok(arc_schema)
+        let generation = self.cache.generation();
+        let schema = self.inner.get_schema_by_version(subject, version).await?;
+        self.cache
+            .insert_if_current(schema.id, Arc::clone(&schema), generation);
+        Ok(schema)
     }
 
-    async fn register_schema_impl(
+    /// Register a schema under the given subject.
+    pub async fn register_schema(
         &self,
         subject: &str,
         schema: &str,
@@ -442,123 +244,24 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             .register_schema(subject, schema, schema_type, references)
             .await
     }
-
-    /// Retrieve a schema by its globally unique ID.
-    ///
-    /// This inherent method mirrors [`SchemaRegistryClient::get_schema_by_id`]
-    /// so callers of `CachedSchemaRegistry` do not need to import the trait.
-    /// Returns an `Arc<Schema>` so callers can hold a zero-copy reference.
-    pub async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> {
-        self.get_schema_by_id_impl(id).await
-    }
-
-    /// Retrieve the latest schema registered under the given subject.
-    ///
-    /// This inherent method mirrors [`SchemaRegistryClient::get_latest_schema`]
-    /// so callers of `CachedSchemaRegistry` do not need to import the trait.
-    pub async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
-        self.get_latest_schema_impl(subject).await
-    }
-
-    /// Retrieve a specific version of a schema under a subject.
-    ///
-    /// This inherent method mirrors [`SchemaRegistryClient::get_schema_by_version`]
-    /// so callers of `CachedSchemaRegistry` do not need to import the trait.
-    pub async fn get_schema_by_version(
-        &self,
-        subject: &str,
-        version: SchemaVersion,
-    ) -> Result<Arc<Schema>> {
-        self.get_schema_by_version_impl(subject, version).await
-    }
-
-    /// Register a schema under the given subject.
-    ///
-    /// This inherent method mirrors [`SchemaRegistryClient::register_schema`]
-    /// so callers of `CachedSchemaRegistry` do not need to import the trait.
-    pub async fn register_schema(
-        &self,
-        subject: &str,
-        schema: &str,
-        schema_type: SchemaType,
-        references: &[SchemaReference],
-    ) -> Result<SchemaId> {
-        self.register_schema_impl(subject, schema, schema_type, references)
-            .await
-    }
-
-    /// Invalidate all cached schemas whose `subject` field matches `subject`.
-    ///
-    /// Performs an O(n) scan of the cache. For typical caches holding a
-    /// few hundred schemas this is fast. The invalidation bumps the
-    /// generation counter and cancels any in-flight fetches for matched IDs.
-    pub fn invalidate_subject(&self, subject: &str) {
-        let ids: Vec<SchemaId> = self
-            .cache
-            .read()
-            .iter()
-            .filter(|(_, s)| s.subject.as_deref() == Some(subject))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in ids {
-            self.invalidate(id);
-        }
-    }
-
-    fn insert_cache_entry_if_current(
-        &self,
-        id: SchemaId,
-        schema: Arc<Schema>,
-        observed_generation: u64,
-    ) {
-        // Acquire write lock first, then re-check the generation inside it to
-        // close the TOCTOU window that existed when the check was done outside.
-        let mut cache = self.cache.write();
-
-        if self.invalidation_generation.load(Ordering::SeqCst) != observed_generation {
-            debug!(
-                schema_id = id.as_u32(),
-                "schema fetch completed after invalidation; skipping cache insert"
-            );
-            return;
-        }
-
-        // Fast path: update existing entry.
-        if let Some(existing) = cache.get_mut(&id) {
-            *existing = schema;
-            return;
-        }
-
-        // New entry with optional LRU-style eviction.
-        if let Some(max_entries) = self.max_entries {
-            let mut insertion_order = self.insertion_order.write();
-            if cache.len() >= max_entries
-                && let Some(evicted) = insertion_order.pop_front()
-            {
-                cache.remove(&evicted);
-            }
-            insertion_order.push_back(id);
-        }
-        cache.insert(id, schema);
-    }
 }
 
 impl<C> fmt::Debug for CachedSchemaRegistry<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CachedSchemaRegistry")
-            .field("cache_len", &self.cache.read().len())
-            .field("max_entries", &self.max_entries)
+            .field("cache_len", &self.cache.len())
+            .field("cache", &self.cache)
             .finish()
     }
 }
 
 impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
     async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> {
-        self.get_schema_by_id_impl(id).await
+        self.get_schema_by_id(id).await
     }
 
     async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
-        self.get_latest_schema_impl(subject).await
+        self.get_latest_schema(subject).await
     }
 
     async fn get_schema_by_version(
@@ -566,7 +269,7 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
         subject: &str,
         version: SchemaVersion,
     ) -> Result<Arc<Schema>> {
-        self.get_schema_by_version_impl(subject, version).await
+        self.get_schema_by_version(subject, version).await
     }
 
     async fn register_schema(
@@ -576,7 +279,7 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
         schema_type: SchemaType,
         references: &[SchemaReference],
     ) -> Result<SchemaId> {
-        self.register_schema_impl(subject, schema, schema_type, references)
+        self.register_schema(subject, schema, schema_type, references)
             .await
     }
 
@@ -608,6 +311,25 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
         subject: &'a str,
     ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
         self.inner.get_versions(subject)
+    }
+
+    fn health_check(&self) -> impl Future<Output = Result<()>> + Send + '_ {
+        self.inner.health_check()
+    }
+
+    fn set_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+        level: CompatibilityLevel,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        self.inner.set_compatibility(subject, level)
+    }
+
+    fn get_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> impl Future<Output = Result<CompatibilityLevel>> + Send + 'a {
+        self.inner.get_compatibility(subject)
     }
 }
 
@@ -1014,8 +736,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_with_capacity() {
-        let cached = CachedSchemaRegistry::with_capacity(MockRegistry::new(), 100);
+    async fn test_cache_with_max_entries() {
+        let cached = CachedSchemaRegistry::with_max_entries(MockRegistry::new(), 100);
         assert_eq!(cached.cache_len(), 0);
         ok(cached.get_schema_by_id(SchemaId::from(1u32)).await);
         assert_eq!(cached.cache_len(), 1);

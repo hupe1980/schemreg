@@ -24,9 +24,19 @@ allow = [
 ]
 
 [bans]
-# Warn on duplicate versions of the same crate; bump to "deny" when dependencies
-# are fully aligned.
-multiple-versions = "warn"
+# Deny duplicate versions of the same crate to prevent accidental
+# introduction of a second copy of security-critical crates (e.g. ring,
+# rustls, zeroize). Re-evaluate per-package skip entries as the dependency
+# tree stabilises.
+multiple-versions = "deny"
+skip = [
+    # aws-sdk crates and their smithy runtime currently pull in two versions
+    # of a few utility crates; these are upstream constraints, not our choices.
+    { name = "bitflags" },
+    { name = "hashbrown" },
+    { name = "indexmap" },
+    { name = "syn" },
+]
 # Prevent pulling in native OpenSSL — the crate uses rustls exclusively.
 deny = [
     { name = "openssl", reason = "use rustls — openssl introduces native-library coupling and a larger attack surface" },

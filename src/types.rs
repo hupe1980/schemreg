@@ -211,7 +211,10 @@ pub struct Schema {
     /// Schema version within its subject (`None` when fetched by ID only).
     pub version: Option<SchemaVersion>,
     /// Subject name (`None` when fetched by ID only).
-    pub subject: Option<String>,
+    ///
+    /// Stored as `Arc<str>` so that cloning a [`Schema`] is O(1) regardless
+    /// of subject name length.
+    pub subject: Option<Arc<str>>,
     /// References to other schemas.
     pub references: Vec<SchemaReference>,
 }
@@ -241,7 +244,7 @@ impl Schema {
     /// Set the subject and version.
     pub fn with_subject(
         mut self,
-        subject: impl Into<String>,
+        subject: impl Into<Arc<str>>,
         version: impl Into<SchemaVersion>,
     ) -> Self {
         self.subject = Some(subject.into());
@@ -253,6 +256,75 @@ impl Schema {
     pub fn with_references(mut self, references: Vec<SchemaReference>) -> Self {
         self.references = references;
         self
+    }
+}
+
+/// Per-subject (or global) schema compatibility policy.
+///
+/// Controls which schema changes are allowed when registering a new version.
+/// The `Transitive` variants enforce compatibility against *all* prior versions,
+/// not just the immediately preceding one.
+///
+/// # Serialisation
+///
+/// The string representation matches Confluent Schema Registry's API values
+/// (`"BACKWARD"`, `"FORWARD"`, etc.).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompatibilityLevel {
+    /// New schema must be readable by code written against the previous schema.
+    Backward,
+    /// New schema must be readable by code written against any prior schema.
+    BackwardTransitive,
+    /// Old schema must be readable by code written against the new schema.
+    Forward,
+    /// Old schema must be readable by code written against any prior schema.
+    ForwardTransitive,
+    /// Both backward and forward compatible.
+    Full,
+    /// Both backward and forward compatible against all prior schemas.
+    FullTransitive,
+    /// No compatibility checks enforced.
+    None,
+}
+
+impl CompatibilityLevel {
+    /// Return the canonical string used by the Confluent Schema Registry API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Backward => "BACKWARD",
+            Self::BackwardTransitive => "BACKWARD_TRANSITIVE",
+            Self::Forward => "FORWARD",
+            Self::ForwardTransitive => "FORWARD_TRANSITIVE",
+            Self::Full => "FULL",
+            Self::FullTransitive => "FULL_TRANSITIVE",
+            Self::None => "NONE",
+        }
+    }
+}
+
+impl fmt::Display for CompatibilityLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CompatibilityLevel {
+    type Err = SchemaRegError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "BACKWARD" => Ok(Self::Backward),
+            "BACKWARD_TRANSITIVE" => Ok(Self::BackwardTransitive),
+            "FORWARD" => Ok(Self::Forward),
+            "FORWARD_TRANSITIVE" => Ok(Self::ForwardTransitive),
+            "FULL" => Ok(Self::Full),
+            "FULL_TRANSITIVE" => Ok(Self::FullTransitive),
+            "NONE" => Ok(Self::None),
+            _ => Err(SchemaRegError::invalid_state(format!(
+                "unknown compatibility level: '{s}'"
+            ))),
+        }
     }
 }
 
@@ -304,6 +376,7 @@ const _: () = {
         assert_send_sync::<Schema>();
         assert_send_sync::<SchemaReference>();
         assert_send_sync::<ArtifactId>();
+        assert_send_sync::<CompatibilityLevel>();
     }
     let _ = check;
 };
@@ -427,7 +500,7 @@ mod tests {
     #[test]
     fn test_schema_with_subject() {
         let s = Schema::new(1u32, SchemaType::Avro, "{}").with_subject("my-topic-value", 3i32);
-        assert_eq!(s.subject, Some("my-topic-value".to_string()));
+        assert_eq!(s.subject.as_deref(), Some("my-topic-value"));
         assert_eq!(s.version, Some(SchemaVersion::new(3)));
     }
 

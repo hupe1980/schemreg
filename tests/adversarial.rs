@@ -150,6 +150,41 @@ mod glue_adversarial {
         let wf = detect_wire_format(&Bytes::from(buf));
         assert!(matches!(wf, DetectedWireFormat::Unknown), "{wf:?}");
     }
+
+    /// Glue header with an unknown compression byte (0x01) — decode must return an error.
+    #[test]
+    fn glue_unknown_compression_byte_is_error() {
+        use schemreg::glue::decode_glue_wire_format;
+        let mut buf = vec![0x03u8]; // version byte
+        buf.push(0x01); // unknown compression byte
+        buf.extend_from_slice(&[0xAAu8; 16]); // UUID
+        buf.extend_from_slice(b"payload");
+        let result = decode_glue_wire_format(&buf);
+        assert!(
+            result.is_err(),
+            "unknown compression byte 0x01 must be rejected: {result:?}"
+        );
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("0x01"),
+            "error should mention the unknown byte: {err_str}"
+        );
+    }
+
+    /// Glue header with compression byte 0x02 — also unknown, must return an error.
+    #[test]
+    fn glue_compression_byte_0x02_is_error() {
+        use schemreg::glue::decode_glue_wire_format;
+        let mut buf = vec![0x03u8];
+        buf.push(0x02);
+        buf.extend_from_slice(&[0xBBu8; 16]);
+        buf.extend_from_slice(b"payload");
+        let result = decode_glue_wire_format(&buf);
+        assert!(
+            result.is_err(),
+            "unknown compression byte 0x02 must be rejected: {result:?}"
+        );
+    }
 }
 
 // ── Protobuf message-index adversarial inputs ─────────────────────────────
@@ -215,5 +250,25 @@ mod protobuf_adversarial {
             decode_protobuf_message_indexes(&buf).expect("large index value is valid");
         assert_eq!(idxs, vec![150]);
         assert_eq!(consumed, 3);
+    }
+
+    /// Message-index count greater than the 512 limit must be rejected.
+    ///
+    /// The count value 513 encodes as a two-byte varint: 513 = 0x201 →
+    /// little-endian varint = [0x81, 0x04].
+    #[test]
+    fn protobuf_message_index_count_over_limit_is_error() {
+        // varint for 513: 513 & 0x7F = 0x01 with continuation bit → 0x81; 513 >> 7 = 4 → 0x04
+        let buf = Bytes::from_static(&[0x81, 0x04]);
+        let result = decode_protobuf_message_indexes(&buf);
+        assert!(
+            result.is_err(),
+            "message-index count 513 (> 512 limit) must be rejected: {result:?}"
+        );
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("513") || err_str.contains("512"),
+            "error should mention the limit or count: {err_str}"
+        );
     }
 }

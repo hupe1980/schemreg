@@ -13,9 +13,14 @@ use serde::{Deserialize, Serialize};
 use base64::Engine as _;
 
 use crate::error::{Result, SchemaRegError};
-use crate::http::HttpClient;
+use crate::http::{
+    HttpClient, HttpClientConfig, normalize_url, percent_encode, reject_embedded_credentials,
+    validate_subject,
+};
 use crate::traits::SchemaRegistryClient;
-use crate::types::{Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion};
+use crate::types::{
+    CompatibilityLevel, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion,
+};
 
 const SCHEMA_REGISTRY_CONTENT_TYPE: &str = "application/vnd.schemaregistry.v1+json";
 const ERROR_BODY_PREVIEW_LIMIT: usize = 512;
@@ -50,6 +55,17 @@ struct RegisterSchemaResponse {
 #[derive(Deserialize)]
 struct CompatibilityResponse {
     is_compatible: bool,
+}
+
+#[derive(Deserialize)]
+struct CompatibilityLevelResponse {
+    #[serde(rename = "compatibility", alias = "compatibilityLevel")]
+    level: String,
+}
+
+#[derive(Serialize)]
+struct SetCompatibilityRequest {
+    compatibility: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +146,8 @@ pub struct ConfluentSchemaRegistry {
     client: HttpClient,
     base_url: String,
     auth: RegistryAuth,
+    /// When `true`, append `?normalize=true` to schema registration requests.
+    normalize: bool,
 }
 
 impl ConfluentSchemaRegistry {
@@ -149,6 +167,7 @@ impl ConfluentSchemaRegistry {
             client,
             base_url: url,
             auth: RegistryAuth::None,
+            normalize: false,
         })
     }
 
@@ -165,6 +184,7 @@ impl ConfluentSchemaRegistry {
         schema_type: SchemaType,
         references: &[SchemaReference],
     ) -> Result<bool> {
+        validate_subject(subject)?;
         let url = format!(
             "{}/compatibility/subjects/{}/versions/latest",
             self.base_url,
@@ -190,12 +210,64 @@ impl ConfluentSchemaRegistry {
 
     /// List all versions registered under a subject.
     pub async fn get_versions(&self, subject: &str) -> Result<Vec<SchemaVersion>> {
+        validate_subject(subject)?;
         let url = format!(
             "{}/subjects/{}/versions",
             self.base_url,
             percent_encode(subject)
         );
         self.http_get(&url).await
+    }
+
+    /// Probe the registry for connectivity.
+    ///
+    /// Issues `GET /subjects?limit=1` — a lightweight request that succeeds
+    /// whenever the registry is reachable and authenticated.
+    pub async fn health_check(&self) -> Result<()> {
+        let url = format!("{}/subjects?limit=1", self.base_url);
+        self.http_get::<Vec<String>>(&url).await?;
+        Ok(())
+    }
+
+    /// Set the per-subject compatibility policy.
+    ///
+    /// Uses `PUT /config/{subject}`. To update the global default use an
+    /// empty subject string `""`.
+    pub async fn set_compatibility(&self, subject: &str, level: CompatibilityLevel) -> Result<()> {
+        let url = if subject.is_empty() {
+            format!("{}/config", self.base_url)
+        } else {
+            validate_subject(subject)?;
+            format!("{}/config/{}", self.base_url, percent_encode(subject))
+        };
+        let body = SetCompatibilityRequest {
+            compatibility: level.as_str(),
+        };
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+            SchemaRegError::invalid_state(format!("failed to serialise request: {e}"))
+        })?;
+        let _: serde_json::Value = self.http_put(&url, &body_bytes).await?;
+        Ok(())
+    }
+
+    /// Get the current compatibility policy for a subject.
+    ///
+    /// Uses `GET /config/{subject}`. If `subject` is empty, returns the global
+    /// default compatibility level (`GET /config`).
+    ///
+    /// Returns a registry API error if the subject has no per-subject override
+    /// and the caller passed a non-empty subject (i.e. the registry returns 404
+    /// for subjects with no explicit override configured). Use an empty string to
+    /// unconditionally retrieve the global default.
+    pub async fn get_compatibility(&self, subject: &str) -> Result<CompatibilityLevel> {
+        let url = if subject.is_empty() {
+            format!("{}/config", self.base_url)
+        } else {
+            validate_subject(subject)?;
+            format!("{}/config/{}", self.base_url, percent_encode(subject))
+        };
+        let resp: CompatibilityLevelResponse = self.http_get(&url).await?;
+        resp.level.parse()
     }
 
     /// Delete a subject and all its versions.
@@ -309,6 +381,25 @@ impl ConfluentSchemaRegistry {
         Self::handle_response(resp.status, resp.content_type.as_deref(), &resp.body)
     }
 
+    async fn http_put<T: serde::de::DeserializeOwned>(&self, url: &str, body: &[u8]) -> Result<T> {
+        let auth = self.auth_header_value();
+        let auth_str = auth.as_ref().map(|z| z.as_str());
+        let resp = self
+            .client
+            .request(
+                "PUT",
+                url,
+                &[
+                    ("Accept", SCHEMA_REGISTRY_CONTENT_TYPE),
+                    ("Content-Type", SCHEMA_REGISTRY_CONTENT_TYPE),
+                ],
+                Some(body),
+                auth_str,
+            )
+            .await?;
+        Self::handle_response(resp.status, resp.content_type.as_deref(), &resp.body)
+    }
+
     async fn http_delete<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let auth = self.auth_header_value();
         let auth_str = auth.as_ref().map(|z| z.as_str());
@@ -353,7 +444,7 @@ impl ConfluentSchemaRegistry {
             schema_type,
             schema: body.schema.into(),
             version: Some(body.version),
-            subject: Some(body.subject),
+            subject: Some(Arc::from(body.subject.as_str())),
             references: Self::parse_references(body.references),
         })
     }
@@ -390,6 +481,7 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
     }
 
     async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
+        validate_subject(subject)?;
         let url = format!(
             "{}/subjects/{}/versions/latest",
             self.base_url,
@@ -404,6 +496,7 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
         subject: &str,
         version: SchemaVersion,
     ) -> Result<Arc<Schema>> {
+        validate_subject(subject)?;
         let url = format!(
             "{}/subjects/{}/versions/{version}",
             self.base_url,
@@ -420,12 +513,21 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
         schema_type: SchemaType,
         references: &[SchemaReference],
     ) -> Result<SchemaId> {
+        validate_subject(subject)?;
         let refs = Self::to_reference_json(references);
-        let url = format!(
-            "{}/subjects/{}/versions",
-            self.base_url,
-            percent_encode(subject)
-        );
+        let url = if self.normalize {
+            format!(
+                "{}/subjects/{}/versions?normalize=true",
+                self.base_url,
+                percent_encode(subject)
+            )
+        } else {
+            format!(
+                "{}/subjects/{}/versions",
+                self.base_url,
+                percent_encode(subject)
+            )
+        };
         let body = RegisterSchemaRequest {
             schema,
             schema_type: schema_type.as_str(),
@@ -466,62 +568,25 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
     ) -> impl std::future::Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
         ConfluentSchemaRegistry::get_versions(self, subject)
     }
-}
 
-fn normalize_url(mut url: String) -> String {
-    let trimmed_len = url.trim_end_matches('/').len();
-    url.truncate(trimmed_len);
-    url
-}
-
-fn reject_embedded_credentials(url: &str) -> Result<()> {
-    let Some(scheme_end) = url.find("://") else {
-        return Ok(());
-    };
-    let authority_start = scheme_end + 3;
-    let authority = &url[authority_start..];
-    let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
-    let authority_slice = &authority[..authority_end];
-
-    if authority_slice.contains('@') {
-        return Err(SchemaRegError::config(
-            "schema registry URL must not contain embedded credentials (user:pass@host); \
-             use ConfluentSchemaRegistryBuilder::basic_auth() instead",
-        ));
+    fn health_check(&self) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        ConfluentSchemaRegistry::health_check(self)
     }
-    Ok(())
-}
 
-/// Characters that MUST be percent-encoded in a URL path segment (RFC 3986).
-///
-/// This set preserves unreserved characters (`A-Z a-z 0-9 - _ . ~`) and all
-/// sub-delimiters/path characters that are valid in a segment, while encoding
-/// only the characters that would break URL parsing. Notably, `.` and `-` are
-/// NOT encoded, which allows typical Confluent subject names such as
-/// `com.example.Order-value` to round-trip without modification.
-static PATH_SEGMENT_ENCODE_SET: percent_encoding::AsciiSet = percent_encoding::CONTROLS
-    .add(b' ')
-    .add(b'"')
-    .add(b'#')
-    .add(b'<')
-    .add(b'>')
-    .add(b'?')
-    .add(b'`')
-    .add(b'{')
-    .add(b'}')
-    .add(b'/')
-    .add(b'%')
-    // RFC 3986 gen-delims that must not appear unencoded in a path segment
-    .add(b'[')
-    .add(b']')
-    // Characters not valid in a segment per RFC 3986
-    .add(b'\\')
-    .add(b'^')
-    // @ must be encoded in path segments per RFC 3986 §3.3
-    .add(b'@');
+    fn set_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+        level: CompatibilityLevel,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        ConfluentSchemaRegistry::set_compatibility(self, subject, level)
+    }
 
-fn percent_encode(input: &str) -> String {
-    percent_encoding::utf8_percent_encode(input, &PATH_SEGMENT_ENCODE_SET).to_string()
+    fn get_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> impl std::future::Future<Output = Result<CompatibilityLevel>> + Send + 'a {
+        ConfluentSchemaRegistry::get_compatibility(self, subject)
+    }
 }
 
 // ── Builder ──────────────────────────────────────────────────────────────
@@ -531,10 +596,15 @@ pub struct ConfluentSchemaRegistryBuilder {
     url: Option<String>,
     auth: RegistryAuth,
     request_timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
+    /// When `true`, append `?normalize=true` to schema registration requests.
+    normalize: bool,
     /// Additional root CA certificates to trust (e.g. for private CAs).
     root_certificates: Vec<reqwest::Certificate>,
     /// Client certificate + private key for mTLS.
     identity: Option<reqwest::Identity>,
+    /// Maximum idle connections per host kept in the connection pool.
+    pool_max_idle_per_host: Option<usize>,
 }
 
 impl Default for ConfluentSchemaRegistryBuilder {
@@ -543,8 +613,11 @@ impl Default for ConfluentSchemaRegistryBuilder {
             url: None,
             auth: RegistryAuth::None,
             request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            connect_timeout: None,
+            normalize: false,
             root_certificates: Vec::new(),
             identity: None,
+            pool_max_idle_per_host: None,
         }
     }
 }
@@ -554,6 +627,34 @@ impl ConfluentSchemaRegistryBuilder {
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
         self
+    }
+
+    /// Build a [`ConfluentSchemaRegistryBuilder`] from environment variables.
+    ///
+    /// Reads the following variables:
+    /// - `SCHEMA_REGISTRY_URL` (required)
+    /// - `SCHEMA_REGISTRY_USERNAME` + `SCHEMA_REGISTRY_PASSWORD` → basic auth
+    /// - `SCHEMA_REGISTRY_BEARER_TOKEN` → bearer token auth
+    ///
+    /// If both basic-auth and bearer-token variables are set, bearer token
+    /// takes precedence.
+    pub fn from_env() -> Result<Self> {
+        let url = std::env::var("SCHEMA_REGISTRY_URL").map_err(|_| {
+            SchemaRegError::config("SCHEMA_REGISTRY_URL environment variable is required")
+        })?;
+
+        let mut builder = Self::default().url(url);
+
+        if let Ok(token) = std::env::var("SCHEMA_REGISTRY_BEARER_TOKEN") {
+            builder = builder.bearer_token(token);
+        } else if let (Ok(user), Ok(pass)) = (
+            std::env::var("SCHEMA_REGISTRY_USERNAME"),
+            std::env::var("SCHEMA_REGISTRY_PASSWORD"),
+        ) {
+            builder = builder.basic_auth(user, pass);
+        }
+
+        Ok(builder)
     }
 
     /// Set basic authentication credentials.
@@ -585,6 +686,25 @@ impl ConfluentSchemaRegistryBuilder {
         self
     }
 
+    /// Set the TCP connection establishment timeout.
+    ///
+    /// Separate from the per-request timeout; controls how long the client
+    /// waits before giving up on the initial TCP handshake.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// When set to `true`, append `?normalize=true` to schema registration
+    /// requests so the registry normalises the schema before storing it.
+    ///
+    /// Useful when comparing schemas registered from different producers that
+    /// may use different field ordering.
+    pub fn normalize_schemas(mut self, normalize: bool) -> Self {
+        self.normalize = normalize;
+        self
+    }
+
     /// Add a custom root CA certificate to trust.
     ///
     /// Useful when the registry uses a private certificate authority (e.g. an
@@ -601,6 +721,15 @@ impl ConfluentSchemaRegistryBuilder {
     /// [`reqwest::Identity::from_pem`].
     pub fn identity(mut self, identity: reqwest::Identity) -> Self {
         self.identity = Some(identity);
+        self
+    }
+
+    /// Set the maximum number of idle connections kept per host in the pool.
+    ///
+    /// Set to `0` to disable connection reuse entirely. The default (unset)
+    /// uses reqwest's built-in pool limit.
+    pub fn pool_max_idle_per_host(mut self, n: usize) -> Self {
+        self.pool_max_idle_per_host = Some(n);
         self
     }
 
@@ -622,16 +751,19 @@ impl ConfluentSchemaRegistryBuilder {
             ));
         }
 
-        let client = HttpClient::with_config(crate::http::HttpClientConfig {
+        let client = HttpClient::with_config(HttpClientConfig {
             timeout: self.request_timeout,
+            connect_timeout: self.connect_timeout,
             root_certificates: self.root_certificates,
             identity: self.identity,
+            pool_max_idle_per_host: self.pool_max_idle_per_host,
         })?;
 
         Ok(ConfluentSchemaRegistry {
             client,
             base_url: normalize_url(url),
             auth: self.auth,
+            normalize: self.normalize,
         })
     }
 }

@@ -9,6 +9,7 @@
 //! - Encoder and decoder adapters (Avro, JSON Schema, raw)
 
 pub mod cache;
+pub(crate) mod cache_inner;
 pub mod decoder;
 pub mod error;
 pub mod glue;
@@ -49,7 +50,8 @@ pub use traits::{
     AnySchemaCache, DynSchemaRegistryClient, SchemaDecoder, SchemaEncoder, SchemaRegistryClient,
 };
 pub use types::{
-    ArtifactId, EncodeTarget, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion,
+    ArtifactId, CompatibilityLevel, EncodeTarget, Schema, SchemaId, SchemaReference, SchemaType,
+    SchemaVersion,
 };
 pub use wire::{
     DetectedWireFormat, decode_protobuf_message_indexes, decode_wire_format,

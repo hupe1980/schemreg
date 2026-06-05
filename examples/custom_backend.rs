@@ -128,7 +128,7 @@ impl SchemaRegistryClient for InMemorySchemaBackend {
         Ok(self
             .by_id
             .values()
-            .filter_map(|s| s.subject.clone())
+            .filter_map(|s| s.subject.as_deref().map(str::to_owned))
             .collect())
     }
 
