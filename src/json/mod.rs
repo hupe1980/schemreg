@@ -17,7 +17,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.2", features = ["json"] }
+//! schemreg = { version = "0.3", features = ["json"] }
 //! ```
 //!
 //! # Layered model

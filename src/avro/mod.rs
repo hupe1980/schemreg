@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.2", features = ["avro"] }
+//! schemreg = { version = "0.3", features = ["avro"] }
 //! ```
 //!
 //! # Layered model

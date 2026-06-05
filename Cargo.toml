@@ -1,6 +1,6 @@
 [package]
 name        = "schemreg"
-version     = "0.2.0"
+version     = "0.3.0"
 edition     = "2024"
 rust-version = "1.88"
 authors     = ["hupe1980"]
@@ -58,7 +58,10 @@ apicurio         = [
 
 [dependencies]
 # Async runtime
-tokio        = { version = "1", features = ["net", "io-util", "sync", "time"] }
+tokio        = { version = "1", features = ["net", "io-util", "sync", "time", "rt"] }
+
+# Async utilities (join_all for warm_cache concurrency, etc.)
+futures      = { version = "0.3", default-features = false, features = ["alloc"] }
 
 
 # Zero-copy buffers

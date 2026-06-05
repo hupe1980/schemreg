@@ -6,8 +6,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::error::Result;
-use crate::types::{EncodeTarget, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion};
+use crate::error::{Result, SchemaRegError};
+use crate::types::{
+    CompatibilityLevel, EncodeTarget, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion,
+};
+
+// ── SchemaRegistryClient ──────────────────────────────────────────────────
 
 /// Async client interface for a schema registry.
 ///
@@ -16,9 +20,14 @@ use crate::types::{EncodeTarget, Schema, SchemaId, SchemaReference, SchemaType, 
 /// provides a ready-made HTTP implementation for the Confluent Schema
 /// Registry (and compatible registries such as Karapace and Apicurio).
 ///
-/// All methods use `async fn` (RPITIT), allowing zero-cost monomorphization at
-/// generic call sites. Object-safe erased wrappers are used internally where
-/// dynamic dispatch is needed (e.g. [`WireFormatDecoder`](crate::WireFormatDecoder)).
+/// All methods use RPITIT (`-> impl Future + Send`) to allow zero-cost
+/// monomorphization at generic call sites; concrete impl blocks may use
+/// `async fn` syntax and the compiler verifies `Send`-ness automatically.
+///
+/// For object-safe trait objects, use [`DynSchemaRegistryClient`] which
+/// provides the same interface with `Pin<Box<dyn Future>>` return types. A
+/// blanket implementation is automatically provided for every
+/// `SchemaRegistryClient`.
 ///
 /// # Implementing a custom backend
 ///
@@ -50,10 +59,6 @@ use crate::types::{EncodeTarget, Schema, SchemaId, SchemaReference, SchemaType, 
 ///
 /// # Wrapping with a cache
 ///
-/// Any `SchemaRegistryClient` implementation can be transparently wrapped with
-/// [`CachedSchemaRegistry`](crate::CachedSchemaRegistry) for in-memory caching
-/// with thundering-herd coalescing:
-///
 /// ```rust
 /// use std::sync::Arc;
 /// use schemreg::CachedSchemaRegistry;
@@ -73,26 +78,19 @@ pub trait SchemaRegistryClient: Send + Sync {
     /// Retrieve a schema by its globally unique ID.
     ///
     /// Schema IDs are immutable — a given ID always maps to the same schema.
-    /// The returned `Arc<Schema>` allows callers to hold a zero-copy reference
-    /// into the cache without cloning the schema bytes.
+    /// Returns `Arc<Schema>` for zero-copy sharing across tasks.
     fn get_schema_by_id(
         &self,
         id: SchemaId,
     ) -> impl Future<Output = Result<Arc<Schema>>> + Send + '_;
 
     /// Retrieve the latest schema registered under the given subject.
-    ///
-    /// Returns an `Arc<Schema>` to allow callers to hold a zero-copy
-    /// reference without cloning the schema bytes.
     fn get_latest_schema<'a>(
         &'a self,
         subject: &'a str,
     ) -> impl Future<Output = Result<Arc<Schema>>> + Send + 'a;
 
     /// Retrieve a specific version of a schema under a subject.
-    ///
-    /// Returns an `Arc<Schema>` to allow callers to hold a zero-copy
-    /// reference without cloning the schema bytes.
     fn get_schema_by_version<'a>(
         &'a self,
         subject: &'a str,
@@ -101,9 +99,8 @@ pub trait SchemaRegistryClient: Send + Sync {
 
     /// Register a schema under the given subject.
     ///
-    /// If the same schema is already registered, the existing ID is returned
-    /// (the operation is idempotent). Pass `&[]` for `references` when the
-    /// schema has no dependencies.
+    /// Idempotent: returns the existing ID if already registered.
+    /// Pass `&[]` for `references` when there are no dependencies.
     fn register_schema<'a>(
         &'a self,
         subject: &'a str,
@@ -112,14 +109,11 @@ pub trait SchemaRegistryClient: Send + Sync {
         references: &'a [SchemaReference],
     ) -> impl Future<Output = Result<SchemaId>> + Send + 'a;
 
-    /// Check whether a schema is compatible with the latest version registered
-    /// under `subject`.
+    /// Check whether `schema` is compatible with the latest version registered
+    /// under `subject`, per the subject's configured compatibility level.
     ///
-    /// Returns `true` when the schema is compatible according to the subject's
-    /// configured compatibility level, `false` otherwise.
-    ///
-    /// Implementations that do not support this operation return
-    /// `Err(SchemaRegError::registry("check_compatibility: not implemented"))`.
+    /// Returns `true` when compatible, `false` otherwise.
+    /// Default: `Err(NotSupported)`.
     fn check_compatibility<'a>(
         &'a self,
         _subject: &'a str,
@@ -127,196 +121,446 @@ pub trait SchemaRegistryClient: Send + Sync {
         _schema_type: SchemaType,
         _references: &'a [SchemaReference],
     ) -> impl Future<Output = Result<bool>> + Send + 'a {
-        std::future::ready(Err(crate::error::SchemaRegError::not_supported(
-            "check_compatibility is not supported by this registry",
-        )))
+        async {
+            Err(SchemaRegError::not_supported(
+                "check_compatibility is not supported by this registry",
+            ))
+        }
+    }
+
+    /// Convenience alias for [`check_compatibility`](Self::check_compatibility)
+    /// with an empty references slice.
+    ///
+    /// Equivalent to `check_compatibility(subject, schema, schema_type, &[])`.
+    fn check_compatible<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+    ) -> impl Future<Output = Result<bool>> + Send + 'a {
+        self.check_compatibility(subject, schema, schema_type, &[])
     }
 
     /// Delete a subject and all its registered versions.
     ///
-    /// Returns the list of deleted version numbers. Set `permanent` to `true`
-    /// to perform a hard delete (bypasses the soft-delete stage).
-    ///
-    /// Implementations that do not support this operation return
-    /// `Err(SchemaRegError::registry("delete_subject: not implemented"))`.
+    /// Returns deleted version numbers. Set `permanent = true` to hard-delete,
+    /// bypassing the soft-delete stage.
+    /// Default: `Err(NotSupported)`.
     fn delete_subject<'a>(
         &'a self,
         _subject: &'a str,
         _permanent: bool,
     ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
-        std::future::ready(Err(crate::error::SchemaRegError::not_supported(
-            "delete_subject is not supported by this registry",
-        )))
+        async {
+            Err(SchemaRegError::not_supported(
+                "delete_subject is not supported by this registry",
+            ))
+        }
     }
 
     /// List all subjects currently registered in the registry.
-    ///
-    /// Implementations that do not support this operation return
-    /// `Err(SchemaRegError::registry("get_subjects: not implemented"))`.
+    /// Default: `Err(NotSupported)`.
     fn get_subjects(&self) -> impl Future<Output = Result<Vec<String>>> + Send + '_ {
-        std::future::ready(Err(crate::error::SchemaRegError::not_supported(
-            "get_subjects is not supported by this registry",
-        )))
+        async {
+            Err(SchemaRegError::not_supported(
+                "get_subjects is not supported by this registry",
+            ))
+        }
     }
 
     /// List all version numbers registered under `subject`.
-    ///
-    /// Implementations that do not support this operation return
-    /// `Err(SchemaRegError::registry("get_versions: not implemented"))`.
+    /// Default: `Err(NotSupported)`.
     fn get_versions<'a>(
         &'a self,
         _subject: &'a str,
     ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
-        std::future::ready(Err(crate::error::SchemaRegError::not_supported(
-            "get_versions is not supported by this registry",
-        )))
+        async {
+            Err(SchemaRegError::not_supported(
+                "get_versions is not supported by this registry",
+            ))
+        }
+    }
+
+    /// Probe the registry for connectivity.
+    ///
+    /// Returns `Ok(())` when the registry is reachable. Designed for
+    /// Kubernetes readiness probes and startup preflight checks.
+    /// Default: `Err(NotSupported)`.
+    fn health_check(&self) -> impl Future<Output = Result<()>> + Send + '_ {
+        async {
+            Err(SchemaRegError::not_supported(
+                "health_check is not supported by this registry",
+            ))
+        }
+    }
+
+    /// Set the compatibility level for a subject.
+    ///
+    /// Uses `PUT /config/{subject}` on Confluent-compatible registries.
+    /// Default: `Err(NotSupported)`.
+    fn set_compatibility<'a>(
+        &'a self,
+        _subject: &'a str,
+        _level: CompatibilityLevel,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        async {
+            Err(SchemaRegError::not_supported(
+                "set_compatibility is not supported by this registry",
+            ))
+        }
+    }
+
+    /// Get the current compatibility level for a subject.
+    ///
+    /// Uses `GET /config/{subject}` on Confluent-compatible registries.
+    /// Default: `Err(NotSupported)`.
+    fn get_compatibility<'a>(
+        &'a self,
+        _subject: &'a str,
+    ) -> impl Future<Output = Result<CompatibilityLevel>> + Send + 'a {
+        async {
+            Err(SchemaRegError::not_supported(
+                "get_compatibility is not supported by this registry",
+            ))
+        }
     }
 }
 
-// Blanket forward implementation so that `&T` and `Arc<T>` can be used
-// wherever a `SchemaRegistryClient` is expected.
+// ── Blanket impls: &T and Arc<T> ─────────────────────────────────────────
+//
+// Enables CachedSchemaRegistry<&T>, generic fn<C: SchemaRegistryClient> etc.
+// Every method explicitly delegates to the inner T so that concrete provider
+// implementations — not the default stubs — are reached.
+
 impl<T: SchemaRegistryClient + ?Sized> SchemaRegistryClient for &T {
     fn get_schema_by_id(
         &self,
-        id: crate::types::SchemaId,
-    ) -> impl Future<Output = crate::error::Result<Arc<crate::types::Schema>>> + Send + '_ {
-        T::get_schema_by_id(self, id)
+        id: SchemaId,
+    ) -> impl Future<Output = Result<Arc<Schema>>> + Send + '_ {
+        (**self).get_schema_by_id(id)
     }
     fn get_latest_schema<'a>(
         &'a self,
         subject: &'a str,
-    ) -> impl Future<Output = crate::error::Result<Arc<crate::types::Schema>>> + Send + 'a {
-        T::get_latest_schema(self, subject)
+    ) -> impl Future<Output = Result<Arc<Schema>>> + Send + 'a {
+        (**self).get_latest_schema(subject)
     }
     fn get_schema_by_version<'a>(
         &'a self,
         subject: &'a str,
-        version: crate::types::SchemaVersion,
-    ) -> impl Future<Output = crate::error::Result<Arc<crate::types::Schema>>> + Send + 'a {
-        T::get_schema_by_version(self, subject, version)
+        version: SchemaVersion,
+    ) -> impl Future<Output = Result<Arc<Schema>>> + Send + 'a {
+        (**self).get_schema_by_version(subject, version)
     }
     fn register_schema<'a>(
         &'a self,
         subject: &'a str,
         schema: &'a str,
-        schema_type: crate::types::SchemaType,
-        references: &'a [crate::types::SchemaReference],
-    ) -> impl Future<Output = crate::error::Result<crate::types::SchemaId>> + Send + 'a {
-        T::register_schema(self, subject, schema, schema_type, references)
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> impl Future<Output = Result<SchemaId>> + Send + 'a {
+        (**self).register_schema(subject, schema, schema_type, references)
     }
     fn check_compatibility<'a>(
         &'a self,
         subject: &'a str,
         schema: &'a str,
-        schema_type: crate::types::SchemaType,
-        references: &'a [crate::types::SchemaReference],
-    ) -> impl Future<Output = crate::error::Result<bool>> + Send + 'a {
-        T::check_compatibility(self, subject, schema, schema_type, references)
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> impl Future<Output = Result<bool>> + Send + 'a {
+        (**self).check_compatibility(subject, schema, schema_type, references)
     }
     fn delete_subject<'a>(
         &'a self,
         subject: &'a str,
         permanent: bool,
-    ) -> impl Future<Output = crate::error::Result<Vec<crate::types::SchemaVersion>>> + Send + 'a
-    {
-        T::delete_subject(self, subject, permanent)
+    ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
+        (**self).delete_subject(subject, permanent)
     }
-    fn get_subjects(&self) -> impl Future<Output = crate::error::Result<Vec<String>>> + Send + '_ {
-        T::get_subjects(self)
+    fn get_subjects(&self) -> impl Future<Output = Result<Vec<String>>> + Send + '_ {
+        (**self).get_subjects()
     }
     fn get_versions<'a>(
         &'a self,
         subject: &'a str,
-    ) -> impl Future<Output = crate::error::Result<Vec<crate::types::SchemaVersion>>> + Send + 'a
-    {
-        T::get_versions(self, subject)
+    ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
+        (**self).get_versions(subject)
+    }
+    fn health_check(&self) -> impl Future<Output = Result<()>> + Send + '_ {
+        (**self).health_check()
+    }
+    fn set_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+        level: CompatibilityLevel,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        (**self).set_compatibility(subject, level)
+    }
+    fn get_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> impl Future<Output = Result<CompatibilityLevel>> + Send + 'a {
+        (**self).get_compatibility(subject)
     }
 }
 
-impl<T: SchemaRegistryClient + ?Sized> SchemaRegistryClient for std::sync::Arc<T> {
+impl<T: SchemaRegistryClient + ?Sized> SchemaRegistryClient for Arc<T> {
     fn get_schema_by_id(
         &self,
-        id: crate::types::SchemaId,
-    ) -> impl Future<Output = crate::error::Result<Arc<crate::types::Schema>>> + Send + '_ {
-        T::get_schema_by_id(self, id)
+        id: SchemaId,
+    ) -> impl Future<Output = Result<Arc<Schema>>> + Send + '_ {
+        (**self).get_schema_by_id(id)
     }
     fn get_latest_schema<'a>(
         &'a self,
         subject: &'a str,
-    ) -> impl Future<Output = crate::error::Result<Arc<crate::types::Schema>>> + Send + 'a {
-        T::get_latest_schema(self, subject)
+    ) -> impl Future<Output = Result<Arc<Schema>>> + Send + 'a {
+        (**self).get_latest_schema(subject)
     }
     fn get_schema_by_version<'a>(
         &'a self,
         subject: &'a str,
-        version: crate::types::SchemaVersion,
-    ) -> impl Future<Output = crate::error::Result<Arc<crate::types::Schema>>> + Send + 'a {
-        T::get_schema_by_version(self, subject, version)
+        version: SchemaVersion,
+    ) -> impl Future<Output = Result<Arc<Schema>>> + Send + 'a {
+        (**self).get_schema_by_version(subject, version)
     }
     fn register_schema<'a>(
         &'a self,
         subject: &'a str,
         schema: &'a str,
-        schema_type: crate::types::SchemaType,
-        references: &'a [crate::types::SchemaReference],
-    ) -> impl Future<Output = crate::error::Result<crate::types::SchemaId>> + Send + 'a {
-        T::register_schema(self, subject, schema, schema_type, references)
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> impl Future<Output = Result<SchemaId>> + Send + 'a {
+        (**self).register_schema(subject, schema, schema_type, references)
     }
     fn check_compatibility<'a>(
         &'a self,
         subject: &'a str,
         schema: &'a str,
-        schema_type: crate::types::SchemaType,
-        references: &'a [crate::types::SchemaReference],
-    ) -> impl Future<Output = crate::error::Result<bool>> + Send + 'a {
-        T::check_compatibility(self, subject, schema, schema_type, references)
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> impl Future<Output = Result<bool>> + Send + 'a {
+        (**self).check_compatibility(subject, schema, schema_type, references)
     }
     fn delete_subject<'a>(
         &'a self,
         subject: &'a str,
         permanent: bool,
-    ) -> impl Future<Output = crate::error::Result<Vec<crate::types::SchemaVersion>>> + Send + 'a
-    {
-        T::delete_subject(self, subject, permanent)
+    ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
+        (**self).delete_subject(subject, permanent)
     }
-    fn get_subjects(&self) -> impl Future<Output = crate::error::Result<Vec<String>>> + Send + '_ {
-        T::get_subjects(self)
+    fn get_subjects(&self) -> impl Future<Output = Result<Vec<String>>> + Send + '_ {
+        (**self).get_subjects()
     }
     fn get_versions<'a>(
         &'a self,
         subject: &'a str,
-    ) -> impl Future<Output = crate::error::Result<Vec<crate::types::SchemaVersion>>> + Send + 'a
-    {
-        T::get_versions(self, subject)
+    ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
+        (**self).get_versions(subject)
+    }
+    fn health_check(&self) -> impl Future<Output = Result<()>> + Send + '_ {
+        (**self).health_check()
+    }
+    fn set_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+        level: CompatibilityLevel,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        (**self).set_compatibility(subject, level)
+    }
+    fn get_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> impl Future<Output = Result<CompatibilityLevel>> + Send + 'a {
+        (**self).get_compatibility(subject)
     }
 }
 
-/// Shared cache-management interface implemented by schema cache wrappers.
+// ── DynSchemaRegistryClient ───────────────────────────────────────────────
+
+/// Object-safe variant of [`SchemaRegistryClient`].
 ///
-/// This trait allows generic orchestration over both
+/// Because `SchemaRegistryClient` uses RPITIT (`-> impl Future`) it cannot be
+/// used as `dyn SchemaRegistryClient`. This trait provides the same interface
+/// with `Pin<Box<dyn Future>>` return types for trait-object usage:
+///
+/// ```rust,ignore
+/// use std::sync::Arc;
+/// use schemreg::DynSchemaRegistryClient;
+///
+/// fn use_registry(client: Arc<dyn DynSchemaRegistryClient>) { ... }
+/// ```
+///
+/// A blanket implementation is provided for every type that implements
+/// [`SchemaRegistryClient`], so no extra `impl` is needed.
+pub trait DynSchemaRegistryClient: Send + Sync {
+    fn get_schema_by_id<'a>(
+        &'a self,
+        id: SchemaId,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>>;
+    fn get_latest_schema<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>>;
+    fn get_schema_by_version<'a>(
+        &'a self,
+        subject: &'a str,
+        version: SchemaVersion,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>>;
+    fn register_schema<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + 'a>>;
+    fn check_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
+    fn check_compatible<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
+    fn delete_subject<'a>(
+        &'a self,
+        subject: &'a str,
+        permanent: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a>>;
+    fn get_subjects<'a>(&'a self)
+    -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + 'a>>;
+    fn get_versions<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a>>;
+    fn health_check<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    fn set_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+        level: CompatibilityLevel,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    fn get_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CompatibilityLevel>> + Send + 'a>>;
+}
+
+// Static assertion: Arc<dyn DynSchemaRegistryClient> must be Send + Sync.
+const _: () = {
+    fn _assert_dyn_is_send_sync()
+    where
+        dyn DynSchemaRegistryClient: Send + Sync,
+    {
+    }
+};
+
+/// Blanket: every [`SchemaRegistryClient`] is automatically a
+/// [`DynSchemaRegistryClient`] via `Box::pin` wrapping.
+impl<T: SchemaRegistryClient> DynSchemaRegistryClient for T {
+    fn get_schema_by_id<'a>(
+        &'a self,
+        id: SchemaId,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>> {
+        Box::pin(self.get_schema_by_id(id))
+    }
+    fn get_latest_schema<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>> {
+        Box::pin(self.get_latest_schema(subject))
+    }
+    fn get_schema_by_version<'a>(
+        &'a self,
+        subject: &'a str,
+        version: SchemaVersion,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>> {
+        Box::pin(self.get_schema_by_version(subject, version))
+    }
+    fn register_schema<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + 'a>> {
+        Box::pin(self.register_schema(subject, schema, schema_type, references))
+    }
+    fn check_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(self.check_compatibility(subject, schema, schema_type, references))
+    }
+    fn check_compatible<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(self.check_compatible(subject, schema, schema_type))
+    }
+    fn delete_subject<'a>(
+        &'a self,
+        subject: &'a str,
+        permanent: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a>> {
+        Box::pin(self.delete_subject(subject, permanent))
+    }
+    fn get_subjects<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + 'a>> {
+        Box::pin(self.get_subjects())
+    }
+    fn get_versions<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a>> {
+        Box::pin(self.get_versions(subject))
+    }
+    fn health_check<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.health_check())
+    }
+    fn set_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+        level: CompatibilityLevel,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.set_compatibility(subject, level))
+    }
+    fn get_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CompatibilityLevel>> + Send + 'a>> {
+        Box::pin(self.get_compatibility(subject))
+    }
+}
+
+// ── AnySchemaCache ────────────────────────────────────────────────────────
+
+/// Shared cache-management interface implemented by both
 /// [`CachedSchemaRegistry`](crate::CachedSchemaRegistry) and
-/// [`glue::CachedGlueSchemaRegistry`](crate::glue::CachedGlueSchemaRegistry)
-/// for cache lifecycle operations (invalidate, clear, prewarm), without
-/// coupling to a specific registry provider.
+/// [`CachedGlueSchemaRegistry`](crate::glue::CachedGlueSchemaRegistry).
 pub trait AnySchemaCache: Send + Sync {
     /// Identifier type used by this cache (schema ID or schema version ID).
     type Id: Copy + Send + Sync;
-
     /// Number of entries currently held in the cache.
     fn cache_len(&self) -> usize;
-
     /// Returns `true` when the cache contains no entries.
     fn cache_is_empty(&self) -> bool;
-
     /// Clear all cached entries and cancel in-flight cache repopulation.
     fn clear_cache(&self);
-
     /// Invalidate a specific cache entry.
     fn invalidate(&self, id: Self::Id);
-
     /// Invalidate all cache entries.
     fn invalidate_all(&self);
-
     /// Pre-warm the cache for a set of immutable IDs.
     fn warm_cache<'a>(
         &'a self,
@@ -324,50 +568,18 @@ pub trait AnySchemaCache: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
 
+// ── SchemaEncoder ─────────────────────────────────────────────────────────
+
 /// Pluggable schema encoder for producer payloads.
 ///
-/// Implement this trait to encode raw bytes into wire-framed bytes before
-/// sending. The default implementation ([`ConfluentSchemaEncoder`](crate::confluent::ConfluentSchemaEncoder))
-/// registers schemas with a Confluent-compatible registry and applies the
-/// 5-byte Confluent wire format header.
-///
-/// # Object Safety
-///
-/// The trait is object-safe. Use `Arc<dyn SchemaEncoder>` to share an encoder
-/// across tasks or store it in a struct field.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use std::pin::Pin;
-/// use std::future::Future;
-/// use bytes::Bytes;
-/// use schemreg::{SchemaEncoder, EncodeTarget};
-/// use schemreg::error::Result;
-///
-/// struct NoopEncoder;
-///
-/// impl SchemaEncoder for NoopEncoder {
-///     fn encode(
-///         &self,
-///         payload: Bytes,
-///         _topic: &str,
-///         _record_name: Option<&str>,
-///         _target: EncodeTarget,
-///     ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
-///         Box::pin(async move { Ok(payload) })
-///     }
-/// }
-/// ```
+/// Encode raw bytes into wire-framed bytes before sending to a broker.
+/// Object-safe: use `Arc<dyn SchemaEncoder>` to share across tasks.
 pub trait SchemaEncoder: Send + Sync {
-    /// Encode raw bytes, returning wire-framed bytes.
+    /// Encode `payload`, returning wire-framed bytes.
     ///
-    /// `payload` contains the raw (pre-serialized) bytes to frame.
-    /// `topic` is the target topic name. `record_name` is the schema record
-    /// name (used by [`SubjectNameStrategy::RecordName`](crate::SubjectNameStrategy::RecordName)
-    /// and [`SubjectNameStrategy::TopicRecordName`](crate::SubjectNameStrategy::TopicRecordName);
-    /// pass `None` for the `TopicName` strategy). `target` distinguishes
-    /// key vs value subjects.
+    /// `topic` is the target topic. `record_name` is required for `RecordName`
+    /// and `TopicRecordName` strategies; `None` for `TopicName`. `target`
+    /// distinguishes key from value subjects.
     fn encode(
         &self,
         payload: Bytes,
@@ -377,198 +589,18 @@ pub trait SchemaEncoder: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
 }
 
+// ── SchemaDecoder ─────────────────────────────────────────────────────────
+
 /// Object-safe async trait for consumer-side schema decoding.
 ///
-/// A [`SchemaDecoder`] receives a raw (possibly wire-framed) [`Bytes`] payload,
-/// strips any framing, and returns the decoded payload.
-///
-/// # Example — custom decoder
-///
-/// ```rust,ignore
-/// use std::pin::Pin;
-/// use std::future::Future;
-/// use bytes::Bytes;
-/// use schemreg::{SchemaDecoder, EncodeTarget};
-/// use schemreg::error::Result;
-///
-/// struct StripPrefixDecoder;
-///
-/// impl SchemaDecoder for StripPrefixDecoder {
-///     fn decode(
-///         &self,
-///         payload: Bytes,
-///         _topic: &str,
-///         _target: EncodeTarget,
-///     ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
-///         Box::pin(async move {
-///             // Strip a 4-byte proprietary header.
-///             Ok(payload.slice(4..))
-///         })
-///     }
-/// }
-/// ```
+/// Strips wire-format framing from a [`Bytes`] payload, returning raw bytes.
+/// Object-safe: use `Arc<dyn SchemaDecoder>` to share across tasks.
 pub trait SchemaDecoder: Send + Sync {
     /// Decode a wire-framed payload, returning the raw inner bytes.
-    ///
-    /// `payload` is the raw bytes (key or value).
-    /// `topic` is the source topic name. `target` is [`EncodeTarget::Key`]
-    /// for key payloads and [`EncodeTarget::Value`] for value payloads.
     fn decode(
         &self,
         payload: Bytes,
         topic: &str,
         target: EncodeTarget,
     ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
-}
-
-// ── DynSchemaRegistryClient ───────────────────────────────────────────────
-
-/// Object-safe variant of [`SchemaRegistryClient`].
-///
-/// Because [`SchemaRegistryClient`] uses `impl Future` return types (RPITIT)
-/// it cannot be used as `dyn SchemaRegistryClient`. This trait provides the
-/// same interface with [`Pin<Box<dyn Future>>`] return types, enabling you to
-/// hold and pass schema registry clients as trait objects:
-///
-/// ```rust,ignore
-/// use std::sync::Arc;
-/// use schemreg::DynSchemaRegistryClient;
-///
-/// fn use_registry(client: Arc<dyn DynSchemaRegistryClient>) {
-///     // store in structs, pass across async boundaries, etc.
-/// }
-/// ```
-///
-/// A blanket implementation is provided for every type that implements
-/// [`SchemaRegistryClient`], so no extra `impl` is needed.
-pub trait DynSchemaRegistryClient: Send + Sync {
-    /// Retrieve a schema by its globally unique ID.
-    fn get_schema_by_id<'a>(
-        &'a self,
-        id: SchemaId,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>>;
-
-    /// Retrieve the latest schema registered under the given subject.
-    fn get_latest_schema<'a>(
-        &'a self,
-        subject: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>>;
-
-    /// Retrieve a specific version of a schema under a subject.
-    fn get_schema_by_version<'a>(
-        &'a self,
-        subject: &'a str,
-        version: SchemaVersion,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>>;
-
-    /// Register a schema under the given subject.
-    fn register_schema<'a>(
-        &'a self,
-        subject: &'a str,
-        schema: &'a str,
-        schema_type: SchemaType,
-        references: &'a [SchemaReference],
-    ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + 'a>>;
-
-    /// Check whether a schema is compatible with the latest registered version.
-    fn check_compatibility<'a>(
-        &'a self,
-        subject: &'a str,
-        schema: &'a str,
-        schema_type: SchemaType,
-        references: &'a [SchemaReference],
-    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
-
-    /// Delete a subject and all its registered versions.
-    fn delete_subject<'a>(
-        &'a self,
-        subject: &'a str,
-        permanent: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a>>;
-
-    /// List all subjects currently registered.
-    fn get_subjects<'a>(&'a self)
-    -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + 'a>>;
-
-    /// List all version numbers registered under `subject`.
-    fn get_versions<'a>(
-        &'a self,
-        subject: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a>>;
-}
-
-/// Blanket implementation: any [`SchemaRegistryClient`] is automatically a
-/// [`DynSchemaRegistryClient`].
-impl<T: SchemaRegistryClient> DynSchemaRegistryClient for T {
-    fn get_schema_by_id<'a>(
-        &'a self,
-        id: SchemaId,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>> {
-        Box::pin(SchemaRegistryClient::get_schema_by_id(self, id))
-    }
-    fn get_latest_schema<'a>(
-        &'a self,
-        subject: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>> {
-        Box::pin(SchemaRegistryClient::get_latest_schema(self, subject))
-    }
-    fn get_schema_by_version<'a>(
-        &'a self,
-        subject: &'a str,
-        version: SchemaVersion,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>> {
-        Box::pin(SchemaRegistryClient::get_schema_by_version(
-            self, subject, version,
-        ))
-    }
-    fn register_schema<'a>(
-        &'a self,
-        subject: &'a str,
-        schema: &'a str,
-        schema_type: SchemaType,
-        references: &'a [SchemaReference],
-    ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + 'a>> {
-        Box::pin(SchemaRegistryClient::register_schema(
-            self,
-            subject,
-            schema,
-            schema_type,
-            references,
-        ))
-    }
-    fn check_compatibility<'a>(
-        &'a self,
-        subject: &'a str,
-        schema: &'a str,
-        schema_type: SchemaType,
-        references: &'a [SchemaReference],
-    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
-        Box::pin(SchemaRegistryClient::check_compatibility(
-            self,
-            subject,
-            schema,
-            schema_type,
-            references,
-        ))
-    }
-    fn delete_subject<'a>(
-        &'a self,
-        subject: &'a str,
-        permanent: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a>> {
-        Box::pin(SchemaRegistryClient::delete_subject(
-            self, subject, permanent,
-        ))
-    }
-    fn get_subjects<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + 'a>> {
-        Box::pin(SchemaRegistryClient::get_subjects(self))
-    }
-    fn get_versions<'a>(
-        &'a self,
-        subject: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a>> {
-        Box::pin(SchemaRegistryClient::get_versions(self, subject))
-    }
 }

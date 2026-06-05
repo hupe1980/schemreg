@@ -26,9 +26,14 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SchemaRegError};
-use crate::http::{HttpClient, HttpClientConfig};
+use crate::http::{
+    HttpClient, HttpClientConfig, normalize_url, percent_encode, reject_embedded_credentials,
+    validate_subject,
+};
 use crate::traits::SchemaRegistryClient;
-use crate::types::{ArtifactId, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion};
+use crate::types::{
+    ArtifactId, CompatibilityLevel, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion,
+};
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GROUP: &str = "default";
@@ -135,6 +140,17 @@ struct CompatibilityTestResult {
     compatible: bool,
 }
 
+#[derive(Serialize)]
+struct SetCompatibilityRuleRequest {
+    r#type: &'static str,
+    config: &'static str,
+}
+
+#[derive(Deserialize)]
+struct GetCompatibilityRuleResponse {
+    config: String,
+}
+
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 enum ApicurioAuth {
@@ -232,13 +248,10 @@ impl ApicurioSchemaRegistry {
         }
     }
 
-    fn auth_str(&self) -> Option<String> {
-        self.auth_header().map(|z| z.as_str().to_string())
-    }
-
     /// GET a JSON response from an Apicurio endpoint.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let auth = self.auth_str();
+        let auth = self.auth_header();
+        let auth_str = auth.as_deref().map(|z| z.as_str());
         let resp = self
             .client
             .request(
@@ -246,7 +259,7 @@ impl ApicurioSchemaRegistry {
                 url,
                 &[("Accept", "application/json")],
                 None,
-                auth.as_deref(),
+                auth_str,
             )
             .await?;
         self.handle_json_response(resp.status, resp.content_type.as_deref(), &resp.body)
@@ -256,10 +269,11 @@ impl ApicurioSchemaRegistry {
     /// Returns the full [`HttpResponse`](crate::http::HttpResponse) so callers can
     /// read `X-Registry-*` headers.
     async fn get_content(&self, url: &str) -> Result<crate::http::HttpResponse> {
-        let auth = self.auth_str();
+        let auth = self.auth_header();
+        let auth_str = auth.as_deref().map(|z| z.as_str());
         let resp = self
             .client
-            .request("GET", url, &[("Accept", "*/*")], None, auth.as_deref())
+            .request("GET", url, &[("Accept", "*/*")], None, auth_str)
             .await?;
         if resp.status == 404 {
             let msg = self.parse_error_body(&resp.body);
@@ -278,7 +292,8 @@ impl ApicurioSchemaRegistry {
 
     /// POST a JSON body and decode a JSON response.
     async fn post_json<T: serde::de::DeserializeOwned>(&self, url: &str, body: &[u8]) -> Result<T> {
-        let auth = self.auth_str();
+        let auth = self.auth_header();
+        let auth_str = auth.as_deref().map(|z| z.as_str());
         let resp = self
             .client
             .request(
@@ -289,7 +304,27 @@ impl ApicurioSchemaRegistry {
                     ("Content-Type", "application/json"),
                 ],
                 Some(body),
-                auth.as_deref(),
+                auth_str,
+            )
+            .await?;
+        self.handle_json_response(resp.status, resp.content_type.as_deref(), &resp.body)
+    }
+
+    /// PUT a JSON body and decode a JSON response.
+    async fn put_json<T: serde::de::DeserializeOwned>(&self, url: &str, body: &[u8]) -> Result<T> {
+        let auth = self.auth_header();
+        let auth_str = auth.as_deref().map(|z| z.as_str());
+        let resp = self
+            .client
+            .request(
+                "PUT",
+                url,
+                &[
+                    ("Accept", "application/json"),
+                    ("Content-Type", "application/json"),
+                ],
+                Some(body),
+                auth_str,
             )
             .await?;
         self.handle_json_response(resp.status, resp.content_type.as_deref(), &resp.body)
@@ -297,10 +332,11 @@ impl ApicurioSchemaRegistry {
 
     /// DELETE and expect 204 No Content (or 200).
     async fn delete_no_content(&self, url: &str) -> Result<()> {
-        let auth = self.auth_str();
+        let auth = self.auth_header();
+        let auth_str = auth.as_deref().map(|z| z.as_str());
         let resp = self
             .client
-            .request("DELETE", url, &[], None, auth.as_deref())
+            .request("DELETE", url, &[], None, auth_str)
             .await?;
         if resp.status == 404 {
             let msg = self.parse_error_body(&resp.body);
@@ -372,7 +408,15 @@ impl ApicurioSchemaRegistry {
             .headers
             .get(HDR_GLOBAL_ID)
             .and_then(|s| s.parse::<i64>().ok())
-            .map(|v| SchemaId::from(v as u32))
+            .map(|v| -> Result<SchemaId> {
+                if v < 0 || v > i64::from(u32::MAX) {
+                    return Err(SchemaRegError::invalid_state(format!(
+                        "Apicurio global_id {v} is out of u32 range"
+                    )));
+                }
+                Ok(SchemaId::from(v as u32))
+            })
+            .transpose()?
             .or(fallback_id)
             .unwrap_or_else(|| SchemaId::from(0u32));
 
@@ -391,8 +435,8 @@ impl ApicurioSchemaRegistry {
         let artifact_id_header = resp.headers.get(HDR_ARTIFACT_ID).cloned();
 
         let subject = artifact_id_header
-            .map(|a| format!("{group_id}/{a}"))
-            .or_else(|| fallback_subject.map(str::to_string));
+            .map(|a| -> Arc<str> { Arc::from(format!("{group_id}/{a}").as_str()) })
+            .or_else(|| fallback_subject.map(Arc::from));
 
         let schema_str = String::from_utf8(resp.body.to_vec()).map_err(|e| {
             SchemaRegError::wire_format(format!("invalid UTF-8 in Apicurio schema content: {e}"))
@@ -499,7 +543,13 @@ impl ApicurioSchemaRegistry {
             SchemaRegError::invalid_state(format!("failed to serialise Apicurio request: {e}"))
         })?;
         let result: CreateArtifactResponse = self.post_json(&url, &body).await?;
-        Ok(SchemaId::from(result.version.global_id as u32))
+        let global_id = result.version.global_id;
+        if global_id < 0 || global_id > i64::from(u32::MAX) {
+            return Err(SchemaRegError::invalid_state(format!(
+                "Apicurio global_id {global_id} is out of u32 range"
+            )));
+        }
+        Ok(SchemaId::from(global_id as u32))
     }
 
     /// Check compatibility of a schema against the latest version of the artifact.
@@ -657,6 +707,47 @@ impl SchemaRegistryClient for ApicurioSchemaRegistry {
     ) -> impl std::future::Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
         self.list_versions(subject)
     }
+
+    async fn health_check(&self) -> Result<()> {
+        // GET /search/artifacts?limit=1 is the lightest operation that verifies
+        // connectivity and authentication without scanning all artifacts.
+        let url = self.api_url("/search/artifacts?limit=1");
+        self.get_json::<ArtifactSearchResults>(&url).await?;
+        Ok(())
+    }
+
+    async fn set_compatibility(&self, subject: &str, level: CompatibilityLevel) -> Result<()> {
+        validate_subject(subject)?;
+        let artifact_id = ArtifactId::from_subject(subject);
+        let url = self.api_url(&format!(
+            "/groups/{}/artifacts/{}/rules/COMPATIBILITY",
+            percent_encode(&artifact_id.group),
+            percent_encode(&artifact_id.artifact),
+        ));
+        let req = SetCompatibilityRuleRequest {
+            r#type: "COMPATIBILITY",
+            config: level.as_str(),
+        };
+        let body = serde_json::to_vec(&req).map_err(|e| {
+            SchemaRegError::invalid_state(format!(
+                "failed to serialise compatibility rule request: {e}"
+            ))
+        })?;
+        let _: serde_json::Value = self.put_json(&url, &body).await?;
+        Ok(())
+    }
+
+    async fn get_compatibility(&self, subject: &str) -> Result<CompatibilityLevel> {
+        validate_subject(subject)?;
+        let artifact_id = ArtifactId::from_subject(subject);
+        let url = self.api_url(&format!(
+            "/groups/{}/artifacts/{}/rules/COMPATIBILITY",
+            percent_encode(&artifact_id.group),
+            percent_encode(&artifact_id.artifact),
+        ));
+        let resp: GetCompatibilityRuleResponse = self.get_json(&url).await?;
+        resp.config.parse()
+    }
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
@@ -678,8 +769,11 @@ pub struct ApicurioSchemaRegistryBuilder {
     url: Option<String>,
     auth: ApicurioAuth,
     request_timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
     root_certificates: Vec<reqwest::Certificate>,
     identity: Option<reqwest::Identity>,
+    /// Maximum idle connections per host kept in the connection pool.
+    pool_max_idle_per_host: Option<usize>,
 }
 
 impl Default for ApicurioSchemaRegistryBuilder {
@@ -688,8 +782,10 @@ impl Default for ApicurioSchemaRegistryBuilder {
             url: None,
             auth: ApicurioAuth::None,
             request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            connect_timeout: None,
             root_certificates: Vec::new(),
             identity: None,
+            pool_max_idle_per_host: None,
         }
     }
 }
@@ -699,6 +795,34 @@ impl ApicurioSchemaRegistryBuilder {
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
         self
+    }
+
+    /// Build an [`ApicurioSchemaRegistryBuilder`] from environment variables.
+    ///
+    /// Reads the following variables:
+    /// - `APICURIO_REGISTRY_URL` (required)
+    /// - `APICURIO_REGISTRY_USERNAME` + `APICURIO_REGISTRY_PASSWORD` → basic auth
+    /// - `APICURIO_REGISTRY_BEARER_TOKEN` → bearer token auth
+    ///
+    /// If both basic-auth and bearer-token variables are set, bearer token
+    /// takes precedence.
+    pub fn from_env() -> Result<Self> {
+        let url = std::env::var("APICURIO_REGISTRY_URL").map_err(|_| {
+            SchemaRegError::config("APICURIO_REGISTRY_URL environment variable is required")
+        })?;
+
+        let mut builder = Self::default().url(url);
+
+        if let Ok(token) = std::env::var("APICURIO_REGISTRY_BEARER_TOKEN") {
+            builder = builder.bearer_token(token);
+        } else if let (Ok(user), Ok(pass)) = (
+            std::env::var("APICURIO_REGISTRY_USERNAME"),
+            std::env::var("APICURIO_REGISTRY_PASSWORD"),
+        ) {
+            builder = builder.basic_auth(user, pass);
+        }
+
+        Ok(builder)
     }
 
     /// Set basic authentication credentials.
@@ -724,6 +848,15 @@ impl ApicurioSchemaRegistryBuilder {
         self
     }
 
+    /// Set the TCP connection establishment timeout.
+    ///
+    /// Separate from the per-request timeout; controls how long the client
+    /// waits before giving up on the initial TCP handshake.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
     /// Add a custom root CA certificate to trust.
     ///
     /// Useful when the registry uses a private certificate authority (e.g. an
@@ -736,6 +869,15 @@ impl ApicurioSchemaRegistryBuilder {
     /// Set a client certificate and private key for mutual TLS (mTLS).
     pub fn identity(mut self, identity: reqwest::Identity) -> Self {
         self.identity = Some(identity);
+        self
+    }
+
+    /// Set the maximum number of idle connections kept per host in the pool.
+    ///
+    /// Set to `0` to disable connection reuse entirely. The default (unset)
+    /// uses reqwest's built-in pool limit.
+    pub fn pool_max_idle_per_host(mut self, n: usize) -> Self {
+        self.pool_max_idle_per_host = Some(n);
         self
     }
 
@@ -755,8 +897,10 @@ impl ApicurioSchemaRegistryBuilder {
         }
         let client = HttpClient::with_config(HttpClientConfig {
             timeout: self.request_timeout,
+            connect_timeout: self.connect_timeout,
             root_certificates: self.root_certificates,
             identity: self.identity,
+            pool_max_idle_per_host: self.pool_max_idle_per_host,
         })?;
         Ok(ApicurioSchemaRegistry {
             client,
@@ -775,52 +919,6 @@ fn schema_content_type(schema_type: SchemaType) -> &'static str {
         SchemaType::Avro | SchemaType::Json => "application/json",
         SchemaType::Protobuf => "application/x-protobuf",
     }
-}
-
-fn normalize_url(mut url: String) -> String {
-    let trimmed_len = url.trim_end_matches('/').len();
-    url.truncate(trimmed_len);
-    url
-}
-
-fn reject_embedded_credentials(url: &str) -> Result<()> {
-    let Some(scheme_end) = url.find("://") else {
-        return Ok(());
-    };
-    let authority_start = scheme_end + 3;
-    let authority = &url[authority_start..];
-    let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
-    let authority_slice = &authority[..authority_end];
-    if authority_slice.contains('@') {
-        return Err(SchemaRegError::config(
-            "Apicurio Registry URL must not contain embedded credentials (user:pass@host); \
-             use ApicurioSchemaRegistryBuilder::basic_auth() instead",
-        ));
-    }
-    Ok(())
-}
-
-/// Characters that MUST be percent-encoded in a URL path segment (RFC 3986).
-static PATH_SEGMENT_ENCODE_SET: percent_encoding::AsciiSet = percent_encoding::CONTROLS
-    .add(b' ')
-    .add(b'"')
-    .add(b'#')
-    .add(b'<')
-    .add(b'>')
-    .add(b'?')
-    .add(b'`')
-    .add(b'{')
-    .add(b'}')
-    .add(b'/')
-    .add(b'%')
-    .add(b'[')
-    .add(b']')
-    .add(b'\\')
-    .add(b'^')
-    .add(b'@');
-
-fn percent_encode(input: &str) -> String {
-    percent_encoding::utf8_percent_encode(input, &PATH_SEGMENT_ENCODE_SET).to_string()
 }
 
 #[cfg(test)]

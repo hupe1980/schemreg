@@ -37,7 +37,7 @@ Async schema registry client for **Confluent Schema Registry** (and Karapace), *
 ```toml
 # Cargo.toml
 [dependencies]
-schemreg = { version = "0.2", features = ["confluent"] }
+schemreg = { version = "0.3", features = ["confluent"] }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 ```
@@ -45,7 +45,7 @@ bytes = "1"
 ```rust
 use std::sync::Arc;
 use schemreg::{
-    CachedSchemaRegistry, SchemaType, SubjectNameStrategy,
+    CachedSchemaRegistry, EncodeTarget, SchemaType, SubjectNameStrategy,
     confluent::{ConfluentSchemaEncoder, ConfluentSchemaRegistry},
     decoder::WireFormatDecoder,
     traits::SchemaEncoder,
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // .basic_auth("user", "password")
         .build()?;
 
-    // Wrap with a 1 000-entry LRU cache (default).
+    // Wrap with a 1 000-entry LRU cache (default).
     let cached = Arc::new(CachedSchemaRegistry::new(registry));
 
     // Producer side: register schema on first send, then reuse cached ID.
@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let raw_bytes = Bytes::from_static(b"\x04\x08some-avro-payload");
-    let framed = encoder.encode(raw_bytes, "orders", None, false).await?;
+    let framed = encoder.encode(raw_bytes, "orders", None, EncodeTarget::Value).await?;
 
     // Consumer side: strip the header (uses the same cached registry for schema lookup).
     let decoder = WireFormatDecoder::confluent(Arc::clone(&cached));
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-schemreg = { version = "0.2", features = ["glue"] }
+schemreg = { version = "0.3", features = ["glue"] }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 ```
@@ -194,17 +194,17 @@ See [`examples/custom_backend.rs`](examples/custom_backend.rs) for a full workin
 `CachedSchemaRegistry` exposes the `AnySchemaCache` trait for lifecycle control:
 
 ```rust
-use schemreg::{AnySchemaCache, CachedSchemaRegistry, SchemaId};
+use schemreg::CachedSchemaRegistry;
 
 let cached = CachedSchemaRegistry::with_max_entries(my_registry, 512);
 
 // Pre-warm for known schema IDs (avoids cold-miss latency on startup).
-cached.warm_cache(&[1, 2, 3]).await?;
+cached.warm_cache([1u32, 2u32, 3u32]).await?;
 
 println!("cached: {}", cached.cache_len());
 
 // Invalidate a single stale entry.
-cached.invalidate(2);
+cached.invalidate(2u32);
 
 // Wipe everything.
 cached.clear_cache();
@@ -217,11 +217,12 @@ cached.clear_cache();
 `WireFormatDecoder` auto-detects the wire format and dispatches to the correct backend:
 
 ```rust
+use std::sync::Arc;
 use schemreg::decoder::WireFormatDecoder;
 
 let decoder = WireFormatDecoder::new()
-    .confluent(&cached_confluent_registry)
-    .glue(&cached_glue_registry);        // requires `glue` feature
+    .with_confluent(Arc::clone(&cached_confluent_registry))
+    .with_glue(Arc::clone(&cached_glue_registry));  // requires `glue` feature
 
 let msg = decoder.decode(raw_bytes).await?;
 println!("format: {:?}", msg.schema_format);  // Avro / Protobuf / Json / Unknown
@@ -250,7 +251,81 @@ cargo run --example apicurio_roundtrip --features apicurio
 
 ---
 
-## 📄 License
+## �️ Full API surface — `SchemaRegistryClient` trait
+
+All implementations (`ConfluentSchemaRegistry`, `ApicurioSchemaRegistry`, and any custom backend) expose the same methods through the `SchemaRegistryClient` trait. `CachedSchemaRegistry` adds transparent caching and delegates all calls to the inner client.
+
+| Method | Description |
+|---|---|
+| `get_schema_by_id(id)` | Fetch schema by its globally unique integer ID |
+| `get_latest_schema(subject)` | Fetch the most recently registered version under a subject |
+| `get_schema_by_version(subject, version)` | Fetch a specific version under a subject |
+| `register_schema(subject, schema, type, refs)` | Register a new schema (idempotent — returns existing ID if already registered) |
+| `check_compatibility(subject, schema, type, refs)` | Test whether a schema is compatible with the currently registered version |
+| `check_compatible(subject, schema, type)` | Convenience alias for `check_compatibility` with no schema references |
+| `delete_subject(subject, permanent)` | Delete all versions of a subject (`permanent = true` for hard delete) |
+| `get_subjects()` | List all registered subjects |
+| `get_versions(subject)` | List all registered version numbers for a subject |
+| `health_check()` | Probe the registry for connectivity (lightweight — `GET /subjects?limit=1`) |
+| `set_compatibility(subject, level)` | Set the per-subject compatibility policy |
+| `get_compatibility(subject)` | Get the current compatibility policy for a subject |
+
+### Compatibility levels
+
+`CompatibilityLevel` supports all Confluent / Apicurio policies:
+
+```rust
+use schemreg::CompatibilityLevel;
+
+registry.set_compatibility("orders-value", CompatibilityLevel::BackwardTransitive).await?;
+let level = registry.get_compatibility("orders-value").await?;
+```
+
+Available variants: `Backward`, `BackwardTransitive`, `Forward`, `ForwardTransitive`, `Full`, `FullTransitive`, `None`.
+
+### 12-Factor / environment variable configuration
+
+Both `ConfluentSchemaRegistryBuilder` and `ApicurioSchemaRegistryBuilder` support `from_env()`:
+
+```rust
+// Reads SCHEMA_REGISTRY_URL, SCHEMA_REGISTRY_USERNAME/PASSWORD or SCHEMA_REGISTRY_BEARER_TOKEN
+let registry = ConfluentSchemaRegistryBuilder::from_env()?.build()?;
+
+// Reads APICURIO_REGISTRY_URL, APICURIO_REGISTRY_USERNAME/PASSWORD or APICURIO_REGISTRY_BEARER_TOKEN
+let registry = ApicurioSchemaRegistryBuilder::from_env()?.build()?;
+```
+
+---
+
+## 🔄 Retry and resilience
+
+`schemreg` has **built-in retry logic** for all HTTP requests — no extra configuration is needed:
+
+| Scenario | Behavior |
+|---|---|
+| HTTP 429 (rate limited) | Retried; `Retry-After` header is honored (server-dictated delay) |
+| HTTP 5xx (server error) | Retried with exponential backoff |
+| Network errors | Retried (connection reset, timeout, DNS) |
+| Max retries | 3 attempts; final error propagated |
+| Backoff | 100 ms base, doubles per attempt, capped at 60 s |
+
+No configuration is needed. To set independent connection and request timeouts:
+
+```rust
+use std::time::Duration;
+use schemreg::confluent::ConfluentSchemaRegistryBuilder;
+
+let registry = ConfluentSchemaRegistryBuilder::default()
+    .url("https://registry.example.com")
+    .connect_timeout(Duration::from_secs(3))    // TCP connection timeout
+    .request_timeout(Duration::from_secs(30))   // full request timeout
+    .pool_max_idle_per_host(10)                 // max idle connections per host
+    .build()?;
+```
+
+---
+
+## �📄 License
 
 Licensed under either of:
 

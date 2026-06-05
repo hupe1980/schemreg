@@ -52,10 +52,20 @@ fn is_retryable_status(status: u16) -> bool {
 pub(crate) struct HttpClientConfig {
     /// Request timeout (applies to the entire request including redirect follows).
     pub timeout: Option<Duration>,
+    /// Connection timeout (TCP handshake + TLS negotiation only).
+    ///
+    /// Set this shorter than `timeout` to fail-fast on network partitions
+    /// without reducing read timeouts on large schema payloads.
+    pub connect_timeout: Option<Duration>,
     /// Additional root CA certificates to trust (e.g. private CA bundles).
     pub root_certificates: Vec<reqwest::Certificate>,
     /// Client identity for mutual TLS (mTLS).
     pub identity: Option<reqwest::Identity>,
+    /// Maximum idle connections per host kept in the pool.
+    ///
+    /// `None` means the reqwest default (no per-host limit). Set to `0` to
+    /// disable connection pooling entirely for a given host.
+    pub pool_max_idle_per_host: Option<usize>,
 }
 
 /// Async HTTP client used by the schema registry connectors.
@@ -71,8 +81,10 @@ impl HttpClient {
     pub fn with_webpki_roots(timeout: Option<Duration>) -> Result<Self> {
         Self::with_config(HttpClientConfig {
             timeout,
+            connect_timeout: None,
             root_certificates: Vec::new(),
             identity: None,
+            pool_max_idle_per_host: None,
         })
     }
 
@@ -86,11 +98,17 @@ impl HttpClient {
         if let Some(t) = config.timeout {
             builder = builder.timeout(t);
         }
+        if let Some(ct) = config.connect_timeout {
+            builder = builder.connect_timeout(ct);
+        }
         for cert in config.root_certificates {
             builder = builder.add_root_certificate(cert);
         }
         if let Some(identity) = config.identity {
             builder = builder.identity(identity);
+        }
+        if let Some(n) = config.pool_max_idle_per_host {
+            builder = builder.pool_max_idle_per_host(n);
         }
         let client = builder
             .build()
@@ -268,4 +286,81 @@ impl HttpClient {
             headers,
         })
     }
+}
+
+// ── Shared URL / auth utilities used by confluent and apicurio modules ────────
+
+/// Characters that MUST be percent-encoded in a URL path segment (RFC 3986).
+///
+/// Preserves RFC 3986 unreserved characters (`A-Z a-z 0-9 - _ . ~`) and all
+/// sub-delimiters/path characters valid in a segment. Encodes characters that
+/// would break URL path parsing.
+///
+/// Note: `.` is intentionally NOT encoded so that dotted subjects like
+/// `com.example.Order-value` round-trip without modification.  Bare `..` is
+/// rejected by [`validate_subject`] before reaching this encoder.
+pub(crate) static PATH_SEGMENT_ENCODE_SET: percent_encoding::AsciiSet = percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'%')
+    .add(b'[')
+    .add(b']')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'@');
+
+/// Percent-encode a path segment using RFC 3986 rules.
+#[inline]
+pub(crate) fn percent_encode(input: &str) -> String {
+    percent_encoding::utf8_percent_encode(input, &PATH_SEGMENT_ENCODE_SET).to_string()
+}
+
+/// Strip trailing slashes from a URL.
+pub(crate) fn normalize_url(mut url: String) -> String {
+    let trimmed_len = url.trim_end_matches('/').len();
+    url.truncate(trimmed_len);
+    url
+}
+
+/// Reject URLs that embed credentials in the authority component
+/// (`user:pass@host`), preventing accidental clear-text credential exposure.
+pub(crate) fn reject_embedded_credentials(url: &str) -> crate::error::Result<()> {
+    let Some(scheme_end) = url.find("://") else {
+        return Ok(());
+    };
+    let authority_start = scheme_end + 3;
+    let authority = &url[authority_start..];
+    let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+    let authority_slice = &authority[..authority_end];
+    if authority_slice.contains('@') {
+        return Err(crate::error::SchemaRegError::config(
+            "registry URL must not contain embedded credentials (user:pass@host); \
+             use the builder's auth methods instead",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that a subject name does not contain path-traversal segments.
+///
+/// The percent-encoder intentionally preserves `.` to allow `com.example.X-value`
+/// subjects. However a bare `..` or `.` segment would survive URL encoding and
+/// could be normalised by intermediate proxies.
+pub(crate) fn validate_subject(subject: &str) -> crate::error::Result<()> {
+    for segment in subject.split('/') {
+        if segment == ".." || segment == "." {
+            return Err(crate::error::SchemaRegError::config(
+                "subject name must not contain '.' or '..' path segments",
+            ));
+        }
+    }
+    Ok(())
 }
