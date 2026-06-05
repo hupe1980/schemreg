@@ -717,6 +717,11 @@ impl SchemaRegistryClient for ApicurioSchemaRegistry {
     }
 
     async fn set_compatibility(&self, subject: &str, level: CompatibilityLevel) -> Result<()> {
+        if subject.is_empty() {
+            return Err(SchemaRegError::config(
+                "set_compatibility requires a non-empty subject name",
+            ));
+        }
         validate_subject(subject)?;
         let artifact_id = ArtifactId::from_subject(subject);
         let url = self.api_url(&format!(
@@ -738,6 +743,11 @@ impl SchemaRegistryClient for ApicurioSchemaRegistry {
     }
 
     async fn get_compatibility(&self, subject: &str) -> Result<CompatibilityLevel> {
+        if subject.is_empty() {
+            return Err(SchemaRegError::config(
+                "get_compatibility requires a non-empty subject name",
+            ));
+        }
         validate_subject(subject)?;
         let artifact_id = ArtifactId::from_subject(subject);
         let url = self.api_url(&format!(

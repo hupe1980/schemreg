@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // .basic_auth("user", "password")
         .build()?;
 
-    // Wrap with a 1 000-entry LRU cache (default).
+    // Wrap with a bounded in-memory cache (1 000-entry capacity, FIFO eviction).
     let cached = Arc::new(CachedSchemaRegistry::new(registry));
 
     // Producer side: register schema on first send, then reuse cached ID.
@@ -251,7 +251,7 @@ cargo run --example apicurio_roundtrip --features apicurio
 
 ---
 
-## �️ Full API surface — `SchemaRegistryClient` trait
+## 🛠️ Full API surface — `SchemaRegistryClient` trait
 
 All implementations (`ConfluentSchemaRegistry`, `ApicurioSchemaRegistry`, and any custom backend) expose the same methods through the `SchemaRegistryClient` trait. `CachedSchemaRegistry` adds transparent caching and delegates all calls to the inner client.
 
@@ -266,7 +266,7 @@ All implementations (`ConfluentSchemaRegistry`, `ApicurioSchemaRegistry`, and an
 | `delete_subject(subject, permanent)` | Delete all versions of a subject (`permanent = true` for hard delete) |
 | `get_subjects()` | List all registered subjects |
 | `get_versions(subject)` | List all registered version numbers for a subject |
-| `health_check()` | Probe the registry for connectivity (lightweight — `GET /subjects?limit=1`) |
+| `health_check()` | Probe the registry for connectivity (lightweight ping — backend-specific endpoint) |
 | `set_compatibility(subject, level)` | Set the per-subject compatibility policy |
 | `get_compatibility(subject)` | Get the current compatibility policy for a subject |
 
@@ -325,7 +325,7 @@ let registry = ConfluentSchemaRegistryBuilder::default()
 
 ---
 
-## �📄 License
+## 📄 License
 
 Licensed under either of:
 

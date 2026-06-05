@@ -290,11 +290,14 @@ impl HttpClient {
 
 // ── Shared URL / auth utilities used by confluent and apicurio modules ────────
 
-/// Characters that MUST be percent-encoded in a URL path segment (RFC 3986).
+/// Conservative percent-encoding set for URL path segments.
 ///
-/// Preserves RFC 3986 unreserved characters (`A-Z a-z 0-9 - _ . ~`) and all
-/// sub-delimiters/path characters valid in a segment. Encodes characters that
-/// would break URL path parsing.
+/// Encodes all characters that could break URL path parsing or be misinterpreted
+/// by proxies and HTTP clients. Preserves RFC 3986 unreserved characters
+/// (`A-Z a-z 0-9 - _ . ~`) and common sub-delimiters valid in path segments.
+/// Deliberately encodes several characters that RFC 3986 technically permits
+/// in path segments (e.g. `@`, `[`, `]`) to prevent any proxy or server from
+/// normalising or reinterpreting them.
 ///
 /// Note: `.` is intentionally NOT encoded so that dotted subjects like
 /// `com.example.Order-value` round-trip without modification.  Bare `..` is

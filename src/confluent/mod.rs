@@ -252,8 +252,13 @@ impl ConfluentSchemaRegistry {
 
     /// Get the current compatibility policy for a subject.
     ///
-    /// Uses `GET /config/{subject}`. Returns the per-subject override if set,
-    /// falling back to the global default on 404.
+    /// Uses `GET /config/{subject}`. If `subject` is empty, returns the global
+    /// default compatibility level (`GET /config`).
+    ///
+    /// Returns a registry API error if the subject has no per-subject override
+    /// and the caller passed a non-empty subject (i.e. the registry returns 404
+    /// for subjects with no explicit override configured). Use an empty string to
+    /// unconditionally retrieve the global default.
     pub async fn get_compatibility(&self, subject: &str) -> Result<CompatibilityLevel> {
         let url = if subject.is_empty() {
             format!("{}/config", self.base_url)
