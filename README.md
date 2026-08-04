@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 With real AWS credentials, use the SDK-backed client:
 
-```rust
+```rust,ignore
 use aws_config::BehaviorVersion;
 use schemreg::{AwsGlueSchemaRegistry, CachedGlueSchemaRegistry, GlueSchemaRegistryClient};
 
@@ -221,7 +221,7 @@ Byte offset  0        1        2                   18 …
 
 Any type implementing `SchemaRegistryClient` works as a backend. Only four methods are required; the rest default to `NotSupported`:
 
-```rust
+```rust,ignore
 use std::sync::Arc;
 use schemreg::{Result, Schema, SchemaId, SchemaReference, SchemaRegistryClient, SchemaType, SchemaVersion};
 
@@ -248,7 +248,7 @@ See [`examples/custom_backend.rs`](examples/custom_backend.rs) for a full workin
 
 `SchemaRegistryClient` uses native `async fn` in traits (RPITIT) for zero-cost monomorphized dispatch. For type erasure, use `DynSchemaRegistryClient`, which every `SchemaRegistryClient` implements automatically:
 
-```rust
+```rust,ignore
 use std::sync::Arc;
 use schemreg::{CachedSchemaRegistry, DynSchemaRegistryClient};
 
@@ -268,7 +268,7 @@ let cached = CachedSchemaRegistry::new(erased);
 
 ## ⚡ Cache behaviour
 
-```rust
+```rust,ignore
 use schemreg::CachedSchemaRegistry;
 
 let cached = CachedSchemaRegistry::with_max_entries(my_registry, 512);
@@ -303,7 +303,7 @@ Measured: a cache hit costs **14.3 ns regardless of schema size** (64 B to 64 Ki
 
 ## 🔍 Format-agnostic decoding
 
-```rust
+```rust,ignore
 use std::sync::Arc;
 use schemreg::WireFormatDecoder;
 
@@ -328,7 +328,7 @@ if let Some(path) = &msg.protobuf_message_indexes {
 
 By default the payload is decoded with the **writer** schema named by the wire header. Supply a **reader** schema to get Avro's full resolution — defaulted fields, dropped fields, promoted numeric types — matching the Confluent Java deserializer:
 
-```rust
+```rust,ignore
 use schemreg::AvroSchemaDecoder;
 
 let decoder = AvroSchemaDecoder::new(registry)
@@ -369,7 +369,7 @@ Methods marked ⬜ default to `Err(SchemaRegError::NotSupported)`. That variant 
 
 ### Compatibility levels
 
-```rust
+```rust,ignore
 use schemreg::CompatibilityLevel;
 
 registry.set_compatibility("orders-value", CompatibilityLevel::BackwardTransitive).await?;
@@ -390,7 +390,7 @@ Variants: `Backward`, `BackwardTransitive`, `Forward`, `ForwardTransitive`, `Ful
 
 ### 12-factor configuration
 
-```rust
+```rust,ignore
 // SCHEMA_REGISTRY_URL, SCHEMA_REGISTRY_USERNAME/PASSWORD or SCHEMA_REGISTRY_BEARER_TOKEN
 let registry = ConfluentSchemaRegistryBuilder::from_env()?.build()?;
 
@@ -414,7 +414,7 @@ Retry is built in, and configurable:
 | `Retry-After` | Never jittered or shortened; still clamped to `max_backoff` so a hostile `Retry-After: 86400` cannot wedge you |
 | Redirects | At most 3; `Authorization` dropped on cross-origin redirects |
 
-```rust
+```rust,ignore
 use std::time::Duration;
 use schemreg::RetryPolicy;
 
@@ -433,7 +433,7 @@ Use `RetryPolicy::none()` when the calling layer already retries, so the two do 
 
 `SchemaRegError::is_retryable()` is the contract for your own retry loop, and it is **uniform across backends** — including AWS Glue, where SDK errors are classified by service code rather than collapsed into one transport variant:
 
-```rust
+```rust,ignore
 match registry.get_schema_by_id(id).await {
     Ok(schema) => { /* … */ }
     Err(e) if e.is_not_found()  => { /* permanent: the schema does not exist */ }
@@ -504,7 +504,7 @@ cargo run --example custom_backend
 | Apicurio Registry v3 | Confluent framing; group + artifact addressing | ✅ Native v3 client |
 | Apicurio (compat mode) | Confluent framing and REST API | ✅ Via `ConfluentSchemaRegistry` |
 | AWS Glue Schema Registry | `0x03` + compression + 16-byte UUID | ✅ Native SDK client |
-| Azure Event Hubs Schema Registry | Schema ID in a **header**, no payload prefix | ⬜ Out of scope — see [FINDINGS.md](FINDINGS.md) §2 |
+| Azure Event Hubs Schema Registry | Schema ID in a **header**, no payload prefix | ⬜ Out of scope — [why](docs/backends.md#why-azure-event-hubs-sr-is-not-supported) |
 | Buf Schema Registry | None — build-time only | ⛔ No runtime framing to implement |
 
 ---
@@ -521,7 +521,6 @@ cargo run --example custom_backend
 | [docs/migration-0.4.md](docs/migration-0.4.md) | Upgrading from 0.3.x |
 | [docs/testing.md](docs/testing.md) | What each test layer is for |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes and breaking changes |
-| [FINDINGS.md](FINDINGS.md) | Decision-grade architecture, security, and release review |
 | [conformance/](conformance/README.md) | The cross-language conformance harness |
 
 ---

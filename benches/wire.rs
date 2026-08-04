@@ -2,7 +2,7 @@
 //!
 //! Run with `cargo bench --features glue`.
 //!
-//! These exist to turn the performance claims in `FINDINGS.md` §7 into
+//! These exist to turn the performance claims in `docs/performance.md` into
 //! measurements. The claims under test:
 //!
 //! - Framing is allocation-light and scales linearly with payload size only.

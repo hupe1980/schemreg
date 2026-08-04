@@ -10,12 +10,13 @@ repository  = "https://github.com/hupe1980/schemreg"
 documentation = "https://docs.rs/schemreg"
 readme      = "README.md"
 keywords    = ["kafka", "schema-registry", "confluent", "avro", "glue"]
-exclude     = ["/.github", "/conformance", "/docs", "/FINDINGS.md", "/REVIEW.md"]
+exclude     = ["/.github", "/conformance"]
 categories  = ["encoding", "network-programming", "asynchronous"]
 
 [features]
 default          = []
-# Enable the built-in Confluent Schema Registry HTTP client, encoder, and decoder.
+# Enable the built-in Confluent Schema Registry HTTP client and encoder.
+# The wire codec and WireFormatDecoder are always available without it.
 confluent        = [
     "dep:serde",
     "dep:serde_json",

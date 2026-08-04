@@ -15,6 +15,7 @@
 //! | Caching | [`CachedSchemaRegistry`], [`CachedGlueSchemaRegistry`], [`AnySchemaCache`] |
 //! | Codecs | [`AvroSchemaEncoder`], [`AvroSchemaDecoder`], [`JsonSchemaEncoder`], [`JsonSchemaDecoder`], [`ProtobufSchemaEncoder`], [`ProtobufSchemaDecoder`] |
 //! | Framing-only decode | [`WireFormatDecoder`] |
+//! | Resilience | `RetryPolicy` — retry budget, jittered back-off, `Retry-After` (with `confluent` or `apicurio`) |
 //!
 //! # Cargo features
 //!
@@ -62,6 +63,10 @@
 //!   runtime. Every I/O entry point is `async fn` and `Send`.
 //! - **Not a Kafka client.** `schemreg` produces and consumes `Bytes`; wiring
 //!   them to a broker is the caller's job.
+//! - **Wire-format conformance is verified, not asserted.** The Confluent
+//!   framings are tested against byte sequences produced by the official
+//!   Confluent serializers, decoded *and* re-encoded byte-identically — not
+//!   only against this crate's own reading of the specification.
 //!
 //! # Error handling
 //!

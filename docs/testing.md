@@ -1,6 +1,20 @@
 # Testing strategy
 
-352 tests. What each layer is for, and what it would take to fool it.
+395 tests across nine layers. What each layer is for, and what it would take to
+fool it.
+
+| Layer | Where | Tests |
+|---|---|---|
+| Cross-language conformance | `tests/conformance_fixtures.rs` | 7 |
+| Specification golden vectors | `tests/conformance.rs` | 24 |
+| Property-based | `tests/properties.rs` | 19 |
+| Adversarial corpus | `tests/adversarial.rs` | 24 |
+| HTTP behaviour (real server) | `tests/http_behaviour.rs` | 21 |
+| Concurrency | `tests/cache.rs`, `tests/codec.rs` | 25 |
+| Security boundaries | `tests/security.rs` | 15 |
+| Trait contract | `tests/contract.rs` | 11 |
+| Codec round-trips | `tests/protobuf_codec.rs`, `tests/decoder.rs`, `tests/subject_strategy.rs`, `tests/wire_format.rs` | 99 |
+| Unit + doctests | `src/`, doctests | 150 |
 
 ---
 
@@ -83,8 +97,8 @@ regression fails with a message instead of hanging CI.
 
 ## 7. Security boundaries — `tests/security.rs`
 
-Eleven hostile subject names × seven operations × two clients, plus positive
-controls proving legitimate dotted subjects still work. Clients point at
+Eleven hostile subject names across six Confluent and seven Apicurio operations,
+plus positive controls proving legitimate dotted subjects still work. Clients point at
 `registry.invalid` (RFC 2606, guaranteed not to resolve), so a `Config` error
 proves the guard fired locally and a `Network` error proves it did not.
 
