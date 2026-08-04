@@ -1,19 +1,19 @@
 //! Confluent wire-format schema encoder.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock};
-use tokio::sync::oneshot;
 
+use crate::cache_inner::InMemoryCache;
 use crate::error::{Result, SchemaRegError};
 use crate::subject::SubjectNameStrategy;
 use crate::traits::{SchemaEncoder, SchemaRegistryClient};
 use crate::types::{EncodeTarget, SchemaId, SchemaReference, SchemaType};
 use crate::wire::{encode_protobuf_wire_format, encode_wire_format};
+
+use crate::codec_cache::{DEFAULT_MAX_SUBJECT_CACHE_ENTRIES, subject_resolution_cancelled};
 
 /// A [`SchemaEncoder`] that registers schemas with a Confluent-compatible
 /// registry and frames encoded payloads with the 5-byte Confluent wire format.
@@ -30,10 +30,12 @@ pub struct ConfluentSchemaEncoder<C> {
     /// vast majority of real-world schemas. Override when using nested messages
     /// or a non-zero file-level message position.
     protobuf_message_indexes: Vec<i32>,
-    /// Cache of resolved `subject → schema_id` mappings.
-    id_cache: RwLock<HashMap<String, SchemaId>>,
-    /// In-flight coalescing: subjects currently being registered.
-    in_flight: Mutex<HashMap<String, Vec<oneshot::Sender<Result<SchemaId>>>>>,
+    /// Bounded, coalescing cache of resolved `subject → schema_id` mappings.
+    ///
+    /// Shares [`InMemoryCache`] with the registry and codec caches, so the
+    /// cancellation and invalidation-race guarantees are identical rather than
+    /// re-derived per encoder.
+    id_cache: InMemoryCache<String, SchemaId>,
 }
 
 impl<C: SchemaRegistryClient> ConfluentSchemaEncoder<C> {
@@ -43,88 +45,16 @@ impl<C: SchemaRegistryClient> ConfluentSchemaEncoder<C> {
     }
 
     async fn resolve_id(&self, subject: &str) -> Result<SchemaId> {
-        // Fast path: already cached.
-        if let Some(&id) = self.id_cache.read().get(subject) {
-            return Ok(id);
-        }
-
-        // Slow path: coalescing lock.
-        let waiter_rx = {
-            let mut in_flight = self.in_flight.lock();
-            // Double-check after acquiring the lock.
-            if let Some(&id) = self.id_cache.read().get(subject) {
-                return Ok(id);
-            }
-            if let Some(waiters) = in_flight.get_mut(subject) {
-                let (tx, rx) = oneshot::channel();
-                waiters.push(tx);
-                Some(rx)
-            } else {
-                in_flight.insert(subject.to_string(), Vec::new());
-                None
-            }
-        };
-
-        if let Some(rx) = waiter_rx {
-            return rx.await.map_err(|_| {
-                SchemaRegError::invalid_state("schema ID resolution cancelled by the leader")
-            })?;
-        }
-
-        // We are the leader. Use a drop-guard to cancel waiters on panic/cancellation.
-        struct ResolveGuard<'a> {
-            in_flight: &'a Mutex<HashMap<String, Vec<oneshot::Sender<Result<SchemaId>>>>>,
-            subject: &'a str,
-            done: bool,
-        }
-        impl Drop for ResolveGuard<'_> {
-            fn drop(&mut self) {
-                if !self.done {
-                    let waiters = self
-                        .in_flight
-                        .lock()
-                        .remove(self.subject)
-                        .unwrap_or_default();
-                    for tx in waiters {
-                        let _ = tx.send(Err(SchemaRegError::invalid_state(
-                            "schema ID resolution cancelled",
-                        )));
-                    }
-                }
-            }
-        }
-
-        let mut guard = ResolveGuard {
-            in_flight: &self.in_flight,
-            subject,
-            done: false,
-        };
-
-        let result = self
-            .registry
-            .register_schema(subject, &self.schema, self.schema_type, &self.references)
-            .await;
-
-        let waiters = self.in_flight.lock().remove(subject).unwrap_or_default();
-
-        match &result {
-            Ok(id) => {
-                let id = *id;
-                self.id_cache.write().insert(subject.to_string(), id);
-                for tx in waiters {
-                    let _ = tx.send(Ok(id));
-                }
-            }
-            Err(e) => {
-                let cloned = e.clone();
-                for tx in waiters {
-                    let _ = tx.send(Err(cloned.clone()));
-                }
-            }
-        }
-
-        guard.done = true;
-        result
+        let id = self
+            .id_cache
+            .get_or_fetch(subject.to_string(), || async {
+                self.registry
+                    .register_schema(subject, &self.schema, self.schema_type, &self.references)
+                    .await
+                    .map(std::sync::Arc::new)
+            })
+            .await?;
+        Ok(*id)
     }
 
     /// Return the cached schema ID for the given subject, if already resolved.
@@ -133,7 +63,18 @@ impl<C: SchemaRegistryClient> ConfluentSchemaEncoder<C> {
     /// registration deferred until first [`encode`](crate::SchemaEncoder::encode)
     /// call).
     pub fn cached_schema_id(&self, subject: &str) -> Option<SchemaId> {
-        self.id_cache.read().get(subject).copied()
+        self.id_cache.get(&subject.to_string()).map(|id| *id)
+    }
+
+    /// Number of `subject → schema ID` mappings currently cached.
+    pub fn cached_subject_count(&self) -> usize {
+        self.id_cache.len()
+    }
+
+    /// Forget the cached schema ID for `subject`, forcing the next encode to
+    /// re-register. Useful after a subject is deleted and recreated.
+    pub fn invalidate_subject(&self, subject: &str) {
+        self.id_cache.invalidate(&subject.to_string());
     }
 }
 
@@ -142,7 +83,7 @@ impl<C: SchemaRegistryClient> fmt::Debug for ConfluentSchemaEncoder<C> {
         f.debug_struct("ConfluentSchemaEncoder")
             .field("schema_type", &self.schema_type)
             .field("strategy", &self.strategy)
-            .field("cached_subjects", &self.id_cache.read().len())
+            .field("cached_subjects", &self.id_cache.len())
             .finish()
     }
 }
@@ -180,6 +121,7 @@ pub struct ConfluentSchemaEncoderBuilder<C> {
     strategy: SubjectNameStrategy,
     references: Vec<SchemaReference>,
     protobuf_message_indexes: Vec<i32>,
+    max_subject_cache_entries: usize,
 }
 
 impl<C: SchemaRegistryClient> ConfluentSchemaEncoderBuilder<C> {
@@ -191,7 +133,15 @@ impl<C: SchemaRegistryClient> ConfluentSchemaEncoderBuilder<C> {
             strategy: SubjectNameStrategy::TopicName,
             references: Vec::new(),
             protobuf_message_indexes: vec![0],
+            max_subject_cache_entries: DEFAULT_MAX_SUBJECT_CACHE_ENTRIES,
         }
+    }
+
+    /// Bound the `subject → schema ID` cache (default:
+    /// [`DEFAULT_MAX_SUBJECT_CACHE_ENTRIES`]). Values below 1 are clamped to 1.
+    pub fn max_subject_cache_entries(mut self, max_entries: usize) -> Self {
+        self.max_subject_cache_entries = max_entries;
+        self
     }
 
     /// Set the registry client (required).
@@ -245,8 +195,23 @@ impl<C: SchemaRegistryClient> ConfluentSchemaEncoderBuilder<C> {
             strategy: self.strategy,
             references: self.references,
             protobuf_message_indexes: self.protobuf_message_indexes,
-            id_cache: RwLock::new(HashMap::new()),
-            in_flight: Mutex::new(HashMap::new()),
+            id_cache: InMemoryCache::new(
+                Some(self.max_subject_cache_entries.max(1)),
+                subject_resolution_cancelled,
+            ),
         })
+    }
+}
+
+impl<C> fmt::Debug for ConfluentSchemaEncoderBuilder<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfluentSchemaEncoderBuilder")
+            .field("registry", &self.registry.is_some())
+            .field("schema_set", &self.schema.is_some())
+            .field("schema_type", &self.schema_type)
+            .field("strategy", &self.strategy)
+            .field("references", &self.references.len())
+            .field("protobuf_message_indexes", &self.protobuf_message_indexes)
+            .finish()
     }
 }

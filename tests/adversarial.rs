@@ -193,19 +193,18 @@ mod protobuf_adversarial {
     use bytes::Bytes;
     use schemreg::wire::decode_protobuf_message_indexes;
 
-    /// Empty slice: empty message-index array (index count = 0 means no indexes
-    /// preceding the payload) — must succeed and return an empty vec.
+    /// A single 0x00 byte is the Confluent single-byte optimisation for the
+    /// path [0] — it must decode to `[0]`, never to an empty path.
     #[test]
-    fn protobuf_empty_index_array() {
-        // varint 0 = single byte 0x00 (count = 0 → no further ints)
+    fn protobuf_zero_count_decodes_to_default_path() {
         let buf = Bytes::from_static(&[0x00]);
         let (idxs, consumed) =
-            decode_protobuf_message_indexes(&buf).expect("empty index array is valid");
-        assert!(idxs.is_empty());
+            decode_protobuf_message_indexes(&buf).expect("optimised [0] encoding is valid");
+        assert_eq!(idxs, vec![0]);
         assert_eq!(consumed, 1);
     }
 
-    /// Overlong varint: 10 bytes all with MSB set, then no terminator.
+    /// Overlong varint: 20 bytes all with MSB set, no terminator.
     /// Must return Err without panicking.
     #[test]
     fn protobuf_overlong_varint_is_error() {
@@ -217,11 +216,10 @@ mod protobuf_adversarial {
         );
     }
 
-    /// Varint claiming N=1 index but then truncated before the index value.
+    /// Count = 1 (ZigZag 0x02) but truncated before the index value.
     #[test]
     fn protobuf_index_count_but_no_index_data() {
-        // varint 1 = one index follows, but no index bytes present
-        let buf = Bytes::from_static(&[0x01]);
+        let buf = Bytes::from_static(&[0x02]);
         let result = decode_protobuf_message_indexes(&buf);
         assert!(
             result.is_err(),
@@ -229,23 +227,35 @@ mod protobuf_adversarial {
         );
     }
 
-    /// Single index [0]: the standard/common-case Confluent Protobuf framing.
+    /// A plain (non-ZigZag) count of 1 ZigZag-decodes to -1 and must be
+    /// rejected — silently accepting it would desynchronise the payload offset.
     #[test]
-    fn protobuf_single_index_zero() {
-        // varint 1 (count), varint 0 (index)
+    fn protobuf_negative_count_is_error() {
         let buf = Bytes::from_static(&[0x01, 0x00]);
+        let result = decode_protobuf_message_indexes(&buf);
+        assert!(
+            result.is_err(),
+            "negative count must be rejected: {result:?}"
+        );
+        assert!(result.unwrap_err().to_string().contains("negative"));
+    }
+
+    /// Single index [1]: ZigZag(count=1)=2, ZigZag(1)=2.
+    #[test]
+    fn protobuf_single_index_one() {
+        let buf = Bytes::from_static(&[0x02, 0x02]);
         let (idxs, consumed) =
-            decode_protobuf_message_indexes(&buf).expect("single index [0] is valid");
-        assert_eq!(idxs, vec![0]);
+            decode_protobuf_message_indexes(&buf).expect("single index [1] is valid");
+        assert_eq!(idxs, vec![1]);
         assert_eq!(consumed, 2);
     }
 
-    /// Large but valid index value — message indexes use zigzag encoding.
-    /// Index value 150 encodes as zigzag(150)=300, varint 300=[0xAC, 0x02].
+    /// Large but valid index value — indexes use ZigZag encoding.
+    /// Index value 150 encodes as ZigZag(150)=300, varint 300 = [0xAC, 0x02].
     #[test]
     fn protobuf_large_index_value() {
-        // count=1, index=150 (zigzag-encoded as 300 = [0xAC, 0x02])
-        let buf = Bytes::from_static(&[0x01, 0xAC, 0x02]);
+        // ZigZag(count=1)=2, then index 150
+        let buf = Bytes::from_static(&[0x02, 0xAC, 0x02]);
         let (idxs, consumed) =
             decode_protobuf_message_indexes(&buf).expect("large index value is valid");
         assert_eq!(idxs, vec![150]);
@@ -254,12 +264,10 @@ mod protobuf_adversarial {
 
     /// Message-index count greater than the 512 limit must be rejected.
     ///
-    /// The count value 513 encodes as a two-byte varint: 513 = 0x201 →
-    /// little-endian varint = [0x81, 0x04].
+    /// ZigZag(513) = 1026 → varint = [0x82, 0x08].
     #[test]
     fn protobuf_message_index_count_over_limit_is_error() {
-        // varint for 513: 513 & 0x7F = 0x01 with continuation bit → 0x81; 513 >> 7 = 4 → 0x04
-        let buf = Bytes::from_static(&[0x81, 0x04]);
+        let buf = Bytes::from_static(&[0x82, 0x08]);
         let result = decode_protobuf_message_indexes(&buf);
         assert!(
             result.is_err(),
@@ -270,5 +278,11 @@ mod protobuf_adversarial {
             err_str.contains("513") || err_str.contains("512"),
             "error should mention the limit or count: {err_str}"
         );
+    }
+
+    /// An empty slice is a truncated varint, not a valid frame.
+    #[test]
+    fn protobuf_empty_slice_is_error() {
+        assert!(decode_protobuf_message_indexes(&[]).is_err());
     }
 }

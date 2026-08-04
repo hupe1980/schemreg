@@ -1,0 +1,15 @@
+# Runs the OFFICIAL confluent-kafka Python serializers so the fixtures are
+# produced by the reference implementation, not by schemreg.
+FROM python:3.12-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends protobuf-compiler \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+      "confluent-kafka[avro,json,protobuf,schemaregistry]==2.6.1" \
+      "protobuf>=5.27,<6"
+
+WORKDIR /app
+COPY shop.proto generate_fixtures.py ./
+RUN protoc --python_out=. shop.proto

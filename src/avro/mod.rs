@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.3", features = ["avro"] }
+//! schemreg = { version = "0.4", features = ["avro"] }
 //! ```
 //!
 //! # Layered model
@@ -60,25 +60,27 @@
 //! println!("{decoded:?}");
 //! ```
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use apache_avro::Schema as AvroSchema;
 use apache_avro::types::Value;
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
 
+use crate::cache_inner::InMemoryCache;
+use crate::codec_cache::{DEFAULT_MAX_SUBJECT_CACHE_ENTRIES, subject_resolution_cancelled};
 use crate::error::{Result, SchemaRegError};
 use crate::subject::SubjectNameStrategy;
 use crate::traits::SchemaRegistryClient;
 use crate::types::{EncodeTarget, SchemaId, SchemaReference, SchemaType};
 use crate::wire::{decode_wire_format_bytes, encode_wire_format};
 
-// ── Type aliases ──────────────────────────────────────────────────────────
-
-type InFlightMap = Mutex<HashMap<String, Vec<oneshot::Sender<Result<Arc<EncoderEntry>>>>>>;
+/// Default bound on the number of parsed writer schemas an
+/// [`AvroSchemaDecoder`] keeps in memory.
+///
+/// Matches [`DEFAULT_MAX_CACHE_ENTRIES`](crate::DEFAULT_MAX_CACHE_ENTRIES) so a
+/// decoder cannot outgrow the registry cache sitting behind it.
+pub const DEFAULT_MAX_AVRO_SCHEMA_CACHE_ENTRIES: usize = 1000;
 
 // ── Schema helpers ────────────────────────────────────────────────────────
 
@@ -115,8 +117,9 @@ struct EncoderEntry {
 ///
 /// On the first call for a given subject, the encoder registers the Avro schema
 /// with the registry, caches the assigned schema ID, and caches the parsed
-/// [`apache_avro::Schema`].  Subsequent encodes hit only an in-memory
-/// [`RwLock`]-guarded hash-map read.
+/// [`apache_avro::Schema`].  Subsequent encodes hit only a bounded in-memory
+/// cache; concurrent first-encodes for one subject coalesce behind a single
+/// registration.
 ///
 /// # Subject name resolution
 ///
@@ -136,10 +139,8 @@ pub struct AvroSchemaEncoder<C> {
     schema_fullname: Option<String>,
     strategy: SubjectNameStrategy,
     references: Vec<SchemaReference>,
-    /// `subject → (schema_id, parsed schema)` — populated lazily on first use.
-    cache: RwLock<HashMap<String, Arc<EncoderEntry>>>,
-    /// In-flight coalescing: subjects currently being registered.
-    in_flight: InFlightMap,
+    /// Bounded, coalescing `subject → (schema_id, parsed schema)` cache.
+    cache: InMemoryCache<String, EncoderEntry>,
 }
 
 impl<C: SchemaRegistryClient> AvroSchemaEncoder<C> {
@@ -148,106 +149,45 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoder<C> {
         AvroSchemaEncoderBuilder::new()
     }
 
-    /// Resolve subject → schema ID, registering if not already cached.
+    /// Resolve subject → cached entry, registering the schema if needed.
     ///
-    /// Uses the same coalescing pattern as [`ConfluentSchemaEncoder`]: concurrent
-    /// callers for the same subject coalesce behind a single leader registration,
-    /// preventing duplicate schema-register RPCs under high concurrency.
+    /// Concurrent callers for the same subject coalesce behind a single leader
+    /// registration, preventing duplicate schema-register RPCs under high
+    /// concurrency. Cancellation of the leader wakes every waiter with an error.
     async fn resolve_subject(&self, subject: &str) -> Result<Arc<EncoderEntry>> {
-        // Fast path: already cached.
-        if let Some(entry) = self.cache.read().get(subject) {
-            return Ok(Arc::clone(entry));
-        }
-
-        // Slow path: coalescing lock.
-        let waiter_rx = {
-            let mut in_flight = self.in_flight.lock();
-            // Double-check after acquiring the lock.
-            if let Some(entry) = self.cache.read().get(subject) {
-                return Ok(Arc::clone(entry));
-            }
-            if let Some(waiters) = in_flight.get_mut(subject) {
-                let (tx, rx) = oneshot::channel();
-                waiters.push(tx);
-                Some(rx)
-            } else {
-                in_flight.insert(subject.to_string(), Vec::new());
-                None
-            }
-        };
-
-        if let Some(rx) = waiter_rx {
-            return rx.await.map_err(|_| {
-                SchemaRegError::invalid_state("schema entry resolution cancelled by the leader")
-            })?;
-        }
-
-        // We are the leader. Use a drop-guard to cancel waiters on panic/cancellation.
-        struct ResolveGuard<'a> {
-            in_flight: &'a InFlightMap,
-            subject: &'a str,
-            done: bool,
-        }
-        impl Drop for ResolveGuard<'_> {
-            fn drop(&mut self) {
-                if !self.done {
-                    let waiters = self
-                        .in_flight
-                        .lock()
-                        .remove(self.subject)
-                        .unwrap_or_default();
-                    for tx in waiters {
-                        let _ = tx.send(Err(SchemaRegError::invalid_state(
-                            "Avro schema entry resolution cancelled",
-                        )));
-                    }
-                }
-            }
-        }
-
-        let mut guard = ResolveGuard {
-            in_flight: &self.in_flight,
-            subject,
-            done: false,
-        };
-
-        let result = self
-            .registry
-            .register_schema(
-                subject,
-                &self.schema_str,
-                SchemaType::Avro,
-                &self.references,
-            )
-            .await
-            .map(|schema_id| {
-                Arc::new(EncoderEntry {
+        self.cache
+            .get_or_fetch(subject.to_string(), || async {
+                let schema_id = self
+                    .registry
+                    .register_schema(
+                        subject,
+                        &self.schema_str,
+                        SchemaType::Avro,
+                        &self.references,
+                    )
+                    .await?;
+                Ok(Arc::new(EncoderEntry {
                     schema_id,
                     avro_schema: Arc::clone(&self.avro_schema),
-                })
-            });
+                }))
+            })
+            .await
+    }
 
-        let waiters = self.in_flight.lock().remove(subject).unwrap_or_default();
+    /// Return the cached schema ID for `subject`, if it has been resolved.
+    #[must_use]
+    pub fn cached_schema_id(&self, subject: &str) -> Option<SchemaId> {
+        self.cache.get(&subject.to_string()).map(|e| e.schema_id)
+    }
 
-        match &result {
-            Ok(entry) => {
-                self.cache
-                    .write()
-                    .insert(subject.to_string(), Arc::clone(entry));
-                for tx in waiters {
-                    let _ = tx.send(Ok(Arc::clone(entry)));
-                }
-            }
-            Err(e) => {
-                let cloned = e.clone();
-                for tx in waiters {
-                    let _ = tx.send(Err(cloned.clone()));
-                }
-            }
-        }
+    /// Number of `subject → schema ID` mappings currently cached.
+    pub fn cached_subject_count(&self) -> usize {
+        self.cache.len()
+    }
 
-        guard.done = true;
-        result
+    /// Forget the cached schema ID for `subject`.
+    pub fn invalidate_subject(&self, subject: &str) {
+        self.cache.invalidate(&subject.to_string());
     }
 
     /// Serialise `value` to Confluent-framed Avro bytes.
@@ -297,6 +237,7 @@ pub struct AvroSchemaEncoderBuilder<C> {
     schema: Option<String>,
     strategy: SubjectNameStrategy,
     references: Vec<SchemaReference>,
+    max_subject_cache_entries: usize,
 }
 
 impl<C: SchemaRegistryClient> AvroSchemaEncoderBuilder<C> {
@@ -306,7 +247,15 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoderBuilder<C> {
             schema: None,
             strategy: SubjectNameStrategy::TopicName,
             references: Vec::new(),
+            max_subject_cache_entries: DEFAULT_MAX_SUBJECT_CACHE_ENTRIES,
         }
+    }
+
+    /// Bound the `subject → schema ID` cache (default:
+    /// [`DEFAULT_MAX_SUBJECT_CACHE_ENTRIES`]). Values below 1 are clamped to 1.
+    pub fn max_subject_cache_entries(mut self, max_entries: usize) -> Self {
+        self.max_subject_cache_entries = max_entries;
+        self
     }
 
     /// Set the schema registry client (required).
@@ -363,8 +312,10 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoderBuilder<C> {
             schema_fullname: fullname,
             strategy: self.strategy,
             references: self.references,
-            cache: RwLock::new(HashMap::new()),
-            in_flight: Mutex::new(HashMap::new()),
+            cache: InMemoryCache::new(
+                Some(self.max_subject_cache_entries.max(1)),
+                subject_resolution_cancelled,
+            ),
         })
     }
 }
@@ -378,37 +329,104 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoderBuilder<C> {
 /// the registry and caches the parsed [`apache_avro::Schema`].  Subsequent
 /// decodes with the same schema ID are served entirely from the in-memory cache.
 ///
+/// # Cache behaviour
+///
+/// The parsed-schema cache is **bounded** (default
+/// [`DEFAULT_MAX_AVRO_SCHEMA_CACHE_ENTRIES`]) and **coalescing**: when N tasks
+/// decode messages carrying a schema ID that is not yet cached, exactly one
+/// registry lookup and one schema parse happen; the rest wait for the result.
+/// Use [`with_max_cache_entries`](Self::with_max_cache_entries) to resize it.
+///
+/// # Schema evolution
+///
+/// By default the payload is decoded with the **writer** schema, which is what
+/// the wire header identifies. Supply a **reader** schema with
+/// [`with_reader_schema`](Self::with_reader_schema) to get Avro's full schema
+/// resolution — defaulted fields, dropped fields, promoted numeric types —
+/// matching the behaviour of the Confluent Java `SpecificAvroDeserializer`.
+///
 /// # Serde support
 ///
 /// Use [`decode_de`](Self::decode_de) to deserialise directly into a
 /// concrete Rust type implementing [`serde::Deserialize`].
 pub struct AvroSchemaDecoder<C> {
     registry: C,
-    schema_cache: RwLock<HashMap<SchemaId, Arc<AvroSchema>>>,
+    /// Optional reader schema used for Avro schema resolution.
+    reader_schema: Option<Arc<AvroSchema>>,
+    schema_cache: InMemoryCache<SchemaId, AvroSchema>,
+}
+
+impl<C> std::fmt::Debug for AvroSchemaDecoder<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AvroSchemaDecoder")
+            .field("has_reader_schema", &self.reader_schema.is_some())
+            .field("cached_schemas", &self.schema_cache.len())
+            .finish_non_exhaustive()
+    }
+}
+
+fn avro_schema_lookup_cancelled(id: &SchemaId) -> SchemaRegError {
+    SchemaRegError::invalid_state(format!(
+        "Avro schema lookup cancelled before completion for schema id {id}"
+    ))
 }
 
 impl<C: SchemaRegistryClient> AvroSchemaDecoder<C> {
     /// Create a new `AvroSchemaDecoder` backed by the given registry client.
     pub fn new(registry: C) -> Self {
+        Self::with_max_cache_entries(registry, DEFAULT_MAX_AVRO_SCHEMA_CACHE_ENTRIES)
+    }
+
+    /// Create a decoder whose parsed-schema cache holds at most `max_entries`.
+    ///
+    /// The oldest entry is evicted once the bound is reached. Values below 1 are
+    /// clamped to 1.
+    pub fn with_max_cache_entries(registry: C, max_entries: usize) -> Self {
         Self {
             registry,
-            schema_cache: RwLock::new(HashMap::new()),
+            reader_schema: None,
+            schema_cache: InMemoryCache::new(
+                Some(max_entries.max(1)),
+                avro_schema_lookup_cancelled,
+            ),
         }
     }
 
+    /// Decode against an explicit **reader** schema, enabling Avro schema
+    /// resolution between the writer schema named by the wire header and the
+    /// schema this consumer was compiled against.
+    ///
+    /// Without a reader schema, a payload written with a newer writer schema is
+    /// decoded structurally as that writer schema — fields the consumer does not
+    /// know about appear in the [`Value`], and fields the consumer expects but
+    /// the writer dropped are simply absent. With a reader schema, Avro applies
+    /// its documented resolution rules instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if `schema` is not valid Avro schema JSON.
+    pub fn with_reader_schema(mut self, schema: &str) -> Result<Self> {
+        self.reader_schema = Some(Arc::new(parse_avro_schema(schema)?));
+        Ok(self)
+    }
+
+    /// Number of parsed writer schemas currently cached.
+    pub fn cache_len(&self) -> usize {
+        self.schema_cache.len()
+    }
+
+    /// Drop every cached parsed schema.
+    pub fn clear_cache(&self) {
+        self.schema_cache.clear();
+    }
+
     async fn get_avro_schema(&self, id: SchemaId) -> Result<Arc<AvroSchema>> {
-        // Fast path: already cached.
-        if let Some(schema) = self.schema_cache.read().get(&id) {
-            return Ok(Arc::clone(schema));
-        }
-        // Slow path: fetch from registry, then parse.
-        let registry_schema = self.registry.get_schema_by_id(id).await?;
-        let avro_schema = parse_avro_schema(&registry_schema.schema)?;
-        let avro_schema = Arc::new(avro_schema);
         self.schema_cache
-            .write()
-            .insert(id, Arc::clone(&avro_schema));
-        Ok(avro_schema)
+            .get_or_fetch(id, || async move {
+                let registry_schema = self.registry.get_schema_by_id(id).await?;
+                parse_avro_schema(&registry_schema.schema).map(Arc::new)
+            })
+            .await
     }
 
     /// Decode a Confluent-framed Avro message to a [`Value`].
@@ -419,13 +437,16 @@ impl<C: SchemaRegistryClient> AvroSchemaDecoder<C> {
     /// - The wire header is invalid (not Confluent-framed or truncated).
     /// - The schema registry lookup fails.
     /// - The Avro bytes do not conform to the schema.
+    /// - A reader schema is configured and the writer schema cannot be resolved to it.
     pub async fn decode(&self, data: Bytes) -> Result<Value> {
         let (schema_id, payload) = decode_wire_format_bytes(&data)?;
-        let avro_schema = self.get_avro_schema(schema_id).await?;
-        let value = apache_avro::from_avro_datum(&avro_schema, &mut payload.as_ref(), None)
-            .map_err(|e| {
-                SchemaRegError::wire_format(format!("Avro deserialization failed: {e}"))
-            })?;
+        let writer_schema = self.get_avro_schema(schema_id).await?;
+        let value = apache_avro::from_avro_datum(
+            &writer_schema,
+            &mut payload.as_ref(),
+            self.reader_schema.as_deref(),
+        )
+        .map_err(|e| SchemaRegError::wire_format(format!("Avro deserialization failed: {e}")))?;
         Ok(value)
     }
 
@@ -445,5 +466,27 @@ impl<C: SchemaRegistryClient> AvroSchemaDecoder<C> {
                 "failed to deserialize Avro value into target type: {e}"
             ))
         })
+    }
+}
+
+impl<C> std::fmt::Debug for AvroSchemaEncoder<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AvroSchemaEncoder")
+            .field("schema_fullname", &self.schema_fullname)
+            .field("strategy", &self.strategy)
+            .field("references", &self.references.len())
+            .field("cached_subjects", &self.cache.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<C> std::fmt::Debug for AvroSchemaEncoderBuilder<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AvroSchemaEncoderBuilder")
+            .field("registry", &self.registry.is_some())
+            .field("schema_set", &self.schema.is_some())
+            .field("strategy", &self.strategy)
+            .field("references", &self.references.len())
+            .finish()
     }
 }

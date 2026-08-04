@@ -1,14 +1,33 @@
 # cargo-deny configuration for schemreg.
 #
-# Run: cargo deny check
-# Install: cargo install cargo-deny
+# Run:     cargo deny check
+# Install: cargo install cargo-deny --locked
+#
+# CI runs `cargo deny check` on every push and pull request; a failure blocks
+# the merge. Add an explicit, dated, justified entry rather than relaxing a
+# whole category.
+
+[graph]
+# Evaluate every optional backend, not just the default (empty) feature set —
+# the AWS SDK and jsonschema trees only appear with features enabled.
+all-features = true
+
+# ── Advisories ────────────────────────────────────────────────────────────
 
 [advisories]
-# Deny all known vulnerabilities; list specific IDs to ignore intentional exceptions.
+# Deny all known vulnerabilities. Any exception must be listed here with a
+# comment naming the advisory, the reason, and the removal condition.
 ignore = []
+# A yanked dependency is a supply-chain signal, not a nuisance.
+yanked = "deny"
+
+# ── Licences ──────────────────────────────────────────────────────────────
 
 [licenses]
-# Approved SPDX licence identifiers.
+version = 2
+confidence-threshold = 0.93
+# Approved SPDX licence identifiers. Permissive only — no copyleft, so the
+# crate stays embeddable in proprietary services.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -16,12 +35,17 @@ allow = [
     "ISC",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "Unicode-DFS-2016",
     "Unicode-3.0",
-    "OpenSSL",
     "CC0-1.0",
     "Zlib",
+    # webpki-roots ships the Mozilla CA bundle under the Common Data Licence
+    # Agreement (permissive; data, not code).
+    "CDLA-Permissive-2.0",
+    # MIT with the attribution clause removed — strictly more permissive.
+    "MIT-0",
 ]
+
+# ── Bans ──────────────────────────────────────────────────────────────────
 
 [bans]
 # Deny duplicate versions of the same crate to prevent accidental
@@ -29,22 +53,35 @@ allow = [
 # rustls, zeroize). Re-evaluate per-package skip entries as the dependency
 # tree stabilises.
 multiple-versions = "deny"
+# A wildcard version requirement makes the build non-reproducible.
+wildcards = "deny"
+allow-wildcard-paths = true
+# Duplicates below are all forced by the AWS SDK / smithy runtime, which still
+# pins the http 0.2 line while reqwest and hyper are on 1.x. They only appear
+# with the `glue` feature enabled. Recheck on every aws-sdk-glue bump: each
+# entry should disappear on its own once smithy migrates.
 skip = [
-    # aws-sdk crates and their smithy runtime currently pull in two versions
-    # of a few utility crates; these are upstream constraints, not our choices.
-    { name = "bitflags" },
-    { name = "hashbrown" },
-    { name = "indexmap" },
-    { name = "syn" },
+    { name = "getrandom", reason = "aws-smithy-* pins getrandom 0.2; rustls/rand use 0.3" },
+    { name = "http", reason = "aws-sigv4 / aws-smithy-http pin http 0.2; reqwest+hyper use 1.x" },
+    { name = "http-body", reason = "transitively pinned alongside http 0.2" },
+    { name = "windows-sys", reason = "several crates pin different windows-sys minor lines" },
+    { name = "hashbrown", reason = "indexmap and std-internal versions differ" },
 ]
-# Prevent pulling in native OpenSSL — the crate uses rustls exclusively.
 deny = [
-    { name = "openssl", reason = "use rustls — openssl introduces native-library coupling and a larger attack surface" },
-    { name = "openssl-sys", reason = "use rustls — openssl introduces native-library coupling and a larger attack surface" },
+    # rustls only — openssl introduces native-library coupling, a much larger
+    # attack surface, and a build-time dependency on the host toolchain.
+    { name = "openssl", reason = "use rustls" },
+    { name = "openssl-sys", reason = "use rustls" },
+    { name = "native-tls", reason = "use rustls" },
+    # The crate must never grow a second async runtime.
+    { name = "async-std", reason = "schemreg targets tokio exclusively" },
 ]
 
+# ── Sources ───────────────────────────────────────────────────────────────
+
 [sources]
-# Only allow crates from crates.io; reject git or path dependencies in published builds.
+# Only allow crates from crates.io; reject git or path dependencies in
+# published builds.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

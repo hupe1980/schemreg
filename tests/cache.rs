@@ -507,10 +507,9 @@ async fn aborted_leader_unblocks_waiters_with_error() {
     // or return a schema error. Under the current implementation they get an Err
     // because the in-flight slot is torn down when the leader is dropped.
     // Either outcome is acceptable; what is NOT acceptable is a hang or a panic.
-    let results =
-        tokio::task::JoinSet::from_iter(waiter_handles.into_iter().map(|h| async move { h.await }))
-            .join_all()
-            .await;
+    let results = tokio::task::JoinSet::from_iter(waiter_handles)
+        .join_all()
+        .await;
 
     for join_result in results {
         // A JoinError only wraps a panic — that is always a bug.

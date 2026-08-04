@@ -14,9 +14,10 @@ use base64::Engine as _;
 
 use crate::error::{Result, SchemaRegError};
 use crate::http::{
-    HttpClient, HttpClientConfig, normalize_url, percent_encode, reject_embedded_credentials,
-    validate_subject,
+    HttpClient, HttpClientConfig, is_loopback_host, normalize_url, percent_encode,
+    reject_embedded_credentials, validate_subject,
 };
+use crate::retry::RetryPolicy;
 use crate::traits::SchemaRegistryClient;
 use crate::types::{
     CompatibilityLevel, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion,
@@ -246,8 +247,7 @@ impl ConfluentSchemaRegistry {
         let body_bytes = serde_json::to_vec(&body).map_err(|e| {
             SchemaRegError::invalid_state(format!("failed to serialise request: {e}"))
         })?;
-        let _: serde_json::Value = self.http_put(&url, &body_bytes).await?;
-        Ok(())
+        self.http_put_unit(&url, &body_bytes).await
     }
 
     /// Get the current compatibility policy for a subject.
@@ -276,6 +276,7 @@ impl ConfluentSchemaRegistry {
         subject: &str,
         permanent: bool,
     ) -> Result<Vec<SchemaVersion>> {
+        validate_subject(subject)?;
         let mut url = format!("{}/subjects/{}", self.base_url, percent_encode(subject));
         if permanent {
             url.push_str("?permanent=true");
@@ -332,17 +333,39 @@ impl ConfluentSchemaRegistry {
                     "failed to parse schema registry response: {e}"
                 ))
             })
-        } else if status == 401 || status == 403 {
+        } else {
+            Err(Self::response_error(status, body))
+        }
+    }
+
+    /// Handle a response whose successful body carries no information.
+    ///
+    /// Registries disagree on what a config write returns: Confluent replies
+    /// `200` with a JSON echo, while some proxies and Karapace builds reply
+    /// `204 No Content` with no `Content-Type` at all. Demanding a parseable
+    /// JSON body would turn a successful write into a spurious error, so
+    /// success is decided purely from the status code.
+    fn handle_unit_response(status: u16, body: &[u8]) -> Result<()> {
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(Self::response_error(status, body))
+        }
+    }
+
+    /// Convert a non-2xx response into the most specific error variant available.
+    fn response_error(status: u16, body: &[u8]) -> SchemaRegError {
+        if status == 401 || status == 403 {
             let message = serde_json::from_slice::<ErrorResponse>(body)
                 .map(|e| e.message)
                 .unwrap_or_else(|_| format!("HTTP {status}"));
-            Err(SchemaRegError::auth(status, message))
+            SchemaRegError::auth(status, message)
         } else if let Ok(err) = serde_json::from_slice::<ErrorResponse>(body) {
-            Err(SchemaRegError::api(err.error_code, err.message))
+            SchemaRegError::api(err.error_code, err.message)
         } else {
             let body_str = String::from_utf8_lossy(body);
             let preview = sanitized_error_body_preview(&body_str);
-            Err(SchemaRegError::http(status, preview))
+            SchemaRegError::http(status, preview)
         }
     }
 
@@ -381,7 +404,8 @@ impl ConfluentSchemaRegistry {
         Self::handle_response(resp.status, resp.content_type.as_deref(), &resp.body)
     }
 
-    async fn http_put<T: serde::de::DeserializeOwned>(&self, url: &str, body: &[u8]) -> Result<T> {
+    /// PUT a JSON body and ignore the (possibly empty) success body.
+    async fn http_put_unit(&self, url: &str, body: &[u8]) -> Result<()> {
         let auth = self.auth_header_value();
         let auth_str = auth.as_ref().map(|z| z.as_str());
         let resp = self
@@ -397,7 +421,7 @@ impl ConfluentSchemaRegistry {
                 auth_str,
             )
             .await?;
-        Self::handle_response(resp.status, resp.content_type.as_deref(), &resp.body)
+        Self::handle_unit_response(resp.status, &resp.body)
     }
 
     async fn http_delete<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
@@ -605,6 +629,10 @@ pub struct ConfluentSchemaRegistryBuilder {
     identity: Option<reqwest::Identity>,
     /// Maximum idle connections per host kept in the connection pool.
     pool_max_idle_per_host: Option<usize>,
+    /// Retry behaviour for transient failures.
+    retry_policy: RetryPolicy,
+    /// Hard ceiling on concurrent in-flight requests.
+    max_concurrent_requests: Option<usize>,
 }
 
 impl Default for ConfluentSchemaRegistryBuilder {
@@ -618,6 +646,8 @@ impl Default for ConfluentSchemaRegistryBuilder {
             root_certificates: Vec::new(),
             identity: None,
             pool_max_idle_per_host: None,
+            retry_policy: RetryPolicy::default(),
+            max_concurrent_requests: None,
         }
     }
 }
@@ -724,6 +754,35 @@ impl ConfluentSchemaRegistryBuilder {
         self
     }
 
+    /// Override the retry policy for transient failures.
+    ///
+    /// The default retries 3 times with jittered exponential back-off and
+    /// honours `Retry-After`. Pass [`RetryPolicy::none()`] when the calling
+    /// layer already implements retry, so the two do not multiply.
+    ///
+    /// ```rust,no_run
+    /// # use std::time::Duration;
+    /// # use schemreg::RetryPolicy;
+    /// let policy = RetryPolicy::new()
+    ///     .max_retries(5)
+    ///     .base_backoff(Duration::from_millis(50));
+    /// ```
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+
+    /// Cap the number of requests this client may have in flight at once.
+    ///
+    /// Coalescing already collapses concurrent misses for the *same* schema ID
+    /// to one request. This bounds the other case: a cold start that fans out to
+    /// thousands of *distinct* IDs, where each miss opens its own socket. Excess
+    /// callers wait for a permit rather than for a file descriptor.
+    pub fn max_concurrent_requests(mut self, max: usize) -> Self {
+        self.max_concurrent_requests = Some(max);
+        self
+    }
+
     /// Set the maximum number of idle connections kept per host in the pool.
     ///
     /// Set to `0` to disable connection reuse entirely. The default (unset)
@@ -741,14 +800,26 @@ impl ConfluentSchemaRegistryBuilder {
 
         reject_embedded_credentials(&url)?;
 
+        // Cleartext credentials may not cross a network. Loopback is exempt:
+        // `http://localhost:8081` is the standard local-development and
+        // docker-compose setup, and the traffic never leaves the machine.
         if matches!(
             self.auth,
             RegistryAuth::Basic { .. } | RegistryAuth::Bearer { .. }
         ) && url.starts_with("http://")
         {
-            return Err(SchemaRegError::config(
-                "schema registry auth requires HTTPS — credentials would be sent in cleartext over HTTP",
-            ));
+            if !is_loopback_host(&url) {
+                return Err(SchemaRegError::config(
+                    "schema registry auth requires HTTPS — credentials would be sent in \
+                     cleartext over HTTP. (Plain HTTP with credentials is permitted only \
+                     for loopback hosts such as http://localhost:8081.)",
+                ));
+            }
+            tracing::warn!(
+                url = %url,
+                "sending credentials over cleartext HTTP to a loopback address — \
+                 acceptable for local development, never for a deployed registry"
+            );
         }
 
         let client = HttpClient::with_config(HttpClientConfig {
@@ -757,6 +828,8 @@ impl ConfluentSchemaRegistryBuilder {
             root_certificates: self.root_certificates,
             identity: self.identity,
             pool_max_idle_per_host: self.pool_max_idle_per_host,
+            retry_policy: self.retry_policy,
+            max_concurrent_requests: self.max_concurrent_requests,
         })?;
 
         Ok(ConfluentSchemaRegistry {
@@ -765,5 +838,25 @@ impl ConfluentSchemaRegistryBuilder {
             auth: self.auth,
             normalize: self.normalize,
         })
+    }
+}
+
+impl fmt::Debug for ConfluentSchemaRegistryBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let auth_desc = match &self.auth {
+            RegistryAuth::None => "none",
+            RegistryAuth::Basic { .. } => "basic(***)",
+            RegistryAuth::Bearer { .. } => "bearer(***)",
+        };
+        f.debug_struct("ConfluentSchemaRegistryBuilder")
+            .field("url", &self.url)
+            .field("auth", &auth_desc)
+            .field("request_timeout", &self.request_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("normalize", &self.normalize)
+            .field("root_certificates", &self.root_certificates.len())
+            .field("identity", &self.identity.is_some())
+            .field("pool_max_idle_per_host", &self.pool_max_idle_per_host)
+            .finish()
     }
 }

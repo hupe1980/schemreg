@@ -25,6 +25,8 @@
 
 #[cfg(feature = "glue")]
 mod client;
+#[cfg(feature = "glue")]
+mod error;
 
 #[cfg(feature = "glue")]
 pub use client::{AwsGlueSchemaRegistry, AwsGlueSchemaRegistryBuilder};
@@ -50,8 +52,6 @@ use std::io::{Read, Write};
 use crate::cache_inner::InMemoryCache;
 use crate::error::{Result, SchemaRegError};
 use crate::traits::AnySchemaCache;
-
-// `futures` is an unconditional dependency of schemreg (used for join_all in warm_cache).
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -202,7 +202,7 @@ fn hex_digit(c: u8) -> Option<u8> {
     }
 }
 
-fn glue_schema_lookup_cancelled_error(id: GlueSchemaVersionId) -> SchemaRegError {
+fn glue_schema_lookup_cancelled_error(id: &GlueSchemaVersionId) -> SchemaRegError {
     SchemaRegError::invalid_state(format!(
         "glue schema lookup cancelled before completion for id {id}"
     ))
@@ -485,6 +485,19 @@ pub trait GlueSchemaRegistryClient: Send + Sync {
         schema: &'a str,
         data_format: GlueDataFormat,
     ) -> impl Future<Output = Result<GlueSchemaVersionId>> + Send + 'a;
+
+    /// Probe the registry for connectivity and credentials.
+    ///
+    /// Returns `Ok(())` when the registry is reachable. Designed for Kubernetes
+    /// readiness probes and startup preflight checks.
+    /// Default: `Err(NotSupported)`.
+    fn health_check(&self) -> impl Future<Output = Result<()>> + Send + '_ {
+        async {
+            Err(SchemaRegError::not_supported(
+                "health_check is not supported by this Glue registry implementation",
+            ))
+        }
+    }
 }
 
 impl<T: GlueSchemaRegistryClient + ?Sized> GlueSchemaRegistryClient for &T {
@@ -502,6 +515,9 @@ impl<T: GlueSchemaRegistryClient + ?Sized> GlueSchemaRegistryClient for &T {
     ) -> impl Future<Output = Result<GlueSchemaVersionId>> + Send + 'a {
         T::register_schema(self, schema_name, schema, data_format)
     }
+    fn health_check(&self) -> impl Future<Output = Result<()>> + Send + '_ {
+        T::health_check(self)
+    }
 }
 
 impl<T: GlueSchemaRegistryClient + ?Sized> GlueSchemaRegistryClient for std::sync::Arc<T> {
@@ -518,6 +534,9 @@ impl<T: GlueSchemaRegistryClient + ?Sized> GlueSchemaRegistryClient for std::syn
         data_format: GlueDataFormat,
     ) -> impl Future<Output = Result<GlueSchemaVersionId>> + Send + 'a {
         T::register_schema(self, schema_name, schema, data_format)
+    }
+    fn health_check(&self) -> impl Future<Output = Result<()>> + Send + '_ {
+        T::health_check(self)
     }
 }
 
@@ -555,6 +574,11 @@ pub trait DynGlueSchemaRegistryClient: Send + Sync {
         schema: &'a str,
         data_format: GlueDataFormat,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + 'a>>;
+
+    /// Probe the registry for connectivity and credentials.
+    fn health_check<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
 
 /// Blanket implementation: any [`GlueSchemaRegistryClient`] is automatically a
@@ -578,6 +602,11 @@ impl<T: GlueSchemaRegistryClient> DynGlueSchemaRegistryClient for T {
             schema,
             data_format,
         ))
+    }
+    fn health_check<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(GlueSchemaRegistryClient::health_check(self))
     }
 }
 
@@ -633,7 +662,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
 
     /// Remove a single schema version ID from the cache.
     pub fn invalidate(&self, version_id: GlueSchemaVersionId) {
-        self.cache.invalidate(version_id);
+        self.cache.invalidate(&version_id);
     }
 
     /// Remove all cached schemas.
@@ -643,9 +672,14 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
 
     /// Pre-fetch a set of schema version IDs into the cache.
     ///
-    /// Duplicate IDs are deduplicated automatically. Up to 16 IDs are fetched
-    /// in parallel per chunk. Failures are collected instead of failing fast;
-    /// see [`WarmGlueCacheError`].
+    /// Duplicate IDs are deduplicated automatically. At most
+    /// [`WARM_CACHE_CONCURRENCY`](crate::cache::WARM_CACHE_CONCURRENCY) fetches
+    /// are in flight at once, with no per-batch barrier. Failures are collected
+    /// instead of failing fast; see [`WarmGlueCacheError`].
+    ///
+    /// Accepts anything iterable over [`GlueSchemaVersionId`] — a slice, a
+    /// `Vec`, or an iterator — mirroring
+    /// [`CachedSchemaRegistry::warm_cache`](crate::CachedSchemaRegistry::warm_cache).
     ///
     /// # Errors
     ///
@@ -653,34 +687,28 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
     /// IDs that loaded successfully remain in the cache.
     pub async fn warm_cache(
         &self,
-        version_ids: &[GlueSchemaVersionId],
+        version_ids: impl IntoIterator<Item = impl Into<GlueSchemaVersionId>>,
     ) -> std::result::Result<(), WarmGlueCacheError> {
-        const WARM_CONCURRENCY: usize = 16;
+        use futures::StreamExt as _;
 
-        let unique: HashSet<GlueSchemaVersionId> = version_ids.iter().copied().collect();
+        let unique: HashSet<GlueSchemaVersionId> =
+            version_ids.into_iter().map(Into::into).collect();
         if unique.is_empty() {
             return Ok(());
         }
 
-        let ids: Vec<GlueSchemaVersionId> = unique.into_iter().collect();
-        let mut failures: Vec<(GlueSchemaVersionId, SchemaRegError)> = Vec::new();
-
-        for chunk in ids.chunks(WARM_CONCURRENCY) {
-            let futs = chunk.iter().map(|&id| async move {
-                (
-                    id,
-                    self.cache
-                        .get_or_fetch(id, || self.inner.get_schema_by_version_id(id))
-                        .await,
-                )
-            });
-            let results = futures::future::join_all(futs).await;
-            for (id, result) in results {
-                if let Err(e) = result {
-                    failures.push((id, e));
-                }
-            }
-        }
+        let failures: Vec<(GlueSchemaVersionId, SchemaRegError)> = futures::stream::iter(unique)
+            .map(|id| async move {
+                let result = self
+                    .cache
+                    .get_or_fetch(id, || self.inner.get_schema_by_version_id(id))
+                    .await;
+                result.err().map(|e| (id, e))
+            })
+            .buffer_unordered(crate::cache::WARM_CACHE_CONCURRENCY)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
 
         if failures.is_empty() {
             Ok(())
@@ -734,6 +762,10 @@ impl<C: GlueSchemaRegistryClient> GlueSchemaRegistryClient for CachedGlueSchemaR
     ) -> Result<GlueSchemaVersionId> {
         self.register_schema(schema_name, schema, data_format).await
     }
+
+    fn health_check(&self) -> impl Future<Output = Result<()>> + Send + '_ {
+        self.inner.health_check()
+    }
 }
 
 impl<C: GlueSchemaRegistryClient> AnySchemaCache for CachedGlueSchemaRegistry<C> {
@@ -764,7 +796,7 @@ impl<C: GlueSchemaRegistryClient> AnySchemaCache for CachedGlueSchemaRegistry<C>
         ids: &'a [Self::Id],
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            Self::warm_cache(self, ids)
+            Self::warm_cache(self, ids.iter().copied())
                 .await
                 .map_err(|e| SchemaRegError::invalid_state(e.to_string()))
         })

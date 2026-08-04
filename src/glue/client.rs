@@ -5,8 +5,9 @@
 use std::fmt;
 use std::time::Duration;
 
+use super::error::map_sdk_error;
 use super::{GlueDataFormat, GlueSchema, GlueSchemaRegistryClient, GlueSchemaVersionId};
-use crate::error::Result;
+use crate::error::{Result, SchemaRegError};
 use std::sync::Arc;
 
 /// Default registry name used by the AWS Glue Schema Registry.
@@ -77,19 +78,19 @@ impl AwsGlueSchemaRegistry {
                 .schema_version_id(schema_version_id)
                 .send()
                 .await
-                .map_err(crate::error::SchemaRegError::network)?;
+                .map_err(map_sdk_error)?;
 
             match response.status() {
                 Some(aws_sdk_glue::types::SchemaVersionStatus::Available) => {
                     return Ok(response);
                 }
                 Some(aws_sdk_glue::types::SchemaVersionStatus::Failure) => {
-                    return Err(crate::error::SchemaRegError::invalid_state(
+                    return Err(SchemaRegError::invalid_state(
                         "schema version registration failed (status: FAILURE)",
                     ));
                 }
                 Some(aws_sdk_glue::types::SchemaVersionStatus::Deleting) => {
-                    return Err(crate::error::SchemaRegError::invalid_state(
+                    return Err(SchemaRegError::invalid_state(
                         "schema version is being deleted",
                     ));
                 }
@@ -100,7 +101,7 @@ impl AwsGlueSchemaRegistry {
                 }
             }
         }
-        Err(crate::error::SchemaRegError::invalid_state(format!(
+        Err(SchemaRegError::invalid_state(format!(
             "schema version did not reach AVAILABLE status after {} attempts",
             self.poll_max_attempts
         )))
@@ -111,7 +112,7 @@ impl AwsGlueSchemaRegistry {
             aws_sdk_glue::types::DataFormat::Avro => Ok(GlueDataFormat::Avro),
             aws_sdk_glue::types::DataFormat::Json => Ok(GlueDataFormat::Json),
             aws_sdk_glue::types::DataFormat::Protobuf => Ok(GlueDataFormat::Protobuf),
-            other => Err(crate::error::SchemaRegError::invalid_state(format!(
+            other => Err(SchemaRegError::invalid_state(format!(
                 "unsupported Glue data format: {other}"
             ))),
         }
@@ -127,9 +128,7 @@ impl AwsGlueSchemaRegistry {
 
     fn parse_version_id(s: &str) -> Result<GlueSchemaVersionId> {
         s.parse::<GlueSchemaVersionId>().map_err(|e| {
-            crate::error::SchemaRegError::invalid_state(format!(
-                "invalid schema version ID from registry: {e}"
-            ))
+            SchemaRegError::invalid_state(format!("invalid schema version ID from registry: {e}"))
         })
     }
 
@@ -157,23 +156,19 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
             .schema_version_id(&id_str)
             .send()
             .await
-            .map_err(crate::error::SchemaRegError::network)?;
+            .map_err(map_sdk_error)?;
 
         let data_format = response
             .data_format()
             .ok_or_else(|| {
-                crate::error::SchemaRegError::invalid_state(
-                    "schema version response missing data_format",
-                )
+                SchemaRegError::invalid_state("schema version response missing data_format")
             })
             .and_then(Self::convert_data_format)?;
 
         let schema_definition = response
             .schema_definition()
             .ok_or_else(|| {
-                crate::error::SchemaRegError::invalid_state(
-                    "schema version response missing schema_definition",
-                )
+                SchemaRegError::invalid_state("schema version response missing schema_definition")
             })?
             .to_string();
 
@@ -184,6 +179,25 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
             schema = schema.with_metadata(arn, version);
         }
         Ok(Arc::new(schema))
+    }
+
+    /// Probe AWS Glue for connectivity, credentials, and registry existence.
+    ///
+    /// Issues `GetRegistry` against the configured registry name — the cheapest
+    /// call that exercises credential resolution, network reachability, and the
+    /// `glue:GetRegistry` IAM permission.
+    async fn health_check(&self) -> Result<()> {
+        self.client
+            .get_registry()
+            .registry_id(
+                aws_sdk_glue::types::RegistryId::builder()
+                    .registry_name(&self.registry_name)
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(map_sdk_error)?;
+        Ok(())
     }
 
     async fn register_schema(
@@ -227,15 +241,13 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
         match register_result {
             Ok(response) => {
                 let version_id_str = response.schema_version_id().ok_or_else(|| {
-                    crate::error::SchemaRegError::invalid_state(
-                        "register response missing schema_version_id",
-                    )
+                    SchemaRegError::invalid_state("register response missing schema_version_id")
                 })?;
                 self.wait_and_parse_version_id(version_id_str).await
             }
             Err(register_err) => {
                 if !self.auto_register {
-                    return Err(crate::error::SchemaRegError::network(register_err));
+                    return Err(map_sdk_error(register_err));
                 }
 
                 // Auto-register — create the schema (first version).
@@ -257,7 +269,7 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
                 match create_result {
                     Ok(response) => {
                         let version_id_str = response.schema_version_id().ok_or_else(|| {
-                            crate::error::SchemaRegError::invalid_state(
+                            SchemaRegError::invalid_state(
                                 "create schema response missing schema_version_id",
                             )
                         })?;
@@ -272,14 +284,19 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
                             .send()
                             .await
                             .map_err(|e| {
-                                crate::error::SchemaRegError::invalid_state(format!(
-                                    "failed to register schema version \
-                                     (create also failed: {create_err}): {e}"
-                                ))
+                                // Preserve the retry semantics of the *final*
+                                // failure; mention the create failure as context.
+                                let classified = map_sdk_error(e);
+                                tracing::warn!(
+                                    create_error = %create_err,
+                                    "auto-register CreateSchema failed; \
+                                     RegisterSchemaVersion retry also failed"
+                                );
+                                classified
                             })?;
 
                         let version_id_str = fallback.schema_version_id().ok_or_else(|| {
-                            crate::error::SchemaRegError::invalid_state(
+                            SchemaRegError::invalid_state(
                                 "register response missing schema_version_id",
                             )
                         })?;
@@ -335,5 +352,16 @@ impl AwsGlueSchemaRegistryBuilder {
             poll_max_attempts: self.poll_max_attempts,
             poll_interval: self.poll_interval,
         }
+    }
+}
+
+impl fmt::Debug for AwsGlueSchemaRegistryBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AwsGlueSchemaRegistryBuilder")
+            .field("registry_name", &self.registry_name)
+            .field("auto_register", &self.auto_register)
+            .field("poll_max_attempts", &self.poll_max_attempts)
+            .field("poll_interval", &self.poll_interval)
+            .finish_non_exhaustive()
     }
 }

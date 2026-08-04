@@ -1,0 +1,36 @@
+syntax = "proto3";
+package shop;
+
+// Message ordering here is load-bearing: it determines the Confluent
+// message-index path, which is exactly what these fixtures pin.
+//
+//   Order            → [0]      (first top-level, the optimised single 0x00)
+//   Invoice          → [1]
+//   Invoice.Line     → [1, 0]
+//   Invoice.Tax      → [1, 1]
+//   Invoice.Tax.Rate → [1, 1, 0]
+//   Refund           → [2]
+
+message Order {
+  string id = 1;
+  int32 quantity = 2;
+}
+
+message Invoice {
+  string id = 1;
+
+  message Line {
+    string sku = 1;
+  }
+
+  message Tax {
+    string code = 1;
+    message Rate {
+      int32 basis_points = 1;
+    }
+  }
+}
+
+message Refund {
+  string id = 1;
+}

@@ -117,32 +117,33 @@ fn confluent_avro_big_endian_byte_order_golden() {
 //
 // Spec layout after the 5-byte header:
 //
-//   [count_varint] [zigzag(index_0)_varint] ... [zigzag(index_n)_varint] [proto_bytes...]
+//   [zigzag(count)_varint] [zigzag(index_0)_varint] ... [zigzag(index_n)_varint] [proto_bytes]
 //
-// All varints are unsigned LEB-128; each index value is ZigZag-encoded first.
+// Every integer — INCLUDING the leading element count — is ZigZag-encoded and
+// then written as an unsigned LEB-128 varint. This mirrors
+// `org.apache.kafka.common.utils.ByteUtils.writeVarint`, which the Confluent
+// Java serde (`io.confluent.kafka.schemaregistry.protobuf.MessageIndexes`)
+// uses for both the count and the path segments.
 //
-// For the most common case — a single top-level message at index 0:
-//   count = 1   → varint 0x01
-//   index = 0   → ZigZag(0) = 0  → varint 0x00
+// The serde defines exactly one special case: the array [0] — the first
+// top-level message in the .proto file — is written as a SINGLE 0x00 byte,
+// and a decoded count of 0 maps back to [0].
 //
-// For a second top-level message at index 1:
-//   count = 1   → varint 0x01
-//   index = 1   → ZigZag(1) = 2  → varint 0x02
-//
-// For a nested message path [0, 1]:
-//   count = 2   → varint 0x02
-//   index = 0   → ZigZag(0) = 0  → varint 0x00
-//   index = 1   → ZigZag(1) = 2  → varint 0x02
+//   path [0]      → 00              (mandated single-byte optimisation)
+//   path [1]      → 02 02           (ZigZag(1)=2 count, ZigZag(1)=2)
+//   path [2]      → 02 04           (ZigZag(1)=2 count, ZigZag(2)=4)
+//   path [0, 1]   → 04 00 02        (ZigZag(2)=4 count, ZigZag(0)=0, ZigZag(1)=2)
+//   path [-1]     → 02 01           (ZigZag(1)=2 count, ZigZag(-1)=1)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Golden bytes for schema_id = 7, message_index = [0], payload = b"proto"
+/// Golden bytes for schema_id = 7, message_index = [0], payload = b"proto".
 ///
 /// Header:        0x00 | 0x00 0x00 0x00 0x07
-/// Message-index: 0x01 0x00        (count=1, ZigZag(0)=0)
+/// Message-index: 0x00              (single-byte optimisation for [0])
 /// Payload:       b"proto"
 const CONFLUENT_PROTO_GOLDEN: &[u8] = &[
     0x00, 0x00, 0x00, 0x00, 0x07, // magic + schema_id = 7
-    0x01, 0x00, // message-index: count=1, index=0 (ZigZag)
+    0x00, // message-index: optimised encoding of [0]
     b'p', b'r', b'o', b't', b'o', // payload
 ];
 
@@ -152,7 +153,7 @@ fn confluent_protobuf_encoder_matches_golden() {
     assert_eq!(
         encoded.as_ref(),
         CONFLUENT_PROTO_GOLDEN,
-        "Confluent Protobuf encoder must produce the canonical byte sequence"
+        "Confluent Protobuf encoder must emit the single-0x00 optimisation for path [0]"
     );
 }
 
@@ -164,7 +165,7 @@ fn confluent_protobuf_decoder_matches_golden() {
 
     let (indexes, offset) = decode_protobuf_message_indexes(after_header)
         .expect("canonical message-index must decode cleanly");
-    assert_eq!(indexes, vec![0i32], "message-index must be [0]");
+    assert_eq!(indexes, vec![0i32], "count 0 must decode back to path [0]");
     assert_eq!(
         &after_header[offset..],
         b"proto",
@@ -172,12 +173,20 @@ fn confluent_protobuf_decoder_matches_golden() {
     );
 }
 
+/// An empty path is treated as the default path `[0]` and produces identical bytes.
+#[test]
+fn confluent_protobuf_empty_path_is_default_index() {
+    let encoded = encode_protobuf_wire_format(7u32, &[], b"proto");
+    assert_eq!(encoded.as_ref(), CONFLUENT_PROTO_GOLDEN);
+}
+
 /// Golden bytes for schema_id = 42, message_index = [1] (second top-level message).
 ///
-/// ZigZag(1) = 2  → varint 0x02
+/// count = 1 → ZigZag(1) = 2 → varint 0x02
+/// index = 1 → ZigZag(1) = 2 → varint 0x02
 const CONFLUENT_PROTO_IDX1_GOLDEN: &[u8] = &[
     0x00, 0x00, 0x00, 0x00, 0x2A, // magic + schema_id = 42
-    0x01, 0x02, // message-index: count=1, ZigZag(1)=2
+    0x02, 0x02, // message-index: ZigZag(count=1)=2, ZigZag(1)=2
     b'd', b'a', b't', b'a', // payload
 ];
 
@@ -193,14 +202,33 @@ fn confluent_protobuf_index_1_golden() {
     assert_eq!(&after_header[offset..], b"data");
 }
 
+/// Golden bytes for message_index = [2], documented in the Confluent community
+/// write-ups as decimal `[1, 2]` → hex `02 04`.
+const CONFLUENT_PROTO_IDX2_GOLDEN: &[u8] = &[
+    0x00, 0x00, 0x00, 0x00, 0x01, // magic + schema_id = 1
+    0x02, 0x04, // ZigZag(count=1)=2, ZigZag(2)=4
+    b'y',
+];
+
+#[test]
+fn confluent_protobuf_index_2_golden() {
+    let encoded = encode_protobuf_wire_format(1u32, &[2], b"y");
+    assert_eq!(encoded.as_ref(), CONFLUENT_PROTO_IDX2_GOLDEN);
+
+    let (_, after_header) = decode_wire_format(CONFLUENT_PROTO_IDX2_GOLDEN).unwrap();
+    let (indexes, offset) = decode_protobuf_message_indexes(after_header).unwrap();
+    assert_eq!(indexes, vec![2i32]);
+    assert_eq!(&after_header[offset..], b"y");
+}
+
 /// Golden bytes for schema_id = 100, nested message path [0, 1].
 ///
-/// count=2 → varint 0x02
+/// count = 2 → ZigZag(2) = 4 → varint 0x04
 /// ZigZag(0) = 0 → varint 0x00
 /// ZigZag(1) = 2 → varint 0x02
 const CONFLUENT_PROTO_NESTED_GOLDEN: &[u8] = &[
     0x00, 0x00, 0x00, 0x00, 0x64, // magic + schema_id = 100
-    0x02, 0x00, 0x02, // message-index: count=2, ZigZag([0,1])=[0,2]
+    0x04, 0x00, 0x02, // ZigZag(count=2)=4, ZigZag([0,1])=[0,2]
     b'n', b'e', b's', b't', // payload
 ];
 
@@ -216,12 +244,33 @@ fn confluent_protobuf_nested_path_golden() {
     assert_eq!(&after_header[offset..], b"nest");
 }
 
+/// Golden bytes for the three-deep path [2, 0, 1].
+///
+/// count = 3 → ZigZag(3) = 6 → varint 0x06
+/// ZigZag(2) = 4, ZigZag(0) = 0, ZigZag(1) = 2
+const CONFLUENT_PROTO_DEEP_GOLDEN: &[u8] = &[
+    0x00, 0x00, 0x00, 0x00, 0x01, // magic + schema_id = 1
+    0x06, 0x04, 0x00, 0x02, // ZigZag(count=3)=6, then ZigZag([2,0,1])
+    b'd',
+];
+
+#[test]
+fn confluent_protobuf_three_deep_path_golden() {
+    let encoded = encode_protobuf_wire_format(1u32, &[2, 0, 1], b"d");
+    assert_eq!(encoded.as_ref(), CONFLUENT_PROTO_DEEP_GOLDEN);
+
+    let (_, after_header) = decode_wire_format(CONFLUENT_PROTO_DEEP_GOLDEN).unwrap();
+    let (indexes, offset) = decode_protobuf_message_indexes(after_header).unwrap();
+    assert_eq!(indexes, vec![2i32, 0i32, 1i32]);
+    assert_eq!(&after_header[offset..], b"d");
+}
+
 /// ZigZag encoding spec: for small negative values the encoding stays compact.
 ///
 /// ZigZag(-1) = 1, ZigZag(-2) = 3, ZigZag(-3) = 5
 const CONFLUENT_PROTO_NEG_INDEX_GOLDEN: &[u8] = &[
     0x00, 0x00, 0x00, 0x00, 0x01, // magic + schema_id = 1
-    0x01, 0x01, // message-index: count=1, ZigZag(-1)=1
+    0x02, 0x01, // ZigZag(count=1)=2, ZigZag(-1)=1
     b'x',
 ];
 
@@ -234,6 +283,17 @@ fn confluent_protobuf_negative_index_zigzag_golden() {
     let (_, after_header) = decode_wire_format(CONFLUENT_PROTO_NEG_INDEX_GOLDEN).unwrap();
     let (indexes, _) = decode_protobuf_message_indexes(after_header).unwrap();
     assert_eq!(indexes, vec![-1i32]);
+}
+
+/// A plain (non-ZigZag) count — what a non-conforming encoder emits for
+/// count = 1 — must be rejected rather than silently mis-parsed.
+///
+/// 0x01 ZigZag-decodes to -1, which is not a valid element count.
+#[test]
+fn confluent_protobuf_rejects_non_zigzag_count() {
+    let err = decode_protobuf_message_indexes(&[0x01, 0x00, b'p'])
+        .expect_err("a plain unsigned count must not be accepted");
+    assert!(err.to_string().contains("negative"), "{err}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

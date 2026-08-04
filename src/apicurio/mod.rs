@@ -27,9 +27,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SchemaRegError};
 use crate::http::{
-    HttpClient, HttpClientConfig, normalize_url, percent_encode, reject_embedded_credentials,
-    validate_subject,
+    HttpClient, HttpClientConfig, is_loopback_host, normalize_url, percent_encode,
+    reject_embedded_credentials, validate_subject,
 };
+use crate::retry::RetryPolicy;
 use crate::traits::SchemaRegistryClient;
 use crate::types::{
     ArtifactId, CompatibilityLevel, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion,
@@ -38,6 +39,12 @@ use crate::types::{
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GROUP: &str = "default";
 const API_PREFIX: &str = "/apis/registry/v3";
+
+/// Page size used when walking Apicurio's paginated search / version endpoints.
+///
+/// Apicurio caps `limit` server-side; 500 is comfortably within every 3.x
+/// default and keeps the number of round-trips low for large registries.
+const PAGE_SIZE: usize = 500;
 
 // Response header names (lowercase) that Apicurio v3 sets on content endpoints.
 const HDR_ARTIFACT_TYPE: &str = "x-registry-artifacttype";
@@ -114,6 +121,9 @@ struct CreateArtifactVersionInfo {
 #[serde(rename_all = "camelCase")]
 struct ArtifactVersionList {
     versions: Vec<ArtifactVersionSummary>,
+    /// Total number of versions matching the query, across all pages.
+    #[serde(default)]
+    count: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +136,9 @@ struct ArtifactVersionSummary {
 #[serde(rename_all = "camelCase")]
 struct ArtifactSearchResults {
     artifacts: Vec<SearchedArtifact>,
+    /// Total number of artifacts matching the query, across all pages.
+    #[serde(default)]
+    count: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -224,6 +237,33 @@ impl ApicurioSchemaRegistry {
 
     fn api_url(&self, path: &str) -> String {
         format!("{}{}{}", self.base_url, API_PREFIX, path)
+    }
+
+    /// Parse a subject string into an [`ArtifactId`] after validating it.
+    ///
+    /// Apicurio's two-dimensional address space means a subject is split into
+    /// `{group}/{artifact}` **before** percent-encoding, so a subject such as
+    /// `../secrets` would produce the path `/groups/../artifacts/secrets` — the
+    /// `..` survives encoding (dots are deliberately preserved for names like
+    /// `com.example.Order`) and can be collapsed by a proxy. Both components are
+    /// therefore validated here, and every operation that builds an artifact
+    /// path must go through this constructor rather than
+    /// [`ArtifactId::from_subject`] directly.
+    fn artifact_id(subject: &str) -> Result<ArtifactId> {
+        validate_subject(subject)?;
+        let id = ArtifactId::from_subject(subject);
+        if id.group.is_empty() || id.artifact.is_empty() {
+            return Err(SchemaRegError::config(
+                "Apicurio subject must be '{group}/{artifact}' or '{artifact}' with \
+                 non-empty components",
+            ));
+        }
+        // Guard against a nested separator smuggling extra path segments, e.g.
+        // "g/a/../../admin" — the artifact component keeps everything after the
+        // first '/', so re-validate it on its own.
+        validate_subject(&id.group)?;
+        validate_subject(&id.artifact)?;
+        Ok(id)
     }
 
     fn auth_header(&self) -> Option<zeroize::Zeroizing<String>> {
@@ -482,7 +522,7 @@ impl ApicurioSchemaRegistry {
     ///
     /// Subject is parsed as `"{group}/{artifact}"` or `"{artifact}"` (default group).
     pub async fn get_latest_schema_impl(&self, subject: &str) -> Result<Arc<Schema>> {
-        let artifact_id = ArtifactId::from_subject(subject);
+        let artifact_id = Self::artifact_id(subject)?;
         let url = self.api_url(&format!(
             "/groups/{}/artifacts/{}/versions/branch=latest/content?returnArtifactType=true",
             percent_encode(&artifact_id.group),
@@ -498,7 +538,7 @@ impl ApicurioSchemaRegistry {
         subject: &str,
         version: SchemaVersion,
     ) -> Result<Arc<Schema>> {
-        let artifact_id = ArtifactId::from_subject(subject);
+        let artifact_id = Self::artifact_id(subject)?;
         let version_str = version.as_i32().to_string();
         let url = self.api_url(&format!(
             "/groups/{}/artifacts/{}/versions/{}/content?returnArtifactType=true",
@@ -521,7 +561,7 @@ impl ApicurioSchemaRegistry {
         schema_type: SchemaType,
         references: &[SchemaReference],
     ) -> Result<SchemaId> {
-        let artifact_id = ArtifactId::from_subject(subject);
+        let artifact_id = Self::artifact_id(subject)?;
         let url = self.api_url(&format!(
             "/groups/{}/artifacts?ifExists=FIND_OR_CREATE_VERSION",
             percent_encode(&artifact_id.group),
@@ -560,7 +600,7 @@ impl ApicurioSchemaRegistry {
         schema_type: SchemaType,
         references: &[SchemaReference],
     ) -> Result<bool> {
-        let artifact_id = ArtifactId::from_subject(subject);
+        let artifact_id = Self::artifact_id(subject)?;
         let url = self.api_url(&format!(
             "/groups/{}/artifacts/{}/versions/branch=latest/compatibility",
             percent_encode(&artifact_id.group),
@@ -584,7 +624,7 @@ impl ApicurioSchemaRegistry {
 
     /// Delete the artifact (all its versions) identified by `subject`.
     pub async fn delete_artifact(&self, subject: &str) -> Result<()> {
-        let artifact_id = ArtifactId::from_subject(subject);
+        let artifact_id = Self::artifact_id(subject)?;
         let url = self.api_url(&format!(
             "/groups/{}/artifacts/{}",
             percent_encode(&artifact_id.group),
@@ -593,35 +633,93 @@ impl ApicurioSchemaRegistry {
         self.delete_no_content(&url).await
     }
 
-    /// List all subjects (formatted as `"{groupId}/{artifactId}"`).
-    pub async fn list_subjects(&self, limit: usize) -> Result<Vec<String>> {
-        let url = self.api_url(&format!("/search/artifacts?limit={limit}"));
-        let results: ArtifactSearchResults = self.get_json(&url).await?;
-        Ok(results
-            .artifacts
-            .into_iter()
-            .map(|a| {
+    /// List all subjects, formatted as `"{groupId}/{artifactId}"`.
+    ///
+    /// Apicurio's search endpoint is paginated. This method follows pages of
+    /// 500-artifact pages until the server reports no more results, or `max_results`
+    /// entries have been collected, so it does **not** silently truncate at the
+    /// first page the way a single bounded request would.
+    ///
+    /// `max_results` caps the total collected — pass [`usize::MAX`] to walk the
+    /// whole registry. When the cap truncates the listing, a `WARN` is emitted
+    /// naming the total the server reported.
+    pub async fn list_subjects(&self, max_results: usize) -> Result<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        let mut offset = 0usize;
+        let mut reported_total: Option<i64> = None;
+
+        while out.len() < max_results {
+            let limit = PAGE_SIZE.min(max_results - out.len());
+            let url = self.api_url(&format!("/search/artifacts?limit={limit}&offset={offset}"));
+            let page: ArtifactSearchResults = self.get_json(&url).await?;
+            reported_total = page.count.or(reported_total);
+
+            let returned = page.artifacts.len();
+            if returned == 0 {
+                break;
+            }
+            out.extend(page.artifacts.into_iter().map(|a| {
                 let group = a.group_id.unwrap_or_else(|| DEFAULT_GROUP.to_string());
                 format!("{group}/{}", a.artifact_id)
-            })
-            .collect())
+            }));
+            offset += returned;
+
+            // A short page means the server has nothing left to give.
+            if returned < limit {
+                break;
+            }
+        }
+
+        if let Some(total) = reported_total
+            && total > out.len() as i64
+        {
+            tracing::warn!(
+                returned = out.len(),
+                total,
+                "list_subjects truncated by max_results — the registry reports more artifacts"
+            );
+        }
+        Ok(out)
     }
 
     /// List all versions of the artifact identified by `subject`.
+    ///
+    /// Paginated in the same way as [`list_subjects`](Self::list_subjects):
+    /// 500-version pages are followed until the artifact's version history
+    /// is exhausted, so long-lived subjects are not truncated at 500 versions.
     pub async fn list_versions(&self, subject: &str) -> Result<Vec<SchemaVersion>> {
-        let artifact_id = ArtifactId::from_subject(subject);
-        let url = self.api_url(&format!(
-            "/groups/{}/artifacts/{}/versions?limit=500",
-            percent_encode(&artifact_id.group),
-            percent_encode(&artifact_id.artifact),
-        ));
-        let list: ArtifactVersionList = self.get_json(&url).await?;
-        let mut versions = Vec::with_capacity(list.versions.len());
-        for v in list.versions {
-            if let Some(ver_val) = v.version
-                && let Some(sv) = Self::parse_version(&ver_val)
+        let artifact_id = Self::artifact_id(subject)?;
+        let group = percent_encode(&artifact_id.group);
+        let artifact = percent_encode(&artifact_id.artifact);
+
+        let mut versions: Vec<SchemaVersion> = Vec::new();
+        let mut offset = 0usize;
+
+        loop {
+            let url = self.api_url(&format!(
+                "/groups/{group}/artifacts/{artifact}/versions?limit={PAGE_SIZE}&offset={offset}"
+            ));
+            let page: ArtifactVersionList = self.get_json(&url).await?;
+            let returned = page.versions.len();
+            if returned == 0 {
+                break;
+            }
+            for v in page.versions {
+                if let Some(ver_val) = v.version
+                    && let Some(sv) = Self::parse_version(&ver_val)
+                {
+                    versions.push(sv);
+                }
+            }
+            offset += returned;
+
+            if returned < PAGE_SIZE {
+                break;
+            }
+            if let Some(total) = page.count
+                && offset as i64 >= total
             {
-                versions.push(sv);
+                break;
             }
         }
         Ok(versions)
@@ -698,7 +796,8 @@ impl SchemaRegistryClient for ApicurioSchemaRegistry {
     }
 
     fn get_subjects(&self) -> impl std::future::Future<Output = Result<Vec<String>>> + Send + '_ {
-        self.list_subjects(500)
+        // Walk every page — the trait contract is "all subjects", not "the first page".
+        self.list_subjects(usize::MAX)
     }
 
     fn get_versions<'a>(
@@ -722,8 +821,7 @@ impl SchemaRegistryClient for ApicurioSchemaRegistry {
                 "set_compatibility requires a non-empty subject name",
             ));
         }
-        validate_subject(subject)?;
-        let artifact_id = ArtifactId::from_subject(subject);
+        let artifact_id = Self::artifact_id(subject)?;
         let url = self.api_url(&format!(
             "/groups/{}/artifacts/{}/rules/COMPATIBILITY",
             percent_encode(&artifact_id.group),
@@ -748,8 +846,7 @@ impl SchemaRegistryClient for ApicurioSchemaRegistry {
                 "get_compatibility requires a non-empty subject name",
             ));
         }
-        validate_subject(subject)?;
-        let artifact_id = ArtifactId::from_subject(subject);
+        let artifact_id = Self::artifact_id(subject)?;
         let url = self.api_url(&format!(
             "/groups/{}/artifacts/{}/rules/COMPATIBILITY",
             percent_encode(&artifact_id.group),
@@ -784,6 +881,10 @@ pub struct ApicurioSchemaRegistryBuilder {
     identity: Option<reqwest::Identity>,
     /// Maximum idle connections per host kept in the connection pool.
     pool_max_idle_per_host: Option<usize>,
+    /// Retry behaviour for transient failures.
+    retry_policy: RetryPolicy,
+    /// Hard ceiling on concurrent in-flight requests.
+    max_concurrent_requests: Option<usize>,
 }
 
 impl Default for ApicurioSchemaRegistryBuilder {
@@ -796,6 +897,8 @@ impl Default for ApicurioSchemaRegistryBuilder {
             root_certificates: Vec::new(),
             identity: None,
             pool_max_idle_per_host: None,
+            retry_policy: RetryPolicy::default(),
+            max_concurrent_requests: None,
         }
     }
 }
@@ -882,6 +985,35 @@ impl ApicurioSchemaRegistryBuilder {
         self
     }
 
+    /// Override the retry policy for transient failures.
+    ///
+    /// The default retries 3 times with jittered exponential back-off and
+    /// honours `Retry-After`. Pass [`RetryPolicy::none()`] when the calling
+    /// layer already implements retry, so the two do not multiply.
+    ///
+    /// ```rust,no_run
+    /// # use std::time::Duration;
+    /// # use schemreg::RetryPolicy;
+    /// let policy = RetryPolicy::new()
+    ///     .max_retries(5)
+    ///     .base_backoff(Duration::from_millis(50));
+    /// ```
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+
+    /// Cap the number of requests this client may have in flight at once.
+    ///
+    /// Coalescing already collapses concurrent misses for the *same* schema ID
+    /// to one request. This bounds the other case: a cold start that fans out to
+    /// thousands of *distinct* IDs, where each miss opens its own socket. Excess
+    /// callers wait for a permit rather than for a file descriptor.
+    pub fn max_concurrent_requests(mut self, max: usize) -> Self {
+        self.max_concurrent_requests = Some(max);
+        self
+    }
+
     /// Set the maximum number of idle connections kept per host in the pool.
     ///
     /// Set to `0` to disable connection reuse entirely. The default (unset)
@@ -898,11 +1030,20 @@ impl ApicurioSchemaRegistryBuilder {
         })?;
         let url = normalize_url(raw_url);
         reject_embedded_credentials(&url)?;
+        // Match the Confluent client: cleartext credentials are a hard error
+        // off-loopback, a warning on it.
         if url.starts_with("http://") && !matches!(&self.auth, ApicurioAuth::None) {
+            if !is_loopback_host(&url) {
+                return Err(SchemaRegError::config(
+                    "Apicurio Registry auth requires HTTPS — credentials would be sent in \
+                     cleartext over HTTP. (Plain HTTP with credentials is permitted only \
+                     for loopback hosts such as http://localhost:8080.)",
+                ));
+            }
             tracing::warn!(
                 url = %url,
-                "Apicurio Registry URL uses plain HTTP with authentication — credentials will \
-                 be sent in cleartext; use HTTPS in production"
+                "sending credentials over cleartext HTTP to a loopback address — \
+                 acceptable for local development, never for a deployed registry"
             );
         }
         let client = HttpClient::with_config(HttpClientConfig {
@@ -911,6 +1052,8 @@ impl ApicurioSchemaRegistryBuilder {
             root_certificates: self.root_certificates,
             identity: self.identity,
             pool_max_idle_per_host: self.pool_max_idle_per_host,
+            retry_policy: self.retry_policy,
+            max_concurrent_requests: self.max_concurrent_requests,
         })?;
         Ok(ApicurioSchemaRegistry {
             client,
@@ -931,7 +1074,27 @@ fn schema_content_type(schema_type: SchemaType) -> &'static str {
     }
 }
 
+impl fmt::Debug for ApicurioSchemaRegistryBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let auth_desc = match &self.auth {
+            ApicurioAuth::None => "none",
+            ApicurioAuth::Basic { .. } => "basic(***)",
+            ApicurioAuth::Bearer { .. } => "bearer(***)",
+        };
+        f.debug_struct("ApicurioSchemaRegistryBuilder")
+            .field("url", &self.url)
+            .field("auth", &auth_desc)
+            .field("request_timeout", &self.request_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("root_certificates", &self.root_certificates.len())
+            .field("identity", &self.identity.is_some())
+            .field("pool_max_idle_per_host", &self.pool_max_idle_per_host)
+            .finish()
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

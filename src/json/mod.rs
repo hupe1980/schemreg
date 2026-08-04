@@ -17,7 +17,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.3", features = ["json"] }
+//! schemreg = { version = "0.4", features = ["json"] }
 //! ```
 //!
 //! # Layered model
@@ -62,26 +62,25 @@
 //! assert_eq!(decoded, json!({"id": 1, "name": "Widget"}));
 //! ```
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use jsonschema::Validator;
-use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::sync::oneshot;
 
+use crate::cache_inner::InMemoryCache;
+use crate::codec_cache::{DEFAULT_MAX_SUBJECT_CACHE_ENTRIES, subject_resolution_cancelled};
 use crate::error::{Result, SchemaRegError};
 use crate::subject::SubjectNameStrategy;
 use crate::traits::SchemaRegistryClient;
 use crate::types::{EncodeTarget, SchemaId, SchemaReference, SchemaType};
 use crate::wire::{decode_wire_format_bytes, encode_wire_format};
 
-// ── Type aliases ──────────────────────────────────────────────────────────
-
-type InFlightMap = Mutex<HashMap<String, Vec<oneshot::Sender<Result<Arc<EncoderEntry>>>>>>;
+/// Default bound on the number of compiled JSON Schema validators a
+/// [`JsonSchemaDecoder`] keeps in memory.
+pub const DEFAULT_MAX_JSON_VALIDATOR_CACHE_ENTRIES: usize = 1000;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -130,8 +129,9 @@ struct EncoderEntry {
 ///
 /// On the first call for a given subject the encoder registers the JSON Schema
 /// with the registry, caches the assigned schema ID, and caches the compiled
-/// [`jsonschema::Validator`].  Subsequent encodes hit only an in-memory
-/// [`RwLock`]-guarded hash-map read — no registry call, no re-compilation.
+/// [`jsonschema::Validator`].  Subsequent encodes hit only a bounded in-memory
+/// cache — no registry call, no re-compilation. Concurrent first-encodes for
+/// one subject coalesce behind a single registration.
 ///
 /// When built with `validate_on_encode(true)` (the default), every value is
 /// validated against the JSON Schema before serialisation.  Disable with
@@ -155,10 +155,8 @@ pub struct JsonSchemaEncoder<C> {
     strategy: SubjectNameStrategy,
     references: Vec<SchemaReference>,
     validate_on_encode: bool,
-    /// `subject → (schema_id, compiled validator)` — populated lazily.
-    cache: RwLock<HashMap<String, Arc<EncoderEntry>>>,
-    /// In-flight coalescing: subjects currently being registered.
-    in_flight: InFlightMap,
+    /// Bounded, coalescing `subject → (schema_id, compiled validator)` cache.
+    cache: InMemoryCache<String, EncoderEntry>,
 }
 
 impl<C: std::fmt::Debug> std::fmt::Debug for JsonSchemaEncoder<C> {
@@ -184,111 +182,42 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoder<C> {
     /// Useful for observability without triggering a registration.
     #[must_use]
     pub fn cached_schema_id(&self, subject: &str) -> Option<SchemaId> {
-        self.cache.read().get(subject).map(|e| e.schema_id)
+        self.cache.get(&subject.to_string()).map(|e| e.schema_id)
+    }
+
+    /// Number of `subject → schema ID` mappings currently cached.
+    pub fn cached_subject_count(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Forget the cached schema ID for `subject`.
+    pub fn invalidate_subject(&self, subject: &str) {
+        self.cache.invalidate(&subject.to_string());
     }
 
     /// Resolve subject → cached entry, registering the schema if needed.
     ///
     /// Concurrent callers for the same subject coalesce behind a single leader
     /// registration, preventing duplicate schema-register RPCs under high
-    /// concurrency.
+    /// concurrency. Cancellation of the leader wakes every waiter with an error.
     async fn resolve_subject(&self, subject: &str) -> Result<Arc<EncoderEntry>> {
-        // Fast path: read lock only.
-        if let Some(entry) = self.cache.read().get(subject) {
-            return Ok(Arc::clone(entry));
-        }
-
-        // Slow path: coalescing lock.
-        let waiter_rx = {
-            let mut in_flight = self.in_flight.lock();
-            // Double-check after acquiring the lock.
-            if let Some(entry) = self.cache.read().get(subject) {
-                return Ok(Arc::clone(entry));
-            }
-            if let Some(waiters) = in_flight.get_mut(subject) {
-                let (tx, rx) = oneshot::channel();
-                waiters.push(tx);
-                Some(rx)
-            } else {
-                in_flight.insert(subject.to_string(), Vec::new());
-                None
-            }
-        };
-
-        if let Some(rx) = waiter_rx {
-            return rx.await.map_err(|_| {
-                SchemaRegError::invalid_state(
-                    "JSON schema entry resolution cancelled by the leader",
-                )
-            })?;
-        }
-
-        // We are the leader. Use a drop-guard to cancel waiters on panic/cancellation.
-        struct ResolveGuard<'a> {
-            in_flight: &'a InFlightMap,
-            subject: String,
-            done: bool,
-        }
-        impl Drop for ResolveGuard<'_> {
-            fn drop(&mut self) {
-                if !self.done {
-                    let waiters = self
-                        .in_flight
-                        .lock()
-                        .remove(&self.subject)
-                        .unwrap_or_default();
-                    for tx in waiters {
-                        let _ = tx.send(Err(SchemaRegError::invalid_state(
-                            "JSON schema entry resolution cancelled",
-                        )));
-                    }
-                }
-            }
-        }
-
-        let mut guard = ResolveGuard {
-            in_flight: &self.in_flight,
-            subject: subject.to_string(),
-            done: false,
-        };
-
-        let result = self
-            .registry
-            .register_schema(
-                subject,
-                &self.schema_str,
-                SchemaType::Json,
-                &self.references,
-            )
-            .await
-            .map(|schema_id| {
-                Arc::new(EncoderEntry {
+        self.cache
+            .get_or_fetch(subject.to_string(), || async {
+                let schema_id = self
+                    .registry
+                    .register_schema(
+                        subject,
+                        &self.schema_str,
+                        SchemaType::Json,
+                        &self.references,
+                    )
+                    .await?;
+                Ok(Arc::new(EncoderEntry {
                     schema_id,
                     validator: Arc::clone(&self.validator),
-                })
-            });
-
-        let waiters = self.in_flight.lock().remove(subject).unwrap_or_default();
-
-        match &result {
-            Ok(entry) => {
-                self.cache
-                    .write()
-                    .insert(subject.to_string(), Arc::clone(entry));
-                for tx in waiters {
-                    let _ = tx.send(Ok(Arc::clone(entry)));
-                }
-            }
-            Err(e) => {
-                let cloned = e.clone();
-                for tx in waiters {
-                    let _ = tx.send(Err(cloned.clone()));
-                }
-            }
-        }
-
-        guard.done = true;
-        result
+                }))
+            })
+            .await
     }
 
     /// Serialise `value` to Confluent-framed JSON bytes.
@@ -349,6 +278,7 @@ pub struct JsonSchemaEncoderBuilder<C> {
     strategy: SubjectNameStrategy,
     references: Vec<SchemaReference>,
     validate_on_encode: bool,
+    max_subject_cache_entries: usize,
 }
 
 impl<C: SchemaRegistryClient> JsonSchemaEncoderBuilder<C> {
@@ -360,7 +290,15 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoderBuilder<C> {
             strategy: SubjectNameStrategy::TopicName,
             references: Vec::new(),
             validate_on_encode: true,
+            max_subject_cache_entries: DEFAULT_MAX_SUBJECT_CACHE_ENTRIES,
         }
+    }
+
+    /// Bound the `subject → schema ID` cache (default:
+    /// [`DEFAULT_MAX_SUBJECT_CACHE_ENTRIES`]). Values below 1 are clamped to 1.
+    pub fn max_subject_cache_entries(mut self, max_entries: usize) -> Self {
+        self.max_subject_cache_entries = max_entries;
+        self
     }
 
     /// Set the schema registry client (required).
@@ -434,8 +372,10 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoderBuilder<C> {
             strategy: self.strategy,
             references: self.references,
             validate_on_encode: self.validate_on_encode,
-            cache: RwLock::new(HashMap::new()),
-            in_flight: Mutex::new(HashMap::new()),
+            cache: InMemoryCache::new(
+                Some(self.max_subject_cache_entries.max(1)),
+                subject_resolution_cancelled,
+            ),
         })
     }
 }
@@ -468,7 +408,22 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoderBuilder<C> {
 pub struct JsonSchemaDecoder<C> {
     registry: C,
     validate_on_decode: bool,
-    schema_cache: RwLock<HashMap<SchemaId, Arc<Validator>>>,
+    schema_cache: InMemoryCache<SchemaId, Validator>,
+}
+
+impl<C> std::fmt::Debug for JsonSchemaDecoder<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonSchemaDecoder")
+            .field("validate_on_decode", &self.validate_on_decode)
+            .field("cached_validators", &self.schema_cache.len())
+            .finish_non_exhaustive()
+    }
+}
+
+fn json_validator_lookup_cancelled(id: &SchemaId) -> SchemaRegError {
+    SchemaRegError::invalid_state(format!(
+        "JSON Schema validator lookup cancelled before completion for schema id {id}"
+    ))
 }
 
 impl<C: SchemaRegistryClient> JsonSchemaDecoder<C> {
@@ -477,34 +432,58 @@ impl<C: SchemaRegistryClient> JsonSchemaDecoder<C> {
     /// Validation on decode is **disabled** by default. Use [`with_validation`]
     /// to enable it.
     ///
+    /// The compiled-validator cache is bounded to
+    /// [`DEFAULT_MAX_JSON_VALIDATOR_CACHE_ENTRIES`] entries and coalesces
+    /// concurrent cold misses so a burst of consumers never compiles the same
+    /// schema more than once.
+    ///
     /// [`with_validation`]: Self::with_validation
     pub fn new(registry: C) -> Self {
-        Self {
-            registry,
-            validate_on_decode: false,
-            schema_cache: RwLock::new(HashMap::new()),
-        }
+        Self::build(registry, false, DEFAULT_MAX_JSON_VALIDATOR_CACHE_ENTRIES)
     }
 
     /// Create a new `JsonSchemaDecoder` with validation on decode enabled.
     pub fn with_validation(registry: C) -> Self {
+        Self::build(registry, true, DEFAULT_MAX_JSON_VALIDATOR_CACHE_ENTRIES)
+    }
+
+    /// Set the maximum number of compiled validators held in memory.
+    ///
+    /// The oldest entry is evicted once the bound is reached. Values below 1 are
+    /// clamped to 1. Only meaningful when validation on decode is enabled — with
+    /// validation off, no validator is ever compiled or cached.
+    pub fn with_max_cache_entries(self, max_entries: usize) -> Self {
+        Self::build(self.registry, self.validate_on_decode, max_entries)
+    }
+
+    fn build(registry: C, validate_on_decode: bool, max_entries: usize) -> Self {
         Self {
             registry,
-            validate_on_decode: true,
-            schema_cache: RwLock::new(HashMap::new()),
+            validate_on_decode,
+            schema_cache: InMemoryCache::new(
+                Some(max_entries.max(1)),
+                json_validator_lookup_cancelled,
+            ),
         }
     }
 
+    /// Number of compiled validators currently cached.
+    pub fn cache_len(&self) -> usize {
+        self.schema_cache.len()
+    }
+
+    /// Drop every cached compiled validator.
+    pub fn clear_cache(&self) {
+        self.schema_cache.clear();
+    }
+
     async fn get_validator(&self, id: SchemaId) -> Result<Arc<Validator>> {
-        // Fast path: already cached.
-        if let Some(v) = self.schema_cache.read().get(&id) {
-            return Ok(Arc::clone(v));
-        }
-        // Slow path: fetch from registry, compile, insert.
-        let registry_schema = self.registry.get_schema_by_id(id).await?;
-        let validator = Arc::new(compile_schema(&registry_schema.schema)?);
-        self.schema_cache.write().insert(id, Arc::clone(&validator));
-        Ok(validator)
+        self.schema_cache
+            .get_or_fetch(id, || async move {
+                let registry_schema = self.registry.get_schema_by_id(id).await?;
+                compile_schema(&registry_schema.schema).map(Arc::new)
+            })
+            .await
     }
 
     /// Decode a Confluent-framed JSON message to a [`serde_json::Value`].
@@ -547,6 +526,19 @@ impl<C: SchemaRegistryClient> JsonSchemaDecoder<C> {
                 "failed to deserialise JSON value into target type: {e}"
             ))
         })
+    }
+}
+
+impl<C> std::fmt::Debug for JsonSchemaEncoderBuilder<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonSchemaEncoderBuilder")
+            .field("registry", &self.registry.is_some())
+            .field("schema_set", &self.schema.is_some())
+            .field("record_name", &self.record_name)
+            .field("strategy", &self.strategy)
+            .field("references", &self.references.len())
+            .field("validate_on_encode", &self.validate_on_encode)
+            .finish()
     }
 }
 

@@ -384,29 +384,72 @@ impl<T: SchemaRegistryClient + ?Sized> SchemaRegistryClient for Arc<T> {
 /// used as `dyn SchemaRegistryClient`. This trait provides the same interface
 /// with `Pin<Box<dyn Future>>` return types for trait-object usage:
 ///
-/// ```rust,ignore
+/// ```rust
 /// use std::sync::Arc;
 /// use schemreg::DynSchemaRegistryClient;
 ///
-/// fn use_registry(client: Arc<dyn DynSchemaRegistryClient>) { ... }
+/// struct AppState {
+///     registry: Arc<dyn DynSchemaRegistryClient>,
+/// }
 /// ```
 ///
 /// A blanket implementation is provided for every type that implements
-/// [`SchemaRegistryClient`], so no extra `impl` is needed.
+/// [`SchemaRegistryClient`], so no extra `impl` is needed — any concrete client
+/// coerces straight to `Arc<dyn DynSchemaRegistryClient>`.
+///
+/// The two traits compose in both directions: `dyn DynSchemaRegistryClient`
+/// also implements [`SchemaRegistryClient`], so a type-erased client can be
+/// handed back to generic code — including
+/// [`CachedSchemaRegistry`](crate::CachedSchemaRegistry):
+///
+/// ```rust
+/// use std::sync::Arc;
+/// use schemreg::{CachedSchemaRegistry, DynSchemaRegistryClient};
+/// # use schemreg::{Result, Schema, SchemaId, SchemaReference, SchemaRegistryClient, SchemaType, SchemaVersion};
+/// # struct MyRegistry;
+/// # impl SchemaRegistryClient for MyRegistry {
+/// #     async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> { unimplemented!() }
+/// #     async fn get_latest_schema(&self, _: &str) -> Result<Arc<Schema>> { unimplemented!() }
+/// #     async fn get_schema_by_version(&self, _: &str, _: SchemaVersion) -> Result<Arc<Schema>> { unimplemented!() }
+/// #     async fn register_schema(&self, _: &str, _: &str, _: SchemaType, _: &[SchemaReference]) -> Result<SchemaId> { unimplemented!() }
+/// # }
+/// let erased: Arc<dyn DynSchemaRegistryClient> = Arc::new(MyRegistry);
+/// let cached = CachedSchemaRegistry::new(erased);
+/// ```
+///
+/// # Method-resolution ambiguity
+///
+/// Both traits expose identically named methods, and most concrete types
+/// implement both. With **both traits imported into the same scope**,
+/// `client.get_schema_by_id(id)` is ambiguous and the compiler will say so.
+/// Either import only the one you need, or disambiguate explicitly:
+///
+/// ```rust,ignore
+/// SchemaRegistryClient::get_schema_by_id(&client, id).await
+/// DynSchemaRegistryClient::get_schema_by_id(&client, id).await
+/// ```
 pub trait DynSchemaRegistryClient: Send + Sync {
+    /// Retrieve a schema by its globally unique ID. See
+    /// [`SchemaRegistryClient::get_schema_by_id`].
     fn get_schema_by_id<'a>(
         &'a self,
         id: SchemaId,
     ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>>;
+    /// Retrieve the latest schema under a subject. See
+    /// [`SchemaRegistryClient::get_latest_schema`].
     fn get_latest_schema<'a>(
         &'a self,
         subject: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>>;
+    /// Retrieve a specific version under a subject. See
+    /// [`SchemaRegistryClient::get_schema_by_version`].
     fn get_schema_by_version<'a>(
         &'a self,
         subject: &'a str,
         version: SchemaVersion,
     ) -> Pin<Box<dyn Future<Output = Result<Arc<Schema>>> + Send + 'a>>;
+    /// Register a schema under a subject. See
+    /// [`SchemaRegistryClient::register_schema`].
     fn register_schema<'a>(
         &'a self,
         subject: &'a str,
@@ -414,6 +457,8 @@ pub trait DynSchemaRegistryClient: Send + Sync {
         schema_type: SchemaType,
         references: &'a [SchemaReference],
     ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + 'a>>;
+    /// Test schema compatibility. See
+    /// [`SchemaRegistryClient::check_compatibility`].
     fn check_compatibility<'a>(
         &'a self,
         subject: &'a str,
@@ -421,29 +466,42 @@ pub trait DynSchemaRegistryClient: Send + Sync {
         schema_type: SchemaType,
         references: &'a [SchemaReference],
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
+    /// Test compatibility with no references. See
+    /// [`SchemaRegistryClient::check_compatible`].
     fn check_compatible<'a>(
         &'a self,
         subject: &'a str,
         schema: &'a str,
         schema_type: SchemaType,
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
+    /// Delete a subject and all its versions. See
+    /// [`SchemaRegistryClient::delete_subject`].
     fn delete_subject<'a>(
         &'a self,
         subject: &'a str,
         permanent: bool,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a>>;
+    /// List all subjects. See [`SchemaRegistryClient::get_subjects`].
     fn get_subjects<'a>(&'a self)
     -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + 'a>>;
+    /// List all versions under a subject. See
+    /// [`SchemaRegistryClient::get_versions`].
     fn get_versions<'a>(
         &'a self,
         subject: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a>>;
+    /// Probe the registry for connectivity. See
+    /// [`SchemaRegistryClient::health_check`].
     fn health_check<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    /// Set the compatibility level for a subject. See
+    /// [`SchemaRegistryClient::set_compatibility`].
     fn set_compatibility<'a>(
         &'a self,
         subject: &'a str,
         level: CompatibilityLevel,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    /// Get the compatibility level for a subject. See
+    /// [`SchemaRegistryClient::get_compatibility`].
     fn get_compatibility<'a>(
         &'a self,
         subject: &'a str,
@@ -540,6 +598,89 @@ impl<T: SchemaRegistryClient> DynSchemaRegistryClient for T {
         subject: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<CompatibilityLevel>> + Send + 'a>> {
         Box::pin(self.get_compatibility(subject))
+    }
+}
+
+// ── dyn DynSchemaRegistryClient: SchemaRegistryClient ─────────────────────
+//
+// Closes the loop between the two traits. Without this, type-erasing a client
+// into `Arc<dyn DynSchemaRegistryClient>` is a one-way door: the erased value
+// can no longer be passed to anything generic over `SchemaRegistryClient`,
+// including `CachedSchemaRegistry` and `ConfluentSchemaEncoder`.
+//
+// No coherence conflict with the blanket `impl<T: SchemaRegistryClient>
+// DynSchemaRegistryClient for T`: that `T` is implicitly `Sized`, which
+// excludes `dyn DynSchemaRegistryClient`.
+
+impl SchemaRegistryClient for dyn DynSchemaRegistryClient + '_ {
+    fn get_schema_by_id(
+        &self,
+        id: SchemaId,
+    ) -> impl Future<Output = Result<Arc<Schema>>> + Send + '_ {
+        DynSchemaRegistryClient::get_schema_by_id(self, id)
+    }
+    fn get_latest_schema<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> impl Future<Output = Result<Arc<Schema>>> + Send + 'a {
+        DynSchemaRegistryClient::get_latest_schema(self, subject)
+    }
+    fn get_schema_by_version<'a>(
+        &'a self,
+        subject: &'a str,
+        version: SchemaVersion,
+    ) -> impl Future<Output = Result<Arc<Schema>>> + Send + 'a {
+        DynSchemaRegistryClient::get_schema_by_version(self, subject, version)
+    }
+    fn register_schema<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> impl Future<Output = Result<SchemaId>> + Send + 'a {
+        DynSchemaRegistryClient::register_schema(self, subject, schema, schema_type, references)
+    }
+    fn check_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> impl Future<Output = Result<bool>> + Send + 'a {
+        DynSchemaRegistryClient::check_compatibility(self, subject, schema, schema_type, references)
+    }
+    fn delete_subject<'a>(
+        &'a self,
+        subject: &'a str,
+        permanent: bool,
+    ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
+        DynSchemaRegistryClient::delete_subject(self, subject, permanent)
+    }
+    fn get_subjects(&self) -> impl Future<Output = Result<Vec<String>>> + Send + '_ {
+        DynSchemaRegistryClient::get_subjects(self)
+    }
+    fn get_versions<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
+        DynSchemaRegistryClient::get_versions(self, subject)
+    }
+    fn health_check(&self) -> impl Future<Output = Result<()>> + Send + '_ {
+        DynSchemaRegistryClient::health_check(self)
+    }
+    fn set_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+        level: CompatibilityLevel,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        DynSchemaRegistryClient::set_compatibility(self, subject, level)
+    }
+    fn get_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> impl Future<Output = Result<CompatibilityLevel>> + Send + 'a {
+        DynSchemaRegistryClient::get_compatibility(self, subject)
     }
 }
 

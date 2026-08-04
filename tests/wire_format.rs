@@ -399,29 +399,31 @@ fn glue_data_format_parse_display() {
     assert_eq!(GlueDataFormat::Protobuf.to_string(), "PROTOBUF");
 }
 
-// ── Protobuf wire format conformance (F12) ────────────────────────────────
+// ── Protobuf wire format conformance ──────────────────────────────────────
 //
-// These tests use golden byte vectors that are byte-for-byte compatible
-// with the Confluent Java client's `ProtobufSerializer` output.
+// These tests use golden byte vectors that are byte-for-byte compatible with
+// the Confluent Java client's `ProtobufSerializer` output.
 //
-// Reference: https://github.com/confluentinc/schema-registry/blob/master/protobuf-serializer/src/main/java/io/confluent/kafka/serializers/protobuf/AbstractKafkaProtobufSerializer.java
+// Reference:
+//   io.confluent.kafka.schemaregistry.protobuf.MessageIndexes
+//   org.apache.kafka.common.utils.ByteUtils#writeVarint (ZigZag + LEB-128)
 //
 // Wire format after the 5-byte Confluent header:
-//   - varint: message-index array length (number of elements)
-//   - for each index: varint of zigzag-encoded signed int32
+//   - varint: ZigZag(element count)
+//   - for each index: varint of ZigZag(signed int32)
 //
-// For the common case of a top-level (first) message in a schema file:
-//   message_indexes = [0]  →  varint(1) ++ varint(zigzag(0))  =  [0x01, 0x00]
+// With ONE mandated special case: the path [0] — the first top-level message
+// in the .proto file, the overwhelmingly common case — is written as a single
+// 0x00 byte, and a decoded count of 0 maps back to [0].
 //
-// For a nested message at position 2 (0-based):
-//   message_indexes = [2]  →  [0x01, 0x04]  (zigzag(2) = 4)
+//   [0]     → 00
+//   [2]     → 02 04      (ZigZag(1)=2 count, ZigZag(2)=4)
+//   [1, 3]  → 04 02 06   (ZigZag(2)=4 count, ZigZag(1)=2, ZigZag(3)=6)
 
 use schemreg::{decode_protobuf_message_indexes, encode_protobuf_wire_format};
 
-/// Top-level message (schema index [0]) — most common case.
-///
-/// Golden bytes: 5-byte header + [0x01, 0x00] + payload
-/// Matches Confluent Java client for schema_id=1, message at index 0.
+/// Top-level message (schema index `[0]`) — the most common case, and the one
+/// the Confluent serde compresses to a single zero byte.
 #[test]
 fn protobuf_golden_top_level_message() {
     let schema_id: u32 = 1;
@@ -429,52 +431,49 @@ fn protobuf_golden_top_level_message() {
 
     let framed = encode_protobuf_wire_format(schema_id, &[0], payload);
 
-    // Verify 5-byte Confluent header.
     assert_eq!(framed[0], 0x00, "magic byte");
     assert_eq!(
         &framed[1..5],
         &schema_id.to_be_bytes(),
         "schema id big-endian"
     );
-
-    // Verify message-index encoding: count=1 (varint 0x01), index=0 (zigzag 0x00).
-    assert_eq!(framed[5], 0x01, "message-index count varint");
-    assert_eq!(framed[6], 0x00, "zigzag(0) = 0");
-
-    // Verify payload is appended verbatim.
-    assert_eq!(&framed[7..], payload);
-    assert_eq!(framed.len(), 5 + 2 + payload.len());
+    assert_eq!(
+        framed[5], 0x00,
+        "path [0] must be the single-byte optimisation, not a count+value pair"
+    );
+    assert_eq!(&framed[6..], payload, "payload appended verbatim");
+    assert_eq!(framed.len(), 5 + 1 + payload.len());
 }
 
-/// Nested message at index 2 — zigzag(2) = 4 = 0x04.
+/// Nested message at index 2 — ZigZag(count=1)=2, ZigZag(2)=4.
 #[test]
 fn protobuf_golden_nested_message_index_2() {
     let framed = encode_protobuf_wire_format(42, &[2], b"x");
-    assert_eq!(framed[5], 0x01, "count=1");
-    assert_eq!(framed[6], 0x04, "zigzag(2)=4");
+    assert_eq!(framed[5], 0x02, "ZigZag(count=1)=2");
+    assert_eq!(framed[6], 0x04, "ZigZag(2)=4");
     assert_eq!(&framed[7..], b"x");
 }
 
-/// Negative index -1 — zigzag(-1) = 1 = 0x01.
+/// Negative index -1 — ZigZag(-1) = 1.
 #[test]
 fn protobuf_golden_negative_index_minus1() {
     let framed = encode_protobuf_wire_format(5, &[-1], b"");
-    assert_eq!(framed[5], 0x01, "count=1");
-    assert_eq!(framed[6], 0x01, "zigzag(-1)=1");
+    assert_eq!(framed[5], 0x02, "ZigZag(count=1)=2");
+    assert_eq!(framed[6], 0x01, "ZigZag(-1)=1");
 }
 
 /// Multiple message indexes (deeply nested schema path).
 #[test]
 fn protobuf_golden_multi_index() {
-    // indexes = [1, 3]  →  count=2 (0x02), zigzag(1)=2 (0x02), zigzag(3)=6 (0x06)
+    // indexes = [1, 3] → ZigZag(2)=4 count, ZigZag(1)=2, ZigZag(3)=6
     let framed = encode_protobuf_wire_format(99, &[1, 3], b"data");
-    assert_eq!(framed[5], 0x02, "count=2");
-    assert_eq!(framed[6], 0x02, "zigzag(1)=2");
-    assert_eq!(framed[7], 0x06, "zigzag(3)=6");
+    assert_eq!(framed[5], 0x04, "ZigZag(count=2)=4");
+    assert_eq!(framed[6], 0x02, "ZigZag(1)=2");
+    assert_eq!(framed[7], 0x06, "ZigZag(3)=6");
     assert_eq!(&framed[8..], b"data");
 }
 
-/// Round-trip: encode then decode message indexes.
+/// Round-trip: encode then decode message indexes, including the i32 extremes.
 #[test]
 fn protobuf_roundtrip_message_indexes() {
     for indexes in [
@@ -497,8 +496,8 @@ fn protobuf_roundtrip_message_indexes() {
 /// Decode: truncated message-index array must return an error.
 #[test]
 fn protobuf_decode_truncated_index_array_is_error() {
-    // count varint=2 but only one index byte follows (incomplete second index).
-    let bad: &[u8] = &[0x02, 0x00]; // count=2 but only one index value
+    // ZigZag(count=2)=4 but only one index value follows.
+    let bad: &[u8] = &[0x04, 0x00];
     let err = decode_protobuf_message_indexes(bad).unwrap_err();
     assert!(
         err.to_string().contains("truncated") || err.to_string().contains("short"),
@@ -514,16 +513,44 @@ fn protobuf_decode_empty_is_error() {
 }
 
 /// Golden framed bytes for schema_id=1, top-level message, payload "hello".
-/// This is the exact byte sequence a Confluent-compatible consumer must accept.
+///
+/// This is the exact byte sequence the Confluent Java, Python, Go, and .NET
+/// serializers emit — and therefore the exact sequence their deserializers
+/// expect. A regression here is a silent cross-language interop break.
 #[test]
 fn protobuf_golden_bytes_exact() {
     let expected: &[u8] = &[
         0x00, // magic byte
         0x00, 0x00, 0x00, 0x01, // schema_id = 1 (big-endian u32)
-        0x01, // message-index count = 1
-        0x00, // zigzag(0) = 0
+        0x00, // message-index: optimised encoding of [0]
         b'h', b'e', b'l', b'l', b'o', // payload
     ];
     let framed = encode_protobuf_wire_format(1, &[0], b"hello");
     assert_eq!(&framed[..], expected);
+}
+
+/// Decoding bytes produced by the official Confluent serializers.
+///
+/// The single `0x00` must resolve to the path `[0]` with the payload starting
+/// at offset 1 — not to an empty path.
+#[test]
+fn protobuf_decodes_official_serializer_default_index() {
+    let java_bytes: &[u8] = &[
+        0x00, 0x00, 0x00, 0x00, 0x2A, // magic + schema_id = 42
+        0x00, // MessageIndexes.DEFAULT_INDEX
+        0x0A, 0x03, b'a', b'b', b'c', // proto payload
+    ];
+    let (indexes, offset) = decode_protobuf_message_indexes(&java_bytes[5..]).unwrap();
+    assert_eq!(indexes, vec![0]);
+    assert_eq!(&java_bytes[5 + offset..], b"\x0a\x03abc");
+}
+
+/// A count written as a plain unsigned varint (the pre-fix behaviour of this
+/// crate, and of several third-party implementations) must be rejected loudly
+/// rather than silently mis-slicing the payload.
+#[test]
+fn protobuf_rejects_plain_unsigned_count() {
+    // 0x01 ZigZag-decodes to -1.
+    let err = decode_protobuf_message_indexes(&[0x01, 0x00, b'p']).unwrap_err();
+    assert!(err.to_string().contains("negative"), "{err}");
 }

@@ -25,7 +25,7 @@ use crate::types::{
     CompatibilityLevel, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion,
 };
 
-fn schema_lookup_cancelled_error(id: SchemaId) -> SchemaRegError {
+fn schema_lookup_cancelled_error(id: &SchemaId) -> SchemaRegError {
     SchemaRegError::invalid_state(format!(
         "schema lookup cancelled before completion for id {id}"
     ))
@@ -95,6 +95,12 @@ pub struct CachedSchemaRegistry<C> {
 /// Default maximum number of cached schema entries, matching the Java client default.
 pub const DEFAULT_MAX_CACHE_ENTRIES: usize = 1000;
 
+/// Maximum number of concurrent in-flight fetches issued by `warm_cache`.
+///
+/// Bounded so that pre-warming several thousand schema IDs on startup cannot
+/// exhaust the HTTP connection pool or trip the registry's rate limiter.
+pub const WARM_CACHE_CONCURRENCY: usize = 16;
+
 impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
     /// Wrap the given client with an in-memory cache.
     ///
@@ -137,7 +143,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
     /// Remove a single schema ID from the cache.
     pub fn invalidate(&self, schema_id: impl Into<SchemaId>) {
-        self.cache.invalidate(schema_id.into());
+        self.cache.invalidate(&schema_id.into());
     }
 
     /// Remove all cached schemas.
@@ -147,40 +153,42 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
     /// Pre-fetch a set of schema IDs into the cache with bounded concurrency.
     ///
-    /// Duplicate IDs are deduplicated automatically. Up to 16 IDs are fetched
-    /// in parallel per chunk via `futures::future::join_all`. All IDs are
-    /// attempted regardless of individual failures; the full set of failures
-    /// is returned as a [`WarmCacheError`].
+    /// Duplicate IDs are deduplicated automatically. At most
+    /// [`WARM_CACHE_CONCURRENCY`] fetches are in flight at any moment; a new
+    /// fetch starts as soon as any earlier one finishes, so one slow schema does
+    /// not stall the rest (there is no per-batch barrier).
+    ///
+    /// **All IDs are attempted regardless of individual failures.** IDs that
+    /// loaded successfully stay in the cache; the full set of failures is
+    /// returned as a [`WarmCacheError`] so the caller can decide whether a
+    /// partial warm is acceptable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WarmCacheError`] if one or more IDs could not be fetched.
     pub async fn warm_cache(
         &self,
         schema_ids: impl IntoIterator<Item = impl Into<SchemaId>>,
     ) -> std::result::Result<(), WarmCacheError> {
-        const WARM_CONCURRENCY: usize = 16;
+        use futures::StreamExt as _;
 
         let unique: HashSet<SchemaId> = schema_ids.into_iter().map(Into::into).collect();
         if unique.is_empty() {
             return Ok(());
         }
 
-        let ids: Vec<SchemaId> = unique.into_iter().collect();
-        let mut failures: Vec<(SchemaId, SchemaRegError)> = Vec::new();
-
-        for chunk in ids.chunks(WARM_CONCURRENCY) {
-            let futs = chunk.iter().map(|&id| async move {
-                (
-                    id,
-                    self.cache
-                        .get_or_fetch(id, || self.inner.get_schema_by_id(id))
-                        .await,
-                )
-            });
-            let results = futures::future::join_all(futs).await;
-            for (id, result) in results {
-                if let Err(e) = result {
-                    failures.push((id, e));
-                }
-            }
-        }
+        let failures: Vec<(SchemaId, SchemaRegError)> = futures::stream::iter(unique)
+            .map(|id| async move {
+                let result = self
+                    .cache
+                    .get_or_fetch(id, || self.inner.get_schema_by_id(id))
+                    .await;
+                result.err().map(|e| (id, e))
+            })
+            .buffer_unordered(WARM_CACHE_CONCURRENCY)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
 
         if failures.is_empty() {
             Ok(())
@@ -197,7 +205,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             .cache
             .keys_matching(|s: &Schema| s.subject.as_deref() == Some(subject));
         for id in ids {
-            self.cache.invalidate(id);
+            self.cache.invalidate(&id);
         }
     }
 

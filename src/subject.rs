@@ -269,8 +269,7 @@ mod tests {
 
     #[test]
     fn test_custom_strategy_ptr_eq() {
-        let f: Arc<dyn Fn(&str, Option<&str>, EncodeTarget) -> Result<String> + Send + Sync> =
-            Arc::new(|topic, _, target| Ok(format!("{topic}-{target}")));
+        let f: CustomSubjectFn = Arc::new(|topic, _, target| Ok(format!("{topic}-{target}")));
         let a = SubjectNameStrategy::Custom(Arc::clone(&f));
         let b = SubjectNameStrategy::Custom(Arc::clone(&f));
         let c = SubjectNameStrategy::Custom(Arc::new(|_, _, _| Ok("other".into())));

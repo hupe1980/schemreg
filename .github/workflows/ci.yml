@@ -5,10 +5,20 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  # Advisories land independently of code changes; a nightly run catches them
+  # without waiting for the next push.
+  schedule:
+    - cron: "0 5 * * *"
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
+
+# A new push supersedes an in-flight run for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # ── Format ───────────────────────────────────────────────────────────────
@@ -23,26 +33,55 @@ jobs:
       - run: cargo fmt --check
 
   # ── Clippy ───────────────────────────────────────────────────────────────
+  #
+  # Every feature is linted in isolation as well as together: a `cfg`-gated
+  # item that only compiles under `--all-features` is a real bug for anyone
+  # who enables a single backend.
   clippy:
     name: Clippy (${{ matrix.features }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - features: "--all-features"
-          - features: "--no-default-features"
-          - features: "--features confluent"
-          - features: "--features glue"
-          - features: "--features avro"
-          - features: "--features json"
-          - features: "--features apicurio"
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features confluent"
+          - "--no-default-features --features apicurio"
+          - "--no-default-features --features glue"
+          - "--no-default-features --features avro"
+          - "--no-default-features --features json"
+          - "--no-default-features --features protobuf"
+          - "--no-default-features --features confluent,avro"
+          - "--no-default-features --features confluent,json"
+          - "--no-default-features --features apicurio,avro"
+          - "--no-default-features --features glue,avro"
+          - "--no-default-features --features confluent,protobuf"
+          - "--no-default-features --features native-tls-roots"
+          - "--all-features"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy ${{ matrix.features }} -- -D warnings
+      # --all-targets covers tests, examples, and benches, not just the lib.
+      - run: cargo clippy ${{ matrix.features }} --all-targets -- -D warnings
+
+  # ── Public API surface ───────────────────────────────────────────────────
+  #
+  # Guards against a `pub` item that is unreachable from the crate root, and
+  # against an accidental removal from the re-export surface.
+  public-api:
+    name: Public API surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check for unreachable public items
+        run: cargo doc --all-features --no-deps
+      - name: Verify the crate builds as a dependency with no features
+        run: cargo build --no-default-features
 
   # ── Dependency policy ────────────────────────────────────────────────────
   deny:
@@ -52,10 +91,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
-      - name: Run cargo deny check
-        run: cargo deny check
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # Evaluates advisories, licences, bans, and sources with all features on.
+      - run: cargo deny check
 
   # ── Security audit ───────────────────────────────────────────────────────
   audit:
@@ -65,28 +105,57 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Run cargo audit
-        run: cargo audit
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit --deny warnings
+
+  # ── MSRV ─────────────────────────────────────────────────────────────────
+  #
+  # `cargo build` on the declared MSRV with the committed lockfile. A separate
+  # job so an MSRV break is unambiguous in the checks list.
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-features --locked
+      - run: cargo test --all-features --locked
 
   # ── Tests ─────────────────────────────────────────────────────────────────
   test:
-    name: Test / ${{ matrix.rust }} / ${{ matrix.features }}
-    runs-on: ubuntu-latest
+    name: Test / ${{ matrix.os }} / ${{ matrix.rust }} / ${{ matrix.features }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, "1.88"]   # stable + MSRV
+        os: [ubuntu-latest]
+        rust: [stable]
         features:
-          - "--all-features"
           - "--no-default-features"
-          - "--features confluent"
-          - "--features glue"
-          - "--features avro"
-          - "--features json"
-          - "--features apicurio"
-          - "--features native-tls-roots"
+          - "--no-default-features --features confluent"
+          - "--no-default-features --features apicurio"
+          - "--no-default-features --features glue"
+          - "--no-default-features --features avro"
+          - "--no-default-features --features json"
+          - "--no-default-features --features protobuf"
+          - "--all-features"
+        include:
+          # Cross-platform smoke: the wire codecs are endianness- and
+          # platform-sensitive, and rustls root discovery differs per OS.
+          - os: macos-latest
+            rust: stable
+            features: "--all-features"
+          - os: windows-latest
+            rust: stable
+            features: "--all-features"
+          - os: ubuntu-latest
+            rust: beta
+            features: "--all-features"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -94,15 +163,12 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.rust }}-${{ matrix.features }}
+          key: ${{ matrix.os }}-${{ matrix.rust }}-${{ matrix.features }}
+      # Runs unit tests, every integration test, and all doctests.
       - name: cargo test
-        run: cargo test ${{ matrix.features }}
-      - name: cargo test --integration
-        run: |
-          cargo test ${{ matrix.features }} --test wire_format
-          cargo test ${{ matrix.features }} --test subject_strategy
-          cargo test ${{ matrix.features }} --test cache
-          cargo test ${{ matrix.features }} --test decoder
+        run: cargo test ${{ matrix.features }} --all-targets
+      - name: cargo test --doc
+        run: cargo test ${{ matrix.features }} --doc
 
   # ── Docs ──────────────────────────────────────────────────────────────────
   docs:
@@ -110,9 +176,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+      # Mirrors the docs.rs build: nightly + --cfg docsrs so feature badges and
+      # doc_auto_cfg render exactly as they will on docs.rs.
+      - name: cargo doc (docs.rs configuration)
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings --cfg docsrs"
 
   # ── Examples ─────────────────────────────────────────────────────────────
   examples:
@@ -126,9 +197,91 @@ jobs:
         run: cargo build --examples --no-default-features
       - name: Build examples (all-features)
         run: cargo build --examples --all-features
-      - name: Run glue_roundtrip example
-        run: cargo run --example glue_roundtrip --features glue
-      - name: Run custom_backend example
-        run: cargo run --example custom_backend
-      - name: Run apicurio_roundtrip example
-        run: cargo run --example apicurio_roundtrip --features apicurio
+      # Every example that runs without a live registry is executed, not just
+      # compiled — a compiling-but-broken example is still broken documentation.
+      - run: cargo run --example confluent_encode_decode --features confluent
+      - run: cargo run --example custom_backend
+      - run: cargo run --example protobuf_wire_format
+      - run: cargo run --example protobuf_roundtrip --features protobuf
+      - run: cargo run --example glue_roundtrip --features glue
+      - run: cargo run --example apicurio_roundtrip --features apicurio
+      - run: cargo run --example avro_roundtrip --features avro
+      - run: cargo run --example json_roundtrip --features json
+
+  # ── Benchmarks ───────────────────────────────────────────────────────────
+  #
+  # Compiled and smoke-run on every push. Not a performance gate — CI runners
+  # are too noisy for that — but a benchmark that stops compiling or panics is
+  # a real regression, and it is cheap to catch here.
+  bench:
+    name: Benchmarks (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --all-features --bench wire -- --warm-up-time 0.2 --measurement-time 0.5 --sample-size 10
+
+  # ── Cross-language conformance ───────────────────────────────────────────
+  #
+  # Regenerates the wire-format fixtures with the OFFICIAL confluent-kafka
+  # Python serializers and fails if the committed file drifts. This is what
+  # keeps the Protobuf message-index framing honest: a specification-derived
+  # golden vector can encode a misreading, a byte stream from the reference
+  # implementation cannot.
+  conformance:
+    name: Cross-language conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Regenerate fixtures with the reference serializers
+        run: |
+          docker compose -f conformance/docker-compose.yml up \
+            --build --abort-on-container-exit --exit-code-from fixtures
+
+      - name: Fail if the committed fixtures drifted
+        run: |
+          if ! git diff --exit-code -- tests/fixtures/; then
+            echo "::error::The regenerated fixtures differ from the committed ones."
+            echo "Either the reference implementation changed its framing, or the"
+            echo "generator did. Review the diff above before updating the fixtures."
+            exit 1
+          fi
+
+      - name: Verify schemreg decodes and re-encodes them
+        run: cargo test --all-features --test conformance_fixtures
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f conformance/docker-compose.yml down -v
+
+  # ── Aggregate gate ───────────────────────────────────────────────────────
+  #
+  # Single required status check for branch protection: stays correct when the
+  # matrix above grows or shrinks.
+  ci-success:
+    name: CI
+    if: always()
+    needs:
+      [
+        fmt,
+        clippy,
+        public-api,
+        deny,
+        audit,
+        msrv,
+        test,
+        docs,
+        examples,
+        bench,
+        conformance,
+      ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any dependency job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "All CI jobs passed."

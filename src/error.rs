@@ -218,14 +218,22 @@ impl SchemaRegError {
 
     /// Returns `true` if the error is likely transient and safe to retry.
     ///
-    /// Network errors and HTTP throttling/unavailability responses
-    /// (429 Too Many Requests, 503 Service Unavailable) are considered
-    /// retryable. Auth and configuration errors are not.
+    /// Retryable: transport-level [`Network`](Self::Network) errors, HTTP 429
+    /// (Too Many Requests) and every HTTP 5xx server response.
+    ///
+    /// Not retryable: [`Auth`](Self::Auth), [`Config`](Self::Config),
+    /// [`Api`](Self::Api), [`WireFormat`](Self::WireFormat),
+    /// [`NotSupported`](Self::NotSupported), and [`InvalidState`](Self::InvalidState) —
+    /// retrying these produces the same failure and wastes the caller's budget.
+    ///
+    /// The classification matches the internal HTTP retry policy, so a caller
+    /// wrapping `schemreg` in its own retry loop will not re-retry something the
+    /// crate already gave up on for a permanent reason.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Network(_) => true,
-            Self::Http { status, .. } => matches!(status, 429 | 503),
+            Self::Http { status, .. } => *status == 429 || (500..600).contains(status),
             _ => false,
         }
     }

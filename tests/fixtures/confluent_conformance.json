@@ -1,0 +1,86 @@
+{
+  "_comment": "GENERATED FILE \u2014 do not edit by hand. Produced by conformance/generate_fixtures.py using the official confluent-kafka Python serializers. Regenerate with: docker compose -f conformance/docker-compose.yml up --build --abort-on-container-exit",
+  "generator": "confluent-kafka-python",
+  "fixtures": [
+    {
+      "name": "avro_order",
+      "note": "Plain 5-byte Confluent header; no message-index array for Avro.",
+      "schema_type": "AVRO",
+      "schema": "{\n  \"type\": \"record\",\n  \"name\": \"Order\",\n  \"namespace\": \"shop\",\n  \"fields\": [\n    {\"name\": \"id\", \"type\": \"string\"},\n    {\"name\": \"quantity\", \"type\": \"int\"}\n  ]\n}",
+      "framed_hex": "00000000010e6f726465722d3106",
+      "message_indexes": null
+    },
+    {
+      "name": "json_order",
+      "note": "Plain 5-byte Confluent header; JSON Schema uses no message-index either.",
+      "schema_type": "JSON",
+      "schema": "{\n  \"$schema\": \"http://json-schema.org/draft-07/schema#\",\n  \"title\": \"Order\",\n  \"type\": \"object\",\n  \"properties\": {\n    \"id\": {\"type\": \"string\"},\n    \"quantity\": {\"type\": \"integer\"}\n  },\n  \"required\": [\"id\", \"quantity\"],\n  \"additionalProperties\": false\n}",
+      "framed_hex": "00000000027b226964223a20226f726465722d32222c20227175616e74697479223a20377d",
+      "message_indexes": null
+    },
+    {
+      "name": "protobuf_order",
+      "note": "First top-level message \u2014 the mandated single-0x00 optimisation.",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "framed_hex": "0000000003000a076f726465722d331001",
+      "message_indexes": [
+        0
+      ]
+    },
+    {
+      "name": "protobuf_invoice",
+      "note": "Second top-level message \u2014 ZigZag(count=1)=2, ZigZag(1)=2.",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "framed_hex": "000000000302020a05696e762d31",
+      "message_indexes": [
+        1
+      ]
+    },
+    {
+      "name": "protobuf_refund",
+      "note": "Third top-level message \u2014 ZigZag(count=1)=2, ZigZag(2)=4.",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "framed_hex": "000000000302040a057265662d31",
+      "message_indexes": [
+        2
+      ]
+    },
+    {
+      "name": "protobuf_invoice_line",
+      "note": "Nested one level \u2014 ZigZag(count=2)=4, then ZigZag(1), ZigZag(0).",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "framed_hex": "00000000030402000a05534b552d31",
+      "message_indexes": [
+        1,
+        0
+      ]
+    },
+    {
+      "name": "protobuf_invoice_tax",
+      "note": "Nested one level, second nested type.",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "framed_hex": "00000000030402020a03564154",
+      "message_indexes": [
+        1,
+        1
+      ]
+    },
+    {
+      "name": "protobuf_invoice_tax_rate",
+      "note": "Nested two levels \u2014 three-segment index path.",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "framed_hex": "000000000306020200089e0f",
+      "message_indexes": [
+        1,
+        1,
+        0
+      ]
+    }
+  ]
+}

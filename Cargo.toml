@@ -1,6 +1,6 @@
 [package]
 name        = "schemreg"
-version     = "0.3.0"
+version     = "0.4.0"
 edition     = "2024"
 rust-version = "1.88"
 authors     = ["hupe1980"]
@@ -10,6 +10,7 @@ repository  = "https://github.com/hupe1980/schemreg"
 documentation = "https://docs.rs/schemreg"
 readme      = "README.md"
 keywords    = ["kafka", "schema-registry", "confluent", "avro", "glue"]
+exclude     = ["/.github", "/conformance", "/docs", "/FINDINGS.md", "/REVIEW.md"]
 categories  = ["encoding", "network-programming", "asynchronous"]
 
 [features]
@@ -33,16 +34,20 @@ avro             = ["dep:apache-avro", "dep:serde"]
 # always available without this feature. Only the AWS SDK client
 # (AwsGlueSchemaRegistry) and ZLIB compression require it.
 glue             = ["dep:aws-sdk-glue", "dep:aws-config", "dep:flate2"]
-# Add the platform-native root certificate store to the HTTPS trust anchors.
-native-tls-roots = ["confluent", "reqwest?/rustls-tls-native-roots"]
-# Use aws-lc-rs as the TLS crypto provider (replaces the default ring backend).
-# Requires the confluent feature.
-aws-lc-rs        = ["confluent", "reqwest?/rustls-tls-webpki-roots", "dep:aws-lc-rs"]
+# Add the platform-native root certificate store to the HTTPS trust anchors,
+# in addition to the bundled webpki roots. Applies to every reqwest-backed
+# client (confluent and apicurio); a no-op if neither is enabled.
+native-tls-roots = ["reqwest?/rustls-tls-native-roots"]
 # Enable JSON Schema encode/decode + Confluent wire-format framing.
 # Uses jsonschema (draft 2020-12) for schema validation and serde_json for
 # serialisation. Pairs JsonSchemaEncoder / JsonSchemaDecoder with any
 # SchemaRegistryClient impl. Does NOT require the `confluent` feature.
 json             = ["dep:jsonschema", "dep:serde", "dep:serde_json"]
+# Enable Protobuf encode/decode + Confluent wire-format framing, including
+# automatic derivation of the message-index path from the message descriptor.
+# Uses prost for (de)serialisation and prost-reflect for descriptor reflection.
+# Does NOT require the `confluent` feature.
+protobuf         = ["dep:prost", "dep:prost-reflect"]
 # Enable the native Apicurio Registry v3 HTTP client.
 # Uses the /apis/registry/v3/ REST API endpoints directly (group + artifact ID
 # address model). Supports Avro, JSON Schema, and Protobuf artifact types.
@@ -58,9 +63,14 @@ apicurio         = [
 
 [dependencies]
 # Async runtime
-tokio        = { version = "1", features = ["net", "io-util", "sync", "time", "rt"] }
+# Only `sync` (oneshot channels for in-flight coalescing) and `time` (retry
+# back-off) are used by the library itself; transport runtime features come in
+# via reqwest / aws-config.
+tokio        = { version = "1", features = ["sync", "time"] }
 
-# Async utilities (join_all for warm_cache concurrency, etc.)
+# Async utilities: bounded-concurrency stream combinators used by warm_cache.
+# `tokio::task::JoinSet` cannot replace this — warm_cache borrows `&self`, and
+# JoinSet requires `'static` futures, which would force an Arc-clone per call.
 futures      = { version = "0.3", default-features = false, features = ["alloc"] }
 
 
@@ -86,7 +96,6 @@ reqwest      = { version = "0.12", features = ["rustls-tls-webpki-roots"], defau
 zeroize      = { version = "1.8", features = ["derive"], optional = true }
 percent-encoding = { version = "2.3", optional = true }
 base64       = { version = "0.22", optional = true }
-aws-lc-rs    = { version = "1", optional = true, default-features = false }
 
 # glue feature
 aws-config   = { version = "1", optional = true, default-features = false, features = ["credentials-process", "default-https-client", "rt-tokio", "sso"] }
@@ -94,10 +103,24 @@ aws-sdk-glue = { version = "1", optional = true, default-features = false, featu
 flate2       = { version = "1", optional = true }
 jsonschema = { version = "0.46.5", optional = true, default-features = false }
 
+# protobuf feature
+prost        = { version = "0.14", optional = true, default-features = false, features = ["std"] }
+prost-reflect = { version = "0.16", optional = true, default-features = false }
+
 [dev-dependencies]
 tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow       = "1"
+wiremock = "0.6.5"
+serde_json = "1"
+prost-reflect = "0.16"
+parking_lot = "0.12"
+proptest = "1.11.0"
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+
+[[bench]]
+name = "wire"
+harness = false
 
 [[example]]
 name = "avro_roundtrip"
@@ -114,6 +137,10 @@ required-features = ["glue"]
 [[example]]
 name = "apicurio_roundtrip"
 required-features = ["apicurio"]
+
+[[example]]
+name = "protobuf_roundtrip"
+required-features = ["protobuf"]
 
 [[example]]
 name = "confluent_encode_decode"

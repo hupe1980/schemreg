@@ -5,13 +5,16 @@
 //! needed and call `.decode(payload)` to strip the header and return the
 //! raw payload bytes along with schema metadata.
 
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
 
 use crate::error::{Result, SchemaRegError};
-use crate::traits::DynSchemaRegistryClient;
-use crate::types::{Schema, SchemaType};
+use crate::traits::{DynSchemaRegistryClient, SchemaDecoder};
+use crate::types::{EncodeTarget, Schema, SchemaType};
 use crate::wire::{decode_protobuf_message_indexes, detect_wire_format};
 
 #[cfg(feature = "glue")]
@@ -293,6 +296,37 @@ impl WireFormatDecoder {
 impl Default for WireFormatDecoder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl fmt::Debug for WireFormatDecoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("WireFormatDecoder");
+        s.field("confluent", &self.confluent.is_some());
+        #[cfg(feature = "glue")]
+        s.field("glue", &self.glue.is_some());
+        s.finish()
+    }
+}
+
+/// `WireFormatDecoder` is the object-safe framing stripper: it satisfies
+/// [`SchemaDecoder`] by returning the header-stripped payload bytes.
+///
+/// `topic` and `target` are accepted for interface compatibility but ignored —
+/// both the Confluent and Glue wire formats are self-describing, so the schema
+/// is located from the header rather than from a derived subject name.
+impl SchemaDecoder for WireFormatDecoder {
+    fn decode(
+        &self,
+        payload: Bytes,
+        _topic: &str,
+        _target: EncodeTarget,
+    ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
+        Box::pin(async move {
+            WireFormatDecoder::decode(self, payload)
+                .await
+                .map(|m| m.payload)
+        })
     }
 }
 

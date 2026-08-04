@@ -29,11 +29,28 @@ jobs:
       - name: Tests (all features)
         run: cargo test --all-features
 
+      - name: Docs (all features)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+
       - name: Tests (no default features)
         run: cargo test --no-default-features
 
-      - name: Docs (all features)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+      # A packaged crate can differ from the working tree: `exclude` rules,
+      # missing files, a stale Cargo.lock. Publishing with --no-verify skips
+      # that check, so do it explicitly here instead.
+      - name: Verify the packaged crate builds
+        run: cargo publish --dry-run --all-features
+
+      - name: Verify CHANGELOG has an entry for this version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^## \[${TAG_VERSION}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${TAG_VERSION}]' section."
+            echo "Every release needs migration notes — this crate is pre-1.0"
+            echo "and ships deliberate breaking changes."
+            exit 1
+          fi
+          echo "CHANGELOG entry found for ${TAG_VERSION}"
 
       # Verify the version tag matches the crate version in Cargo.toml.
       - name: Verify crate version matches tag

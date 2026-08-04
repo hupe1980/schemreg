@@ -51,7 +51,9 @@ struct InFlightEntry<V> {
 /// channels once the leader completes.
 ///
 /// # Type parameters
-/// - `K`: cache key. Must be `Hash + Eq + Copy + Send + Sync + 'static`.
+/// - `K`: cache key. Must be `Hash + Eq + Clone + Send + Sync + 'static`.
+///   `Clone` rather than `Copy` so that `String`-keyed caches (subject → schema
+///   ID, on the producer side) can share this implementation.
 /// - `V`: cached value (stored as `Arc<V>`). Must be `Send + Sync + 'static`.
 pub(crate) struct InMemoryCache<K, V> {
     entries: RwLock<HashMap<K, Arc<V>>>,
@@ -65,12 +67,12 @@ pub(crate) struct InMemoryCache<K, V> {
     in_flight: Mutex<HashMap<K, InFlightEntry<V>>>,
     /// Factory for the "lookup cancelled" error reported to waiters when the
     /// leader task is aborted before completing.
-    make_cancelled_error: fn(K) -> SchemaRegError,
+    make_cancelled_error: fn(&K) -> SchemaRegError,
 }
 
 impl<K, V> InMemoryCache<K, V>
 where
-    K: Hash + Eq + Copy + fmt::Debug + Send + Sync + 'static,
+    K: Hash + Eq + Clone + fmt::Debug + Send + Sync + 'static,
     V: Send + Sync + 'static,
 {
     /// Create a new cache.
@@ -81,7 +83,7 @@ where
     ///   when the leader task is aborted before completion.
     pub(crate) fn new(
         max_entries: Option<usize>,
-        make_cancelled_error: fn(K) -> SchemaRegError,
+        make_cancelled_error: fn(&K) -> SchemaRegError,
     ) -> Self {
         let capacity = max_entries.unwrap_or(0);
         Self {
@@ -112,22 +114,34 @@ where
         self.invalidation_generation.load(Ordering::SeqCst)
     }
 
+    /// Look up `key` without fetching. Returns `None` on a miss.
+    ///
+    /// Used by the encoders' `cached_schema_id` observability accessors, which
+    /// must never trigger a registration.
+    #[cfg_attr(
+        not(any(feature = "confluent", feature = "avro", feature = "json")),
+        allow(dead_code)
+    )]
+    pub(crate) fn get(&self, key: &K) -> Option<Arc<V>> {
+        self.entries.read().get(key).map(Arc::clone)
+    }
+
     // ── Invalidation ──────────────────────────────────────────────────────
 
     /// Remove a single entry from the cache and cancel any in-flight waiters
     /// for that key.
-    pub(crate) fn invalidate(&self, key: K) {
+    pub(crate) fn invalidate(&self, key: &K) {
         self.invalidation_generation.fetch_add(1, Ordering::SeqCst);
 
         let waiters = self
             .in_flight
             .lock()
-            .remove(&key)
+            .remove(key)
             .map(|e| e.waiters)
             .unwrap_or_default();
 
-        self.entries.write().remove(&key);
-        self.insertion_order.write().retain(|cached| *cached != key);
+        self.entries.write().remove(key);
+        self.insertion_order.write().retain(|cached| cached != key);
 
         let err = (self.make_cancelled_error)(key);
         for waiter in waiters {
@@ -144,7 +158,7 @@ where
         self.insertion_order.write().clear();
 
         for (key, entry) in cancelled {
-            let err = (self.make_cancelled_error)(key);
+            let err = (self.make_cancelled_error)(&key);
             for waiter in entry.waiters {
                 let _ = waiter.send(Err(err.clone()));
             }
@@ -160,7 +174,7 @@ where
             .read()
             .iter()
             .filter(|(_, v)| predicate(v.as_ref()))
-            .map(|(k, _)| *k)
+            .map(|(k, _)| k.clone())
             .collect()
     }
 
@@ -198,7 +212,7 @@ where
             {
                 entries.remove(&evicted);
             }
-            insertion_order.push_back(key);
+            insertion_order.push_back(key.clone());
         }
         entries.insert(key, value);
     }
@@ -244,7 +258,7 @@ where
                 // Become the leader.
                 let token = self.in_flight_token.fetch_add(1, Ordering::SeqCst) + 1;
                 in_flight.insert(
-                    key,
+                    key.clone(),
                     InFlightEntry {
                         token,
                         waiters: Vec::new(),
@@ -256,19 +270,19 @@ where
 
         // Waiter path: wait for the leader.
         if let Some(rx) = waiter_rx {
-            return rx.await.map_err(|_| (self.make_cancelled_error)(key))?;
+            return rx.await.map_err(|_| (self.make_cancelled_error)(&key))?;
         }
 
         // Leader path.
         let Some(leader_token) = leader_token else {
-            return Err((self.make_cancelled_error)(key));
+            return Err((self.make_cancelled_error)(&key));
         };
 
         // Drop guard: if this future is dropped (task abort) before we mark
         // `completed`, notify all waiters with a cancellation error.
         struct FetchGuard<'a, K, V>
         where
-            K: Hash + Eq + Copy + fmt::Debug + Send + Sync + 'static,
+            K: Hash + Eq + Clone + fmt::Debug + Send + Sync + 'static,
             V: Send + Sync + 'static,
         {
             cache: &'a InMemoryCache<K, V>,
@@ -279,7 +293,7 @@ where
 
         impl<K, V> Drop for FetchGuard<'_, K, V>
         where
-            K: Hash + Eq + Copy + fmt::Debug + Send + Sync + 'static,
+            K: Hash + Eq + Clone + fmt::Debug + Send + Sync + 'static,
             V: Send + Sync + 'static,
         {
             fn drop(&mut self) {
@@ -297,7 +311,7 @@ where
                         Vec::new()
                     }
                 };
-                let err = (self.cache.make_cancelled_error)(self.key);
+                let err = (self.cache.make_cancelled_error)(&self.key);
                 for waiter in waiters {
                     let _ = waiter.send(Err(err.clone()));
                 }
@@ -306,15 +320,14 @@ where
 
         let mut guard = FetchGuard {
             cache: self,
-            key,
+            key: key.clone(),
             token: leader_token,
             completed: false,
         };
 
         // Snapshot the generation before hitting the backend. Any concurrent
         // `invalidate()` that completes AFTER this point but BEFORE the write
-        // lock is acquired will be detected by the generation re-check inside
-        // `insert_if_current`.
+        // lock is acquired will be detected by the generation re-check below.
         let gen_before = self.invalidation_generation.load(Ordering::SeqCst);
 
         let result = fetch().await;
@@ -348,10 +361,10 @@ where
                             {
                                 entries.remove(&evicted);
                             }
-                            insertion_order.push_back(key);
+                            insertion_order.push_back(key.clone());
                         }
                         let arc = Arc::clone(value);
-                        entries.insert(key, Arc::clone(&arc));
+                        entries.insert(key.clone(), Arc::clone(&arc));
                         Ok(arc)
                     }
                 } else {

@@ -300,3 +300,36 @@ async fn decoder_with_confluent_and_glue_glue_path() {
         Some(SchemaMetadata::Glue(_))
     ));
 }
+
+// ── SchemaDecoder trait object ────────────────────────────────────────────
+
+/// `WireFormatDecoder` is the crate's object-safe framing stripper. Without an
+/// implementor, `SchemaDecoder` would be a trait nobody could use.
+#[tokio::test]
+async fn wire_format_decoder_is_usable_as_a_schema_decoder_trait_object() {
+    use schemreg::{EncodeTarget, SchemaDecoder};
+
+    let decoder: Arc<dyn SchemaDecoder> =
+        Arc::new(WireFormatDecoder::confluent(MockConfluentRegistry {
+            schema: avro_schema(1),
+        }));
+
+    let framed = confluent_framed(1, b"inner-payload");
+    let payload = decoder
+        .decode(framed, "orders", EncodeTarget::Value)
+        .await
+        .expect("decode through the trait object");
+
+    assert_eq!(
+        &payload[..],
+        b"inner-payload",
+        "the trait object must return the header-stripped payload"
+    );
+}
+
+#[test]
+fn schema_decoder_trait_object_is_send_sync() {
+    fn assert_send_sync<T: Send + Sync + ?Sized>() {}
+    assert_send_sync::<dyn schemreg::SchemaDecoder>();
+    assert_send_sync::<dyn schemreg::SchemaEncoder>();
+}
