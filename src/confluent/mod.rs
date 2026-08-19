@@ -20,7 +20,7 @@ use crate::http::{
 use crate::retry::RetryPolicy;
 use crate::traits::SchemaRegistryClient;
 use crate::types::{
-    CompatibilityLevel, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion,
+    CompatibilityLevel, Schema, SchemaGuid, SchemaId, SchemaReference, SchemaType, SchemaVersion,
 };
 
 const SCHEMA_REGISTRY_CONTENT_TYPE: &str = "application/vnd.schemaregistry.v1+json";
@@ -29,14 +29,25 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── API JSON types ───────────────────────────────────────────────────────
 
+/// `GET /schemas/ids/{id}` and `GET /schemas/guids/{guid}`.
+///
+/// `subject` and `version` are absent on a plain by-ID lookup and present when
+/// the registry chose to report them; `guid` appears from Confluent Platform 8.
 #[derive(Deserialize)]
 struct SchemaByIdResponse {
     schema: String,
     #[serde(rename = "schemaType", default = "default_avro_type")]
     schema_type: String,
     references: Option<Vec<ReferenceJson>>,
+    #[serde(default)]
+    guid: Option<SchemaGuid>,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    version: Option<SchemaVersion>,
 }
 
+/// `GET /subjects/{subject}/versions/{version}` and `POST /subjects/{subject}`.
 #[derive(Deserialize)]
 struct SchemaBySubjectResponse {
     id: SchemaId,
@@ -46,6 +57,8 @@ struct SchemaBySubjectResponse {
     #[serde(rename = "schemaType", default = "default_avro_type")]
     schema_type: String,
     references: Option<Vec<ReferenceJson>>,
+    #[serde(default)]
+    guid: Option<SchemaGuid>,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +106,20 @@ struct RegisterSchemaRequest<'a> {
 
 fn default_avro_type() -> String {
     "AVRO".to_string()
+}
+
+/// The path segment naming `version`.
+///
+/// [`SchemaVersion`] documents a negative value as meaning "latest"; the
+/// registry spells that `latest` and rejects `-1` outright with error code
+/// 42202. Translating here is what makes that documented convention true for
+/// this backend as well as for Apicurio.
+fn version_path_segment(version: SchemaVersion) -> String {
+    if version.as_i32() < 0 {
+        "latest".to_string()
+    } else {
+        version.as_i32().to_string()
+    }
 }
 
 fn sanitized_error_body_preview(body: &str) -> String {
@@ -250,27 +277,51 @@ impl ConfluentSchemaRegistry {
         self.http_put_unit(&url, &body_bytes).await
     }
 
-    /// Get the current compatibility policy for a subject.
+    /// Get the compatibility policy that actually applies to a subject.
     ///
-    /// Uses `GET /config/{subject}`. If `subject` is empty, returns the global
-    /// default compatibility level (`GET /config`).
+    /// Uses `GET /config/{subject}?defaultToGlobal=true`, so a subject with no
+    /// override of its own reports the global default rather than failing with
+    /// error code 40408. That is the question callers are almost always asking:
+    /// "what will happen if I register here?" — and most subjects have no
+    /// override, so without the parameter the common case is an error.
     ///
-    /// Returns a registry API error if the subject has no per-subject override
-    /// and the caller passed a non-empty subject (i.e. the registry returns 404
-    /// for subjects with no explicit override configured). Use an empty string to
-    /// unconditionally retrieve the global default.
+    /// Pass an empty `subject` to read the global default directly
+    /// (`GET /config`).
     pub async fn get_compatibility(&self, subject: &str) -> Result<CompatibilityLevel> {
         let url = if subject.is_empty() {
             format!("{}/config", self.base_url)
         } else {
             validate_subject(subject)?;
-            format!("{}/config/{}", self.base_url, percent_encode(subject))
+            format!(
+                "{}/config/{}?defaultToGlobal=true",
+                self.base_url,
+                percent_encode(subject)
+            )
         };
         let resp: CompatibilityLevelResponse = self.http_get(&url).await?;
         resp.level.parse()
     }
 
-    /// Delete a subject and all its versions.
+    /// Delete a subject and all its versions, returning the deleted versions.
+    ///
+    /// Deletion is **two-stage**. A soft delete (`permanent = false`) hides the
+    /// subject from `GET /subjects` but keeps its schema IDs resolvable, so
+    /// consumers still reading the topic's backlog do not break. A permanent
+    /// delete (`permanent = true`) removes it for good — and the registry
+    /// rejects it with error code
+    /// [`SUBJECT_NOT_SOFT_DELETED`](crate::error::error_code::SUBJECT_NOT_SOFT_DELETED)
+    /// unless the subject was soft-deleted first.
+    ///
+    /// To do both stages, call this twice:
+    ///
+    /// ```rust,no_run
+    /// # use schemreg::{ConfluentSchemaRegistry, Result};
+    /// # async fn run(registry: ConfluentSchemaRegistry) -> Result<()> {
+    /// registry.delete_subject("orders-value", false).await?; // soft
+    /// registry.delete_subject("orders-value", true).await?;  // permanent
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn delete_subject(
         &self,
         subject: &str,
@@ -282,6 +333,88 @@ impl ConfluentSchemaRegistry {
             url.push_str("?permanent=true");
         }
         self.http_delete(&url).await
+    }
+
+    /// Delete a single version under a subject, returning the deleted version.
+    ///
+    /// Two-stage in the same way as [`delete_subject`](Self::delete_subject).
+    pub async fn delete_version(
+        &self,
+        subject: &str,
+        version: SchemaVersion,
+        permanent: bool,
+    ) -> Result<SchemaVersion> {
+        validate_subject(subject)?;
+        let mut url = format!(
+            "{}/subjects/{}/versions/{}",
+            self.base_url,
+            percent_encode(subject),
+            version_path_segment(version)
+        );
+        if permanent {
+            url.push_str("?permanent=true");
+        }
+        let deleted: i32 = self.http_delete(&url).await?;
+        Ok(SchemaVersion::new(deleted))
+    }
+
+    /// Look up an already-registered schema without registering it.
+    ///
+    /// Issues `POST /subjects/{subject}`, which needs only read access. Returns
+    /// `Ok(None)` when the subject does not exist or has no version with this
+    /// content, so "not registered" is an ordinary outcome rather than an error
+    /// the caller has to classify.
+    ///
+    /// Prefer this over [`register_schema`](SchemaRegistryClient::register_schema)
+    /// wherever schemas are managed by CI or a migration step rather than by
+    /// the application: registering from a producer will silently create a new
+    /// version in production the moment the local schema drifts.
+    ///
+    /// Honours the client's
+    /// [`normalize_schemas`](ConfluentSchemaRegistryBuilder::normalize_schemas)
+    /// setting so that a lookup matches what a registration would have stored.
+    pub async fn lookup_schema(
+        &self,
+        subject: &str,
+        schema: &str,
+        schema_type: SchemaType,
+        references: &[SchemaReference],
+    ) -> Result<Option<Arc<Schema>>> {
+        validate_subject(subject)?;
+        let mut url = format!("{}/subjects/{}", self.base_url, percent_encode(subject));
+        if self.normalize {
+            url.push_str("?normalize=true");
+        }
+        let body = RegisterSchemaRequest {
+            schema,
+            schema_type: schema_type.as_str(),
+            references: Self::to_reference_json(references),
+        };
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+            SchemaRegError::invalid_state(format!("failed to serialise request: {e}"))
+        })?;
+        match self
+            .http_post::<SchemaBySubjectResponse>(&url, &body_bytes)
+            .await
+        {
+            Ok(found) => Self::schema_from_subject_response(found).map(|s| Some(Arc::new(s))),
+            // 40401 = no such subject, 40403 = subject exists, this schema does
+            // not. Both mean "not registered", which is not a failure here.
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Retrieve a schema by its registry-independent GUID (wire format v1).
+    ///
+    /// Issues `GET /schemas/guids/{guid}`, which requires Confluent Platform 8
+    /// or newer. Older registries answer 404.
+    pub async fn get_schema_by_guid(&self, guid: SchemaGuid) -> Result<Arc<Schema>> {
+        let url = format!("{}/schemas/guids/{guid}", self.base_url);
+        let body: SchemaByIdResponse = self.http_get(&url).await?;
+        // The response carries no numeric ID — the GUID is the only identifier
+        // this lookup establishes.
+        Self::schema_from_id_response(body, None, Some(guid)).map(Arc::new)
     }
 
     fn auth_header_value(&self) -> Option<zeroize::Zeroizing<String>> {
@@ -464,11 +597,34 @@ impl ConfluentSchemaRegistry {
     fn schema_from_subject_response(body: SchemaBySubjectResponse) -> Result<Schema> {
         let schema_type: SchemaType = body.schema_type.parse()?;
         Ok(Schema {
-            id: body.id,
+            id: Some(body.id),
+            guid: body.guid,
             schema_type,
             schema: body.schema.into(),
             version: Some(body.version),
             subject: Some(Arc::from(body.subject.as_str())),
+            references: Self::parse_references(body.references),
+        })
+    }
+
+    /// Build a [`Schema`] from a by-ID or by-GUID response.
+    ///
+    /// `id` is passed in because `GET /schemas/ids/{id}` echoes neither the ID
+    /// nor (before Platform 8) the GUID; whichever identifier was used for the
+    /// lookup is the one we know for certain.
+    fn schema_from_id_response(
+        body: SchemaByIdResponse,
+        id: Option<SchemaId>,
+        guid: Option<SchemaGuid>,
+    ) -> Result<Schema> {
+        let schema_type: SchemaType = body.schema_type.parse()?;
+        Ok(Schema {
+            id,
+            guid: body.guid.or(guid),
+            schema_type,
+            schema: body.schema.into(),
+            version: body.version,
+            subject: body.subject.map(|s| Arc::from(s.as_str())),
             references: Self::parse_references(body.references),
         })
     }
@@ -492,16 +648,33 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
     async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> {
         let url = format!("{}/schemas/ids/{id}", self.base_url);
         let body: SchemaByIdResponse = self.http_get(&url).await?;
-        let schema_type: SchemaType = body.schema_type.parse()?;
+        Self::schema_from_id_response(body, Some(id), None).map(Arc::new)
+    }
 
-        Ok(Arc::new(Schema {
-            id,
-            schema_type,
-            schema: body.schema.into(),
-            version: None,
-            subject: None,
-            references: Self::parse_references(body.references),
-        }))
+    fn get_schema_by_guid(
+        &self,
+        guid: SchemaGuid,
+    ) -> impl std::future::Future<Output = Result<Arc<Schema>>> + Send + '_ {
+        ConfluentSchemaRegistry::get_schema_by_guid(self, guid)
+    }
+
+    fn lookup_schema<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> impl std::future::Future<Output = Result<Option<Arc<Schema>>>> + Send + 'a {
+        ConfluentSchemaRegistry::lookup_schema(self, subject, schema, schema_type, references)
+    }
+
+    fn delete_version<'a>(
+        &'a self,
+        subject: &'a str,
+        version: SchemaVersion,
+        permanent: bool,
+    ) -> impl std::future::Future<Output = Result<SchemaVersion>> + Send + 'a {
+        ConfluentSchemaRegistry::delete_version(self, subject, version, permanent)
     }
 
     async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
@@ -522,9 +695,10 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
     ) -> Result<Arc<Schema>> {
         validate_subject(subject)?;
         let url = format!(
-            "{}/subjects/{}/versions/{version}",
+            "{}/subjects/{}/versions/{}",
             self.base_url,
-            percent_encode(subject)
+            percent_encode(subject),
+            version_path_segment(version)
         );
         let body: SchemaBySubjectResponse = self.http_get(&url).await?;
         Self::schema_from_subject_response(body).map(Arc::new)

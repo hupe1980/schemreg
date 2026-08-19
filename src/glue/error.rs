@@ -24,8 +24,6 @@ mod codes {
     pub(super) const ALREADY_EXISTS: i32 = 40902;
     /// The request was rejected as invalid (schema validation, bad input).
     pub(super) const INVALID_INPUT: i32 = 42201;
-    /// A service error that does not map to a more specific code.
-    pub(super) const UNCLASSIFIED: i32 = 50001;
 }
 
 /// Map an AWS SDK error onto the [`SchemaRegError`] with matching semantics.
@@ -39,7 +37,7 @@ mod codes {
 /// | `ServiceError` — `AlreadyExistsException` | [`SchemaRegError::Api`] (40902) | no |
 /// | `ServiceError` — `InvalidInputException` | [`SchemaRegError::Api`] (42201) | no |
 /// | `ServiceError` — throttling / 5xx | [`SchemaRegError::Http`] | yes |
-/// | `ServiceError` — anything else | [`SchemaRegError::Api`] (50001) | no |
+/// | `ServiceError` — anything else | [`SchemaRegError::Http`] (its status) | by status |
 pub(crate) fn map_sdk_error<E>(err: SdkError<E>) -> SchemaRegError
 where
     E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
@@ -95,10 +93,12 @@ fn classify_service_error(status: u16, code: &str, message: &str) -> SchemaRegEr
         401 | 403 => SchemaRegError::auth(status, detail),
         404 => SchemaRegError::api(codes::NOT_FOUND, detail),
         409 => SchemaRegError::api(codes::ALREADY_EXISTS, detail),
-        429 => SchemaRegError::http(429, detail),
-        // 5xx responses are transient by definition and are marked retryable.
-        500..=599 => SchemaRegError::http(status, detail),
-        _ => SchemaRegError::api(codes::UNCLASSIFIED, detail),
+        // An unrecognised code carries no more information than its status, so
+        // classify on that alone: `Http` is retryable for 429 and 5xx and not
+        // otherwise, which is exactly the desired reading. Inventing a
+        // Confluent-style code here would be worse than saying nothing — every
+        // spare code already means something specific to `is_retryable`.
+        _ => SchemaRegError::http(status, detail),
     }
 }
 
@@ -148,6 +148,21 @@ mod tests {
         assert!(classify_service_error(409, "SomethingNew", "conflict").is_api_error());
         assert!(classify_service_error(503, "SomethingNew", "down").is_retryable());
         assert!(!classify_service_error(400, "SomethingNew", "nope").is_retryable());
+    }
+
+    /// The synthetic codes borrowed from Confluent must not stray into the
+    /// `5xxxx` range, which `is_retryable` reads as "the registry is unwell".
+    /// A Glue 4xx classified with such a code would be retried forever.
+    #[test]
+    fn synthetic_codes_never_look_like_server_errors() {
+        for err in [
+            classify_service_error(400, "EntityNotFoundException", "x"),
+            classify_service_error(400, "AlreadyExistsException", "x"),
+            classify_service_error(400, "InvalidInputException", "x"),
+            classify_service_error(400, "SomethingNew", "x"),
+        ] {
+            assert!(!err.is_retryable(), "a 400 must never be retryable: {err}");
+        }
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! Run with `cargo bench --features glue`.
 //!
-//! These exist to turn the performance claims in `docs/performance.md` into
-//! measurements. The claims under test:
+//! These exist to turn the performance guide's claims into measurements. The
+//! claims under test:
 //!
 //! - Framing is allocation-light and scales linearly with payload size only.
 //! - A cache hit is `O(1)` in schema size — `Schema` holds `Arc<str>`, so

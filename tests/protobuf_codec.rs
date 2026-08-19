@@ -584,7 +584,7 @@ async fn java_produced_default_index_bytes_unframe() {
     ]);
 
     let unframed = decoder.unframe(&java_bytes).unwrap();
-    assert_eq!(unframed.schema_id, 42u32);
+    assert_eq!(unframed.key, 42u32);
     assert_eq!(unframed.message_indexes, vec![0]);
     assert_eq!(&unframed.payload[..], b"\x0a\x03abc");
 }

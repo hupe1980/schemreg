@@ -1,0 +1,63 @@
+# Zola configuration for the schemreg documentation site.
+#
+# Built and deployed by .github/workflows/pages.yml. Everything the site needs
+# is vendored under site/ — no theme, no CDN, no external font. That keeps the
+# page fast, keeps it working offline, and keeps a reader's browser from
+# announcing them to a third party on the way to a schema-registry guide.
+
+base_url = "https://hupe1980.github.io/schemreg"
+title = "schemreg"
+description = "Async schema registry client for Kafka in Rust — Confluent (schema ID, GUID, and header framing), Apicurio Registry v3, and AWS Glue, with Avro, JSON Schema, and Protobuf codecs."
+
+default_language = "en"
+compile_sass = true
+minify_html = true
+
+# Powers the ⌘K search overlay. Zola emits `search_index.en.js` and
+# `elasticlunr.min.js` next to the pages; `static/js/search.js` drives them.
+build_search_index = true
+
+generate_feeds = false
+taxonomies = []
+
+[markdown]
+insert_anchor_links = "right"
+smart_punctuation = false
+external_links_no_referrer = true
+
+[markdown.highlighting]
+# `class` emits CSS classes instead of inline colours, which is what lets the
+# same markup follow the light/dark theme toggle.
+style = "class"
+light_theme = "ayu-light"
+dark_theme = "ayu-dark"
+add_color_scheme = true
+error_on_missing_language = false
+
+[link_checker]
+# `zola check` validates every external link, which is how a link to Confluent's
+# or Apicurio's docs is caught when it rots. Our own API links are skipped: the
+# site is built from `main` and docs.rs only has the last *published* release,
+# so a link to an item added since would 404 until the next publish.
+skip_prefixes = ["https://docs.rs/schemreg"]
+
+[search]
+# Emits `search_index.en.js`, which assigns `window.searchIndex` — no fetch
+# needed, so search works from a `file://` build too.
+index_format = "elasticlunr_javascript"
+
+[extra]
+# ── Identity ───────────────────────────────────────────────────────────────
+tagline = "Kafka wire formats, exactly."
+subtitle = "An async Rust schema-registry client that speaks Confluent v0 and v1, Kafka-header schema IDs, and AWS Glue framing — verified byte-for-byte against the official serializers."
+crate_name = "schemreg"
+crate_version = "0.5"
+repo = "https://github.com/hupe1980/schemreg"
+repo_branch = "main"
+docs_rs = "https://docs.rs/schemreg"
+crates_io = "https://crates.io/crates/schemreg"
+author = "hupe1980"
+
+# ── SEO ────────────────────────────────────────────────────────────────────
+og_image = "img/og.png"
+keywords = "kafka, schema registry, rust, confluent, apicurio, aws glue, avro, protobuf, json schema, wire format, serde, async"

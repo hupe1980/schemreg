@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use schemreg::wire::DetectedWireFormat;
-use schemreg::{decode_wire_format_bytes, detect_wire_format};
+use schemreg::{SchemaKey, decode_wire_format_bytes, detect_wire_format};
 
 // ── Confluent wire-format adversarial inputs ──────────────────────────────
 
@@ -42,13 +42,50 @@ fn confluent_five_byte_header_empty_payload_is_confluent() {
     assert!(matches!(wf, DetectedWireFormat::Confluent { .. }), "{wf:?}");
 }
 
-/// Wrong magic byte (0x01): must be Unknown passthrough, not Confluent.
+/// `0x01` is the wire format v1 magic byte (schema GUID), not garbage: a
+/// 17-byte-or-longer buffer starting with it is a Confluent frame.
 #[test]
-fn confluent_wrong_magic_byte_is_unknown() {
-    let mut buf = vec![0x01u8; 100];
-    buf[0] = 0x01; // wrong magic
+fn confluent_v1_magic_byte_is_recognised() {
+    let buf = vec![0x01u8; 100];
     let wf = detect_wire_format(&Bytes::from(buf));
-    assert!(matches!(wf, DetectedWireFormat::Unknown), "{wf:?}");
+    assert!(
+        matches!(
+            wf,
+            DetectedWireFormat::Confluent {
+                key: SchemaKey::Guid(_),
+                payload_offset: 17,
+            }
+        ),
+        "{wf:?}"
+    );
+}
+
+/// A v1 frame shorter than the 17-byte prefix must be reported as truncated,
+/// never half-parsed into a GUID built from whatever bytes were present.
+#[test]
+fn confluent_v1_truncated_prefix_is_invalid() {
+    for len in 1..17usize {
+        let wf = detect_wire_format(&Bytes::from(vec![0x01u8; len]));
+        assert!(
+            matches!(wf, DetectedWireFormat::InvalidConfluent),
+            "len {len}: {wf:?}"
+        );
+    }
+}
+
+/// Magic bytes with no assigned meaning must stay Unknown, so a topic carrying
+/// unframed records is passed through rather than mis-decoded.
+#[test]
+fn unassigned_magic_bytes_are_unknown() {
+    for magic in [0x02u8, 0x04, 0x05, 0x7F, 0x80, 0xFF] {
+        let mut buf = vec![0u8; 100];
+        buf[0] = magic;
+        let wf = detect_wire_format(&Bytes::from(buf));
+        assert!(
+            matches!(wf, DetectedWireFormat::Unknown),
+            "magic 0x{magic:02X}: {wf:?}"
+        );
+    }
 }
 
 /// Schema ID all-zeros: parse must succeed (schema_id == 0).
@@ -57,7 +94,7 @@ fn confluent_schema_id_zero() {
     let buf = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x00, b'x']);
     let wf = detect_wire_format(&buf);
     assert!(
-        matches!(wf, DetectedWireFormat::Confluent { schema_id, .. } if schema_id.as_u32() == 0),
+        matches!(wf, DetectedWireFormat::Confluent { key, .. } if key == 0u32),
         "{wf:?}"
     );
 }
@@ -68,7 +105,7 @@ fn confluent_schema_id_max_u32() {
     let buf = Bytes::from_static(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, b'x']);
     let wf = detect_wire_format(&buf);
     assert!(
-        matches!(wf, DetectedWireFormat::Confluent { schema_id, .. } if schema_id.as_u32() == u32::MAX),
+        matches!(wf, DetectedWireFormat::Confluent { key, .. } if key == u32::MAX),
         "{wf:?}"
     );
 }
@@ -88,8 +125,8 @@ fn decode_wire_format_bytes_truncated_is_error() {
 #[test]
 fn decode_wire_format_bytes_header_only_empty_inner() {
     let buf = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x42]);
-    let (schema_id, inner) = decode_wire_format_bytes(&buf).expect("5-byte header is valid");
-    assert_eq!(schema_id.as_u32(), 0x42);
+    let (key, inner) = decode_wire_format_bytes(&buf).expect("5-byte header is valid");
+    assert_eq!(key, 0x42u32);
     assert!(inner.is_empty());
 }
 
@@ -99,7 +136,7 @@ fn confluent_all_zeros_parses_schema_id_zero() {
     let buf = Bytes::from(vec![0u8; 100]);
     let wf = detect_wire_format(&buf);
     assert!(
-        matches!(wf, DetectedWireFormat::Confluent { schema_id, .. } if schema_id.as_u32() == 0),
+        matches!(wf, DetectedWireFormat::Confluent { key, .. } if key == 0u32),
         "{wf:?}"
     );
 }

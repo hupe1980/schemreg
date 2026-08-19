@@ -16,9 +16,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use schemreg::{
-    CachedSchemaRegistry, CompatibilityLevel, Result, Schema, SchemaId, SchemaReference,
-    SchemaRegistryClient, SchemaType, SchemaVersion,
+    CachedSchemaRegistry, CompatibilityLevel, Result, Schema, SchemaGuid, SchemaId, SchemaKey,
+    SchemaReference, SchemaRegistryClient, SchemaType, SchemaVersion,
 };
+
+/// An arbitrary well-formed GUID; the minimal backend never resolves it.
+const GUID: SchemaGuid = SchemaGuid::from_bytes([0x11; 16]);
+
+/// A second GUID, so that `get_schema_by_key` is a distinct lookup from
+/// `get_schema_by_guid` — otherwise `CachedSchemaRegistry` correctly serves the
+/// second from cache and the delegation count comes up one short.
+const OTHER_GUID: SchemaGuid = SchemaGuid::from_bytes([0x22; 16]);
 
 // ── A backend that implements *only* the four required methods ────────────
 
@@ -69,10 +77,19 @@ async fn defaulted_methods_return_not_supported_and_are_not_retryable() {
                 .err(),
         ),
         (
-            "check_compatible",
-            r.check_compatible("s", "{}", SchemaType::Avro).await.err(),
+            "lookup_schema",
+            r.lookup_schema("s", "{}", SchemaType::Avro, &[])
+                .await
+                .err(),
         ),
+        ("get_schema_by_guid", r.get_schema_by_guid(GUID).await.err()),
         ("delete_subject", r.delete_subject("s", false).await.err()),
+        (
+            "delete_version",
+            r.delete_version("s", SchemaVersion::new(1), false)
+                .await
+                .err(),
+        ),
         ("get_subjects", r.get_subjects().await.err()),
         ("get_versions", r.get_versions("s").await.err()),
         ("health_check", r.health_check().await.err()),
@@ -108,7 +125,7 @@ async fn required_methods_work_on_a_minimal_backend() {
     let r = MinimalRegistry;
     assert_eq!(
         r.get_schema_by_id(SchemaId::from(7u32)).await.unwrap().id,
-        7u32
+        Some(SchemaId::from(7u32))
     );
     assert_eq!(
         r.get_latest_schema("orders-value")
@@ -192,6 +209,36 @@ impl SchemaRegistryClient for CountingRegistry {
         self.hit();
         Ok(true)
     }
+    async fn get_schema_by_guid(&self, guid: SchemaGuid) -> Result<Arc<Schema>> {
+        self.hit();
+        Ok(Arc::new(Schema::new(guid, SchemaType::Avro, r#""string""#)))
+    }
+    async fn get_schema_by_key(&self, key: SchemaKey) -> Result<Arc<Schema>> {
+        self.hit();
+        Ok(Arc::new(Schema::new(key, SchemaType::Avro, r#""string""#)))
+    }
+    async fn lookup_schema(
+        &self,
+        subject: &str,
+        _: &str,
+        _: SchemaType,
+        _: &[SchemaReference],
+    ) -> Result<Option<Arc<Schema>>> {
+        self.hit();
+        Ok(Some(Arc::new(
+            Schema::new(SchemaId::from(1u32), SchemaType::Avro, r#""string""#)
+                .with_subject(subject, 1i32),
+        )))
+    }
+    async fn delete_version(
+        &self,
+        _: &str,
+        version: SchemaVersion,
+        _: bool,
+    ) -> Result<SchemaVersion> {
+        self.hit();
+        Ok(version)
+    }
     async fn delete_subject(&self, _: &str, _: bool) -> Result<Vec<SchemaVersion>> {
         self.hit();
         Ok(vec![SchemaVersion::new(1)])
@@ -243,8 +290,17 @@ async fn exercise_all<C: SchemaRegistryClient>(c: &C, label: &str) {
         c.check_compatibility("s", "{}", SchemaType::Avro, &[])
     );
     ok!(
-        "check_compatible",
-        c.check_compatible("s", "{}", SchemaType::Avro)
+        "lookup_schema",
+        c.lookup_schema("s", "{}", SchemaType::Avro, &[])
+    );
+    ok!(
+        "delete_version",
+        c.delete_version("s", SchemaVersion::new(1), false)
+    );
+    ok!("get_schema_by_guid", c.get_schema_by_guid(GUID));
+    ok!(
+        "get_schema_by_key",
+        c.get_schema_by_key(SchemaKey::Guid(OTHER_GUID))
     );
     ok!("delete_subject", c.delete_subject("s", false));
     ok!("get_subjects", c.get_subjects());
@@ -257,14 +313,16 @@ async fn exercise_all<C: SchemaRegistryClient>(c: &C, label: &str) {
     ok!("get_compatibility", c.get_compatibility("s"));
 }
 
-/// Twelve trait methods, exercised through every wrapper in the crate.
-const TRAIT_METHOD_COUNT: u32 = 12;
+/// Every trait method, exercised through every wrapper in the crate.
+///
+/// Bump this together with the macro list in `src/traits.rs`: a wrapper that
+/// forgot to forward a new method shows up here as a count mismatch.
+const TRAIT_METHOD_COUNT: u32 = 15;
 
 #[tokio::test]
 async fn reference_wrapper_delegates_every_method() {
     let inner = CountingRegistry::default();
     exercise_all(&&inner, "&T").await;
-    // check_compatible delegates to check_compatibility, so it costs one call too.
     assert_eq!(inner.count(), TRAIT_METHOD_COUNT);
 }
 
@@ -316,9 +374,10 @@ mod dyn_object_safety {
                 .unwrap()
         );
         assert!(
-            DynSchemaRegistryClient::check_compatible(c, "s", "{}", SchemaType::Avro)
+            DynSchemaRegistryClient::lookup_schema(c, "s", "{}", SchemaType::Avro, &[])
                 .await
                 .unwrap()
+                .is_some()
         );
         assert_eq!(
             DynSchemaRegistryClient::delete_subject(c, "s", true)
@@ -388,7 +447,10 @@ async fn trait_futures_are_send_and_spawnable() {
         let client = Arc::clone(&client);
         async move { SchemaRegistryClient::get_schema_by_id(&client, SchemaId::from(5u32)).await }
     });
-    assert_eq!(handle.await.unwrap().unwrap().id, 5u32);
+    assert_eq!(
+        handle.await.unwrap().unwrap().id,
+        Some(SchemaId::from(5u32))
+    );
 }
 
 // ── Error taxonomy ────────────────────────────────────────────────────────
@@ -430,5 +492,9 @@ fn not_found_covers_the_confluent_code_range_only() {
     for code in [40400, 40404, 42201, 50001] {
         assert!(!SchemaRegError::api(code, "x").is_not_found(), "{code}");
     }
-    assert!(!SchemaRegError::http(404, "x").is_not_found());
+    // A bare 404 carries no error code but means the same thing — a proxy, a
+    // gateway, or a registry that never implemented the route answers this way,
+    // and `lookup_schema` must still report `Ok(None)` for it.
+    assert!(SchemaRegError::http(404, "x").is_not_found());
+    assert!(!SchemaRegError::http(410, "x").is_not_found());
 }

@@ -17,7 +17,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.4", features = ["json"] }
+//! schemreg = { version = "0.5", features = ["json"] }
 //! ```
 //!
 //! # Layered model
@@ -71,29 +71,194 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::cache_inner::InMemoryCache;
-use crate::codec_cache::{DEFAULT_MAX_SUBJECT_CACHE_ENTRIES, subject_resolution_cancelled};
 use crate::error::{Result, SchemaRegError};
+use crate::resolver::{
+    DEFAULT_MAX_SUBJECT_CACHE_ENTRIES, Framing, SchemaResolution, resolve_schema_key,
+    subject_resolution_cancelled,
+};
 use crate::subject::SubjectNameStrategy;
 use crate::traits::SchemaRegistryClient;
-use crate::types::{EncodeTarget, SchemaId, SchemaReference, SchemaType};
-use crate::wire::{decode_wire_format_bytes, encode_wire_format};
+use crate::types::{EncodeTarget, SchemaId, SchemaKey, SchemaReference, SchemaType};
+use crate::wire::{HeaderFramed, decode_wire_format_bytes, encode_wire_format};
 
 /// Default bound on the number of compiled JSON Schema validators a
 /// [`JsonSchemaDecoder`] keeps in memory.
 pub const DEFAULT_MAX_JSON_VALIDATOR_CACHE_ENTRIES: usize = 1000;
 
+/// Maximum depth the reference resolver will follow.
+///
+/// Nothing in the Confluent API forbids a reference cycle `A → B → A`, and
+/// following one would recurse until the stack ran out.
+const MAX_REFERENCE_DEPTH: usize = 32;
+
+/// Maximum number of referenced schemas resolved for a single root schema.
+const MAX_REFERENCES: usize = 256;
+
+// ── Reference resolution ──────────────────────────────────────────────────
+
+/// The referenced schemas a root schema needs, indexed by the `$ref` strings
+/// that can reach them.
+///
+/// Confluent stores a referencing JSON Schema exactly as written, so a document
+/// whose `$ref` points at `https://example.com/address.json` is **not**
+/// compilable on its own — the target lives under another subject.
+/// [`SchemaReference::name`](crate::SchemaReference::name) is that `$ref`
+/// string, so the reference list is the map from `$ref` to subject.
+///
+/// `jsonschema` resolves a relative `$ref` against a base URI before asking the
+/// retriever, so `"address.json"` arrives as `json-schema:///address.json`.
+/// Every dependency is therefore indexed twice — under its declared name and
+/// under that name's final path segment — and lookup tries the full URI first,
+/// then its final segment.
+#[derive(Debug, Default)]
+struct ReferenceSet {
+    by_key: std::collections::HashMap<String, Value>,
+}
+
+impl ReferenceSet {
+    fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+    }
+
+    /// Index `schema` under `name` and under `name`'s final path segment.
+    fn insert(&mut self, name: &str, schema: Value) -> Result<()> {
+        if self.by_key.len() >= MAX_REFERENCES * 2 {
+            return Err(SchemaRegError::config(format!(
+                "JSON Schema pulls in more than {MAX_REFERENCES} referenced schemas"
+            )));
+        }
+        if let Some(tail) = last_segment(name)
+            && tail != name
+        {
+            self.by_key
+                .entry(tail.to_string())
+                .or_insert(schema.clone());
+        }
+        self.by_key.insert(name.to_string(), schema);
+        Ok(())
+    }
+
+    fn lookup(&self, uri: &str) -> Option<&Value> {
+        self.by_key
+            .get(uri)
+            .or_else(|| self.by_key.get(last_segment(uri)?))
+    }
+}
+
+/// The part of `s` after the last `/`, if there is one.
+fn last_segment(s: &str) -> Option<&str> {
+    s.rsplit_once('/').map(|(_, tail)| tail)
+}
+
+impl jsonschema::Retrieve for ReferenceSet {
+    fn retrieve(
+        &self,
+        uri: &jsonschema::Uri<String>,
+    ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let key = uri.to_string();
+        self.lookup(&key).cloned().ok_or_else(|| {
+            format!(
+                "JSON Schema reference '{key}' was not supplied. Register it under a subject \
+                 and name it in the schema's `references` list, or pass it to \
+                 JsonSchemaEncoderBuilder::dependencies"
+            )
+            .into()
+        })
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Compile a JSON Schema string into a [`Validator`].
+/// Compile a JSON Schema together with the schemas it references.
 ///
 /// Uses the most recent draft supported by the document's `$schema` keyword
-/// (falling back to draft 2020-12 when absent).  Errors are mapped to
+/// (falling back to draft 2020-12 when absent). Errors are mapped to
 /// [`SchemaRegError::config`].
-fn compile_schema(schema_str: &str) -> Result<Validator> {
+///
+/// Remote retrieval stays impossible: `jsonschema` is built without
+/// `resolve-http`, and the retriever installed here only ever answers from
+/// `refs`. A `$ref` to a URL nobody supplied is a compile error, not an
+/// outbound request.
+fn compile_schema_with_refs(schema_str: &str, refs: ReferenceSet) -> Result<Validator> {
     let schema: Value = serde_json::from_str(schema_str)
         .map_err(|e| SchemaRegError::config(format!("invalid JSON Schema (parse): {e}")))?;
-    jsonschema::validator_for(&schema)
-        .map_err(|e| SchemaRegError::config(format!("invalid JSON Schema (compile): {e}")))
+    if refs.is_empty() {
+        return jsonschema::validator_for(&schema)
+            .map_err(|e| SchemaRegError::config(format!("invalid JSON Schema (compile): {e}")));
+    }
+    jsonschema::options()
+        .with_retriever(refs)
+        .build(&schema)
+        .map_err(|e| {
+            SchemaRegError::config(format!(
+                "invalid JSON Schema (compile, with referenced schemas): {e}"
+            ))
+        })
+}
+
+/// Parse each `(name, schema JSON)` pair into a [`ReferenceSet`].
+fn reference_set_from_pairs(deps: &[(String, String)]) -> Result<ReferenceSet> {
+    let mut set = ReferenceSet::default();
+    for (name, schema) in deps {
+        let value: Value = serde_json::from_str(schema).map_err(|e| {
+            SchemaRegError::config(format!(
+                "invalid JSON Schema for referenced schema '{name}': {e}"
+            ))
+        })?;
+        set.insert(name, value)?;
+    }
+    Ok(set)
+}
+
+/// Depth-first fetch of every schema transitively referenced by `references`.
+///
+/// Mirrors the Avro resolver: visited `(subject, version)` pairs are tracked, so
+/// a diamond dependency is fetched once and a cycle terminates instead of
+/// recursing forever.
+async fn collect_reference_closure<C: SchemaRegistryClient>(
+    registry: &C,
+    references: &[SchemaReference],
+    depth: usize,
+    visited: &mut std::collections::HashSet<(String, i32)>,
+    out: &mut ReferenceSet,
+) -> Result<()> {
+    if references.is_empty() {
+        return Ok(());
+    }
+    if depth >= MAX_REFERENCE_DEPTH {
+        return Err(SchemaRegError::config(format!(
+            "JSON Schema references nest deeper than {MAX_REFERENCE_DEPTH} levels; \
+             the registry likely contains a reference cycle"
+        )));
+    }
+
+    for reference in references {
+        if !visited.insert((reference.subject.clone(), reference.version.as_i32())) {
+            continue;
+        }
+
+        let referenced = registry
+            .get_schema_by_version(&reference.subject, reference.version)
+            .await?;
+
+        Box::pin(collect_reference_closure(
+            registry,
+            &referenced.references,
+            depth + 1,
+            visited,
+            out,
+        ))
+        .await?;
+
+        let value: Value = serde_json::from_str(&referenced.schema).map_err(|e| {
+            SchemaRegError::config(format!(
+                "referenced schema '{}' (subject '{}') is not valid JSON: {e}",
+                reference.name, reference.subject
+            ))
+        })?;
+        out.insert(&reference.name, value)?;
+    }
+    Ok(())
 }
 
 /// Validate a JSON value against a compiled `Validator`, collecting all errors.
@@ -119,7 +284,7 @@ fn validate(validator: &Validator, value: &Value) -> Result<()> {
 
 /// Cached subject-resolution entry for the encoder.
 struct EncoderEntry {
-    schema_id: SchemaId,
+    key: SchemaKey,
     /// Compiled validator shared across encode calls — no re-compilation.
     validator: Arc<Validator>,
 }
@@ -155,7 +320,9 @@ pub struct JsonSchemaEncoder<C> {
     strategy: SubjectNameStrategy,
     references: Vec<SchemaReference>,
     validate_on_encode: bool,
-    /// Bounded, coalescing `subject → (schema_id, compiled validator)` cache.
+    resolution: SchemaResolution,
+    framing: Framing,
+    /// Bounded, coalescing `subject → (identifier, compiled validator)` cache.
     cache: InMemoryCache<String, EncoderEntry>,
 }
 
@@ -166,6 +333,8 @@ impl<C: std::fmt::Debug> std::fmt::Debug for JsonSchemaEncoder<C> {
             .field("record_name", &self.record_name)
             .field("strategy", &self.strategy)
             .field("validate_on_encode", &self.validate_on_encode)
+            .field("resolution", &self.resolution)
+            .field("framing", &self.framing)
             .finish_non_exhaustive()
     }
 }
@@ -176,21 +345,30 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoder<C> {
         JsonSchemaEncoderBuilder::new()
     }
 
-    /// Return the cached schema ID for `subject`, if it has been resolved.
+    /// Return the cached identifier for `subject`, if it has been resolved.
     ///
     /// Returns `None` for subjects not yet encountered or not yet resolved.
     /// Useful for observability without triggering a registration.
     #[must_use]
-    pub fn cached_schema_id(&self, subject: &str) -> Option<SchemaId> {
-        self.cache.get(&subject.to_string()).map(|e| e.schema_id)
+    pub fn cached_schema_key(&self, subject: &str) -> Option<SchemaKey> {
+        self.cache.get(&subject.to_string()).map(|e| e.key)
     }
 
-    /// Number of `subject → schema ID` mappings currently cached.
+    /// Return the cached schema ID for `subject`, if it has been resolved
+    /// **and** framed as a numeric ID (`None` under [`Framing::SchemaGuid`]).
+    #[must_use]
+    pub fn cached_schema_id(&self, subject: &str) -> Option<SchemaId> {
+        self.cached_schema_key(subject).and_then(SchemaKey::as_id)
+    }
+
+    /// Number of `subject → identifier` mappings currently cached.
     pub fn cached_subject_count(&self) -> usize {
         self.cache.len()
     }
 
-    /// Forget the cached schema ID for `subject`.
+    /// Forget the cached identifier for `subject`, forcing the next encode to
+    /// resolve it again — the way to pick up a newer version under
+    /// [`SchemaResolution::UseLatestVersion`] without a restart.
     pub fn invalidate_subject(&self, subject: &str) {
         self.cache.invalidate(&subject.to_string());
     }
@@ -203,21 +381,44 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoder<C> {
     async fn resolve_subject(&self, subject: &str) -> Result<Arc<EncoderEntry>> {
         self.cache
             .get_or_fetch(subject.to_string(), || async {
-                let schema_id = self
-                    .registry
-                    .register_schema(
-                        subject,
-                        &self.schema_str,
-                        SchemaType::Json,
-                        &self.references,
-                    )
-                    .await?;
+                let key = resolve_schema_key(
+                    &self.registry,
+                    self.resolution,
+                    self.framing,
+                    subject,
+                    &self.schema_str,
+                    SchemaType::Json,
+                    &self.references,
+                )
+                .await?;
                 Ok(Arc::new(EncoderEntry {
-                    schema_id,
+                    key,
                     validator: Arc::clone(&self.validator),
                 }))
             })
             .await
+    }
+
+    /// Serialise `value` and its subject's identifier, validating and framing
+    /// exactly as [`encode`](Self::encode) does.
+    async fn serialise(
+        &self,
+        value: &Value,
+        topic: &str,
+        target: EncodeTarget,
+    ) -> Result<(SchemaKey, Vec<u8>)> {
+        let subject = self
+            .strategy
+            .subject_name(topic, self.record_name.as_deref(), target)?;
+        let entry = self.resolve_subject(&subject).await?;
+
+        if self.validate_on_encode {
+            validate(&entry.validator, value)?;
+        }
+
+        let raw = serde_json::to_vec(value)
+            .map_err(|e| SchemaRegError::wire_format(format!("JSON serialization failed: {e}")))?;
+        Ok((entry.key, raw))
     }
 
     /// Serialise `value` to Confluent-framed JSON bytes.
@@ -231,18 +432,28 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoder<C> {
     /// - Validation errors if `validate_on_encode` is `true` and `value` is invalid.
     /// - Serialisation errors (should not occur for well-formed `serde_json::Value`).
     pub async fn encode(&self, value: &Value, topic: &str, target: EncodeTarget) -> Result<Bytes> {
-        let subject = self
-            .strategy
-            .subject_name(topic, self.record_name.as_deref(), target)?;
-        let entry = self.resolve_subject(&subject).await?;
+        let (key, raw) = self.serialise(value, topic, target).await?;
+        Ok(encode_wire_format(key, &raw))
+    }
 
-        if self.validate_on_encode {
-            validate(&entry.validator, value)?;
-        }
-
-        let raw = serde_json::to_vec(value)
-            .map_err(|e| SchemaRegError::wire_format(format!("JSON serialization failed: {e}")))?;
-        Ok(encode_wire_format(entry.schema_id, &raw))
+    /// Serialise `value` with the identifier in a Kafka header instead of in
+    /// the payload prefix.
+    ///
+    /// The returned [`HeaderFramed`] carries the header name, the header value,
+    /// and an **unprefixed** JSON payload — write all three, or a consumer
+    /// cannot recover the schema.
+    ///
+    /// # Errors
+    ///
+    /// As [`encode`](Self::encode).
+    pub async fn encode_with_header(
+        &self,
+        value: &Value,
+        topic: &str,
+        target: EncodeTarget,
+    ) -> Result<HeaderFramed> {
+        let (key, raw) = self.serialise(value, topic, target).await?;
+        Ok(HeaderFramed::new(target, key, None, Bytes::from(raw)))
     }
 
     /// Serialise any `serde::Serialize` value to Confluent-framed JSON bytes.
@@ -274,10 +485,13 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoder<C> {
 pub struct JsonSchemaEncoderBuilder<C> {
     registry: Option<C>,
     schema: Option<String>,
+    dependencies: Vec<(String, String)>,
     record_name: Option<String>,
     strategy: SubjectNameStrategy,
     references: Vec<SchemaReference>,
     validate_on_encode: bool,
+    resolution: SchemaResolution,
+    framing: Framing,
     max_subject_cache_entries: usize,
 }
 
@@ -286,12 +500,28 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoderBuilder<C> {
         Self {
             registry: None,
             schema: None,
+            dependencies: Vec::new(),
             record_name: None,
             strategy: SubjectNameStrategy::TopicName,
             references: Vec::new(),
             validate_on_encode: true,
+            resolution: SchemaResolution::default(),
+            framing: Framing::default(),
             max_subject_cache_entries: DEFAULT_MAX_SUBJECT_CACHE_ENTRIES,
         }
+    }
+
+    /// Choose how a subject resolves to an identifier
+    /// (default: [`SchemaResolution::AutoRegister`]).
+    pub fn resolution(mut self, resolution: SchemaResolution) -> Self {
+        self.resolution = resolution;
+        self
+    }
+
+    /// Choose the wire-format version (default: [`Framing::SchemaId`], v0).
+    pub fn framing(mut self, framing: Framing) -> Self {
+        self.framing = framing;
+        self
     }
 
     /// Bound the `subject → schema ID` cache (default:
@@ -336,8 +566,55 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoderBuilder<C> {
     }
 
     /// Set schema references (default: empty).
+    ///
+    /// Needed when the JSON Schema `$ref`s a document registered under another
+    /// subject. These are sent to the registry so it can resolve them
+    /// server-side; pair them with [`dependencies`](Self::dependencies), which
+    /// supplies the same documents for local compilation.
     pub fn references(mut self, references: Vec<SchemaReference>) -> Self {
         self.references = references;
+        self
+    }
+
+    /// Supply the JSON of every schema this one `$ref`s, as `(name, schema)`
+    /// pairs.
+    ///
+    /// A document with an external `$ref` cannot be compiled from
+    /// [`schema`](Self::schema) alone, so validation on encode would fail at
+    /// `build()` without this. `name` is the `$ref` string as it appears in the
+    /// schema — the same value that goes in
+    /// [`SchemaReference::name`](crate::SchemaReference::name).
+    ///
+    /// Order does not matter: unlike Avro, JSON Schema resolves by URI rather
+    /// than by declaration order.
+    ///
+    /// ```rust,no_run
+    /// # use schemreg::{JsonSchemaEncoder, SchemaReference, SchemaRegistryClient};
+    /// # fn build<C: SchemaRegistryClient>(registry: C) -> schemreg::Result<()> {
+    /// const ADDRESS: &str = r#"{"type":"object","properties":{"city":{"type":"string"}}}"#;
+    /// const ORDER: &str = r#"{"type":"object","properties":{
+    ///     "shipTo":{"$ref":"https://example.com/address.json"}}}"#;
+    ///
+    /// let encoder = JsonSchemaEncoder::builder()
+    ///     .registry(registry)
+    ///     .schema(ORDER)
+    ///     .dependencies([("https://example.com/address.json", ADDRESS)])
+    ///     .references(vec![SchemaReference::new(
+    ///         "https://example.com/address.json", "address-value", 1i32,
+    ///     )])
+    ///     .build()?;
+    /// # let _ = encoder;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn dependencies(
+        mut self,
+        schemas: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.dependencies = schemas
+            .into_iter()
+            .map(|(name, schema)| (name.into(), schema.into()))
+            .collect();
         self
     }
 
@@ -363,7 +640,10 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoderBuilder<C> {
         let schema_str = self
             .schema
             .ok_or_else(|| SchemaRegError::config("JsonSchemaEncoder: schema must be set"))?;
-        let validator = Arc::new(compile_schema(&schema_str)?);
+        let validator = Arc::new(compile_schema_with_refs(
+            &schema_str,
+            reference_set_from_pairs(&self.dependencies)?,
+        )?);
         Ok(JsonSchemaEncoder {
             registry,
             schema_str,
@@ -372,6 +652,8 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoderBuilder<C> {
             strategy: self.strategy,
             references: self.references,
             validate_on_encode: self.validate_on_encode,
+            resolution: self.resolution,
+            framing: self.framing,
             cache: InMemoryCache::new(
                 Some(self.max_subject_cache_entries.max(1)),
                 subject_resolution_cancelled,
@@ -401,6 +683,17 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoderBuilder<C> {
 /// Enable it in integration test environments or for strict conformance
 /// pipelines.
 ///
+/// # Schema references
+///
+/// A schema whose `$ref` points at another subject is stored by the registry
+/// exactly as written and is not compilable alone. When validation is enabled,
+/// the decoder fetches the transitive closure of
+/// [`Schema::references`](crate::Schema::references) and compiles the set
+/// together. A diamond is fetched once per subject, and a cycle terminates
+/// instead of recursing — a recursive `$ref` is legal JSON Schema, so it is
+/// compiled rather than rejected. This happens once per schema identifier and
+/// is cached alongside the validator.
+///
 /// # Serde support
 ///
 /// Use [`decode_de`](Self::decode_de) to deserialise directly into a
@@ -408,7 +701,7 @@ impl<C: SchemaRegistryClient> JsonSchemaEncoderBuilder<C> {
 pub struct JsonSchemaDecoder<C> {
     registry: C,
     validate_on_decode: bool,
-    schema_cache: InMemoryCache<SchemaId, Validator>,
+    schema_cache: InMemoryCache<SchemaKey, Validator>,
 }
 
 impl<C> std::fmt::Debug for JsonSchemaDecoder<C> {
@@ -420,9 +713,9 @@ impl<C> std::fmt::Debug for JsonSchemaDecoder<C> {
     }
 }
 
-fn json_validator_lookup_cancelled(id: &SchemaId) -> SchemaRegError {
+fn json_validator_lookup_cancelled(key: &SchemaKey) -> SchemaRegError {
     SchemaRegError::invalid_state(format!(
-        "JSON Schema validator lookup cancelled before completion for schema id {id}"
+        "JSON Schema validator lookup cancelled before completion for schema {key}"
     ))
 }
 
@@ -477,11 +770,21 @@ impl<C: SchemaRegistryClient> JsonSchemaDecoder<C> {
         self.schema_cache.clear();
     }
 
-    async fn get_validator(&self, id: SchemaId) -> Result<Arc<Validator>> {
+    async fn get_validator(&self, key: SchemaKey) -> Result<Arc<Validator>> {
         self.schema_cache
-            .get_or_fetch(id, || async move {
-                let registry_schema = self.registry.get_schema_by_id(id).await?;
-                compile_schema(&registry_schema.schema).map(Arc::new)
+            .get_or_fetch(key, || async move {
+                let registry_schema = self.registry.get_schema_by_key(key).await?;
+                let mut refs = ReferenceSet::default();
+                let mut visited = std::collections::HashSet::new();
+                collect_reference_closure(
+                    &self.registry,
+                    &registry_schema.references,
+                    0,
+                    &mut visited,
+                    &mut refs,
+                )
+                .await?;
+                compile_schema_with_refs(&registry_schema.schema, refs).map(Arc::new)
             })
             .await
     }
@@ -495,14 +798,14 @@ impl<C: SchemaRegistryClient> JsonSchemaDecoder<C> {
     /// - JSON parse failure.
     /// - Validation failure when `validate_on_decode` is `true`.
     pub async fn decode(&self, data: Bytes) -> Result<Value> {
-        let (schema_id, payload) = decode_wire_format_bytes(&data)?;
+        let (key, payload) = decode_wire_format_bytes(&data)?;
 
         let value: Value = serde_json::from_slice(&payload).map_err(|e| {
             SchemaRegError::wire_format(format!("JSON deserialisation failed: {e}"))
         })?;
 
         if self.validate_on_decode {
-            let validator = self.get_validator(schema_id).await?;
+            let validator = self.get_validator(key).await?;
             validate(&validator, &value)?;
         }
 
@@ -534,10 +837,13 @@ impl<C> std::fmt::Debug for JsonSchemaEncoderBuilder<C> {
         f.debug_struct("JsonSchemaEncoderBuilder")
             .field("registry", &self.registry.is_some())
             .field("schema_set", &self.schema.is_some())
+            .field("dependencies", &self.dependencies.len())
             .field("record_name", &self.record_name)
             .field("strategy", &self.strategy)
             .field("references", &self.references.len())
             .field("validate_on_encode", &self.validate_on_encode)
+            .field("resolution", &self.resolution)
+            .field("framing", &self.framing)
             .finish()
     }
 }

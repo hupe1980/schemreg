@@ -165,7 +165,7 @@ fn confluent_protobuf_decoder_matches_golden() {
 
     let (indexes, offset) = decode_protobuf_message_indexes(after_header)
         .expect("canonical message-index must decode cleanly");
-    assert_eq!(indexes, vec![0i32], "count 0 must decode back to path [0]");
+    assert_eq!(indexes, vec![0u32], "count 0 must decode back to path [0]");
     assert_eq!(
         &after_header[offset..],
         b"proto",
@@ -198,7 +198,7 @@ fn confluent_protobuf_index_1_golden() {
     let (id, after_header) = decode_wire_format(CONFLUENT_PROTO_IDX1_GOLDEN).unwrap();
     assert_eq!(id, 42u32);
     let (indexes, offset) = decode_protobuf_message_indexes(after_header).unwrap();
-    assert_eq!(indexes, vec![1i32]);
+    assert_eq!(indexes, vec![1u32]);
     assert_eq!(&after_header[offset..], b"data");
 }
 
@@ -217,7 +217,7 @@ fn confluent_protobuf_index_2_golden() {
 
     let (_, after_header) = decode_wire_format(CONFLUENT_PROTO_IDX2_GOLDEN).unwrap();
     let (indexes, offset) = decode_protobuf_message_indexes(after_header).unwrap();
-    assert_eq!(indexes, vec![2i32]);
+    assert_eq!(indexes, vec![2u32]);
     assert_eq!(&after_header[offset..], b"y");
 }
 
@@ -240,7 +240,7 @@ fn confluent_protobuf_nested_path_golden() {
     let (id, after_header) = decode_wire_format(CONFLUENT_PROTO_NESTED_GOLDEN).unwrap();
     assert_eq!(id, 100u32);
     let (indexes, offset) = decode_protobuf_message_indexes(after_header).unwrap();
-    assert_eq!(indexes, vec![0i32, 1i32]);
+    assert_eq!(indexes, vec![0u32, 1u32]);
     assert_eq!(&after_header[offset..], b"nest");
 }
 
@@ -261,28 +261,34 @@ fn confluent_protobuf_three_deep_path_golden() {
 
     let (_, after_header) = decode_wire_format(CONFLUENT_PROTO_DEEP_GOLDEN).unwrap();
     let (indexes, offset) = decode_protobuf_message_indexes(after_header).unwrap();
-    assert_eq!(indexes, vec![2i32, 0i32, 1i32]);
+    assert_eq!(indexes, vec![2u32, 0u32, 1u32]);
     assert_eq!(&after_header[offset..], b"d");
 }
 
-/// ZigZag encoding spec: for small negative values the encoding stays compact.
-///
-/// ZigZag(-1) = 1, ZigZag(-2) = 3, ZigZag(-3) = 5
+/// A hand-built frame carrying ZigZag(-1)=1 as its single index — the shape a
+/// non-conforming serializer produces. Nothing in this crate can emit it.
 const CONFLUENT_PROTO_NEG_INDEX_GOLDEN: &[u8] = &[
     0x00, 0x00, 0x00, 0x00, 0x01, // magic + schema_id = 1
     0x02, 0x01, // ZigZag(count=1)=2, ZigZag(-1)=1
     b'x',
 ];
 
+/// A frame whose message index ZigZag-decodes to a negative number must be
+/// rejected.
+///
+/// A message index is a position in a `FileDescriptorProto.message_type` or
+/// `DescriptorProto.nested_type` list, so it is never negative — which is why
+/// this crate types message indexes as `u32` and the encoder cannot produce
+/// these bytes at all. Confluent's Java decoder reads the varint without
+/// checking and only fails later, when resolving the message type; rejecting it
+/// at the framing boundary turns a confusing downstream error into a precise
+/// one. A deliberate divergence, and one no conforming producer can trip.
 #[test]
-fn confluent_protobuf_negative_index_zigzag_golden() {
-    // ZigZag(-1) = 1; the spec supports negative indices (reserved for future use)
-    let encoded = encode_protobuf_wire_format(1u32, &[-1], b"x");
-    assert_eq!(encoded.as_ref(), CONFLUENT_PROTO_NEG_INDEX_GOLDEN);
-
+fn confluent_protobuf_rejects_a_negative_index_segment() {
     let (_, after_header) = decode_wire_format(CONFLUENT_PROTO_NEG_INDEX_GOLDEN).unwrap();
-    let (indexes, _) = decode_protobuf_message_indexes(after_header).unwrap();
-    assert_eq!(indexes, vec![-1i32]);
+    let err = decode_protobuf_message_indexes(after_header)
+        .expect_err("a negative message index must be rejected");
+    assert!(err.to_string().contains("negative"), "{err}");
 }
 
 /// A plain (non-ZigZag) count — what a non-conforming encoder emits for

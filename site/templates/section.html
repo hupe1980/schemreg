@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block body_class %}docs{% endblock body_class %}
+
+{% block content %}
+<div class="docs-shell">
+  {% include "partials/sidebar.html" %}
+
+  <main id="main" class="docs-main">
+    <nav class="breadcrumbs" aria-label="Breadcrumb">
+      <ol>
+        <li><a href="{{ get_url(path='/') | safe }}">Home</a></li>
+        <li aria-current="page">{{ section.title }}</li>
+      </ol>
+    </nav>
+
+    <article class="prose">
+      <header class="page-head">
+        <h1>{{ section.title }}</h1>
+        {% if section.description %}<p class="page-desc">{{ section.description }}</p>{% endif %}
+      </header>
+      {{ section.content | safe }}
+
+      <div class="card-grid">
+        {% for p in section.pages %}
+        <a class="doc-card" href="{{ p.permalink | safe }}">
+          <h2>{{ p.title }}</h2>
+          <p>{{ p.description }}</p>
+        </a>
+        {% endfor %}
+      </div>
+    </article>
+  </main>
+
+  <aside class="toc" aria-hidden="true"></aside>
+</div>
+{% endblock content %}

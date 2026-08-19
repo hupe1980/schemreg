@@ -124,7 +124,7 @@ async fn decode_confluent_framed_returns_schema() {
     let Some(SchemaMetadata::Confluent(schema)) = decoded.schema_metadata else {
         panic!("expected Confluent schema metadata");
     };
-    assert_eq!(schema.id, 42u32);
+    assert_eq!(schema.id, Some(SchemaId::from(42u32)));
 }
 
 #[tokio::test]
@@ -301,15 +301,15 @@ async fn decoder_with_confluent_and_glue_glue_path() {
     ));
 }
 
-// ── SchemaDecoder trait object ────────────────────────────────────────────
+// ── PayloadDecoder trait object ────────────────────────────────────────────
 
 /// `WireFormatDecoder` is the crate's object-safe framing stripper. Without an
-/// implementor, `SchemaDecoder` would be a trait nobody could use.
+/// implementor, `PayloadDecoder` would be a trait nobody could use.
 #[tokio::test]
 async fn wire_format_decoder_is_usable_as_a_schema_decoder_trait_object() {
-    use schemreg::{EncodeTarget, SchemaDecoder};
+    use schemreg::{EncodeTarget, PayloadDecoder};
 
-    let decoder: Arc<dyn SchemaDecoder> =
+    let decoder: Arc<dyn PayloadDecoder> =
         Arc::new(WireFormatDecoder::confluent(MockConfluentRegistry {
             schema: avro_schema(1),
         }));
@@ -330,6 +330,6 @@ async fn wire_format_decoder_is_usable_as_a_schema_decoder_trait_object() {
 #[test]
 fn schema_decoder_trait_object_is_send_sync() {
     fn assert_send_sync<T: Send + Sync + ?Sized>() {}
-    assert_send_sync::<dyn schemreg::SchemaDecoder>();
-    assert_send_sync::<dyn schemreg::SchemaEncoder>();
+    assert_send_sync::<dyn schemreg::PayloadDecoder>();
+    assert_send_sync::<dyn schemreg::PayloadEncoder>();
 }

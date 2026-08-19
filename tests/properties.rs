@@ -151,11 +151,11 @@ proptest! {
     }
 
     /// Every message-index path the encoder accepts must survive the decoder,
-    /// including negative values and the i32 extremes.
+    /// across the whole `u32` range including the extremes.
     #[test]
     fn protobuf_index_round_trip(
         id: u32,
-        indexes in prop::collection::vec(any::<i32>(), 1..12),
+        indexes in prop::collection::vec(any::<u32>(), 1..12),
         payload: Vec<u8>,
     ) {
         let framed = encode_protobuf_wire_format(id, &indexes, &payload);
@@ -208,10 +208,10 @@ proptest! {
     #[test]
     fn detection_agrees_with_confluent_decoding(data: Vec<u8>) {
         match detect_wire_format(&data) {
-            DetectedWireFormat::Confluent { schema_id, .. } => {
-                let (decoded_id, _) = decode_wire_format(&data)
+            DetectedWireFormat::Confluent { key, .. } => {
+                let (decoded_key, _) = decode_wire_format(&data)
                     .expect("a detected Confluent frame must decode");
-                prop_assert_eq!(decoded_id, schema_id);
+                prop_assert_eq!(decoded_key, key);
             }
             DetectedWireFormat::InvalidConfluent => {
                 prop_assert!(

@@ -299,6 +299,18 @@ mod apicurio_guards {
                     c.delete_subject(subject, true).await.err(),
                 ),
                 ("delete_artifact", c.delete_artifact(subject).await.err()),
+                (
+                    "delete_version",
+                    c.delete_version(subject, SchemaVersion::new(1), true)
+                        .await
+                        .err(),
+                ),
+                (
+                    "lookup_schema",
+                    c.lookup_schema(subject, "{}", SchemaType::Avro, &[])
+                        .await
+                        .err(),
+                ),
             ];
 
             for (op, err) in checks {
@@ -310,6 +322,43 @@ mod apicurio_guards {
                 );
             }
         }
+    }
+
+    /// The compatibility endpoints treat an empty subject as the registry-wide
+    /// default (`/admin/rules/COMPATIBILITY`), matching the Confluent client, so
+    /// they are tested against traversal alone — `""` is legitimate here and
+    /// must reach the network rather than being rejected.
+    #[tokio::test]
+    async fn compatibility_endpoints_reject_traversal_but_allow_the_global_scope() {
+        let c = client();
+
+        for &subject in TRAVERSAL_SUBJECTS {
+            for (op, err) in [
+                (
+                    "get_compatibility",
+                    c.get_compatibility(subject).await.err(),
+                ),
+                (
+                    "set_compatibility",
+                    c.set_compatibility(subject, schemreg::CompatibilityLevel::Full)
+                        .await
+                        .err(),
+                ),
+            ] {
+                let err =
+                    err.unwrap_or_else(|| panic!("{op}({subject:?}) must fail before any request"));
+                assert!(
+                    err.is_config_error(),
+                    "{op}({subject:?}) must be rejected locally, got: {err}"
+                );
+            }
+        }
+
+        let err = c.get_compatibility("").await.unwrap_err();
+        assert!(
+            err.is_network_error(),
+            "an empty subject is the global scope and must reach the network, got: {err}"
+        );
     }
 
     /// A subject whose group component is empty (`"/artifact"`) would build

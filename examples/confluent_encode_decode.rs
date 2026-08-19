@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use schemreg::{
         CachedSchemaRegistry, Schema, SchemaId, SchemaReference, SchemaRegistryClient, SchemaType,
         SubjectNameStrategy, confluent::ConfluentSchemaEncoder, decoder::WireFormatDecoder,
-        error::SchemaRegError, traits::SchemaEncoder,
+        error::SchemaRegError, traits::PayloadEncoder,
     };
 
     init_tracing();

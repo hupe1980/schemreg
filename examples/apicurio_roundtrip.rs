@@ -199,12 +199,12 @@ async fn main() -> anyhow::Result<()> {
     // Decode: strip wire header, look up schema, deserialize.
     let (wire_schema_id, payload) = decode_wire_format(&framed)?;
     println!(
-        "Decoded wire frame: schema_id={} payload_len={}",
+        "Decoded wire frame: {} payload_len={}",
         wire_schema_id,
         payload.len()
     );
 
-    let looked_up = mock.get_schema_by_id(wire_schema_id).await?;
+    let looked_up = mock.get_schema_by_key(wire_schema_id).await?;
     println!(
         "Schema from registry: type={} subject={:?}",
         looked_up.schema_type, looked_up.subject

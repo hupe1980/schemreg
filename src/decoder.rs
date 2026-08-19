@@ -13,7 +13,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::error::{Result, SchemaRegError};
-use crate::traits::{DynSchemaRegistryClient, SchemaDecoder};
+use crate::traits::{DynSchemaRegistryClient, PayloadDecoder};
 use crate::types::{EncodeTarget, Schema, SchemaType};
 use crate::wire::{decode_protobuf_message_indexes, detect_wire_format};
 
@@ -97,7 +97,7 @@ pub struct DecodedMessage {
     /// Protobuf message-index path, present only for Confluent-framed Protobuf
     /// messages. Identifies which message type in the `.proto` file was used.
     /// `[0]` means the first top-level message (the common case).
-    pub protobuf_message_indexes: Option<Vec<i32>>,
+    pub protobuf_message_indexes: Option<Vec<u32>>,
 }
 
 // ── WireFormatDecoder ─────────────────────────────────────────────────────
@@ -202,7 +202,7 @@ impl WireFormatDecoder {
 
         match detect_wire_format(&data) {
             DetectedWireFormat::Confluent {
-                schema_id,
+                key,
                 payload_offset,
             } => {
                 let Some(client) = self.confluent.as_deref() else {
@@ -212,7 +212,7 @@ impl WireFormatDecoder {
                 };
 
                 let after_header = data.slice(payload_offset..);
-                let schema = client.get_schema_by_id(schema_id).await?;
+                let schema = client.get_schema_by_key(key).await?;
                 let schema_type = schema.schema_type;
                 let schema_format = SchemaFormat::from(schema_type);
 
@@ -245,7 +245,7 @@ impl WireFormatDecoder {
                     ));
                 };
 
-                // Decompress according to the header byte (F-01 fix).
+                // Decompress according to the compression byte in the header.
                 let raw = &data[payload_offset..];
                 let payload = match compression {
                     crate::glue::GlueCompression::None => data.slice(payload_offset..),
@@ -310,12 +310,12 @@ impl fmt::Debug for WireFormatDecoder {
 }
 
 /// `WireFormatDecoder` is the object-safe framing stripper: it satisfies
-/// [`SchemaDecoder`] by returning the header-stripped payload bytes.
+/// [`PayloadDecoder`] by returning the header-stripped payload bytes.
 ///
 /// `topic` and `target` are accepted for interface compatibility but ignored —
 /// both the Confluent and Glue wire formats are self-describing, so the schema
 /// is located from the header rather than from a derived subject name.
-impl SchemaDecoder for WireFormatDecoder {
+impl PayloadDecoder for WireFormatDecoder {
     fn decode(
         &self,
         payload: Bytes,

@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block body_class %}landing{% endblock body_class %}
+{% block title %}Page not found · {{ config.title }}{% endblock title %}
+{% block description %}This page could not be found. Browse the schemreg documentation index instead.{% endblock description %}
+
+{% block content %}
+<main id="main">
+  <section class="band closing">
+    <div class="wrap center">
+      <p class="eyebrow"><span class="pill">404</span></p>
+      <h1>That page is not here</h1>
+      <p class="section-lede">
+        It may have moved. The documentation index lists every guide, and
+        <kbd>⌘K</kbd> searches all of them.
+      </p>
+      <p class="cta-row center-row">
+        <a class="btn btn-primary" href="{{ get_url(path='@/docs/_index.md') | safe }}">Documentation</a>
+        <a class="btn" href="{{ get_url(path='/') | safe }}">Home</a>
+      </p>
+    </div>
+  </section>
+</main>
+{% endblock content %}

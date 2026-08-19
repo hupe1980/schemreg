@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{#- Title: the page's own on subpages, the tagline on the landing page. -#}
+{%- if page and page.title %}{% set page_title = page.title ~ " · " ~ config.title %}
+{%- elif section and section.title and section.path != "/" %}{% set page_title = section.title ~ " · " ~ config.title %}
+{%- else %}{% set page_title = config.title ~ " — " ~ config.extra.tagline %}{% endif %}
+
+{%- if page and page.description %}{% set page_desc = page.description %}
+{%- elif section and section.description %}{% set page_desc = section.description %}
+{%- else %}{% set page_desc = config.description %}{% endif %}
+
+{%- if page %}{% set canonical = page.permalink %}
+{%- elif section %}{% set canonical = section.permalink %}
+{%- else %}{% set canonical = config.base_url %}{% endif %}
+
+<title>{% block title %}{{ page_title }}{% endblock title %}</title>
+<meta name="description" content="{% block description %}{{ page_desc }}{% endblock description %}">
+<meta name="keywords" content="{{ config.extra.keywords }}">
+<meta name="author" content="{{ config.extra.author }}">
+<link rel="canonical" href="{{ canonical | safe }}">
+
+{#- Theme is applied before first paint to avoid a flash of the wrong palette. -#}
+<script>
+  (function () {
+    var d = document.documentElement;
+    d.classList.remove('no-js');
+    try {
+      var t = localStorage.getItem('theme');
+      if (t === 'light' || t === 'dark') d.dataset.theme = t;
+    } catch (e) {}
+  })();
+</script>
+
+<meta name="theme-color" content="#0d1017" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+
+{#- Open Graph / Twitter -#}
+<meta property="og:type" content="{% if page %}article{% else %}website{% endif %}">
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:title" content="{{ page_title }}">
+<meta property="og:description" content="{{ page_desc }}">
+<meta property="og:url" content="{{ canonical | safe }}">
+<meta property="og:image" content="{{ get_url(path=config.extra.og_image) | safe }}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="{{ config.title }} — {{ config.extra.tagline }}">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ page_title }}">
+<meta name="twitter:description" content="{{ page_desc }}">
+<meta name="twitter:image" content="{{ get_url(path=config.extra.og_image) | safe }}">
+
+<link rel="icon" href="{{ get_url(path='img/favicon.svg') | safe }}" type="image/svg+xml">
+<link rel="alternate icon" href="{{ get_url(path='img/favicon.png') | safe }}" sizes="32x32">
+<link rel="apple-touch-icon" href="{{ get_url(path='img/favicon.png') | safe }}">
+<link rel="sitemap" type="application/xml" href="{{ get_url(path='sitemap.xml') | safe }}">
+
+<link rel="stylesheet" href="{{ get_url(path='style.css', cachebust=true) | safe }}">
+{#- Zola emits both class sets into the markup (`z-l-*` light, `z-d-*` dark), so
+    exactly one sheet may apply at a time. `media` selects it, and the theme
+    toggle in site.js rewrites `media` when the reader overrides the OS. -#}
+<link rel="stylesheet" href="{{ get_url(path='giallo-light.css', cachebust=true) | safe }}" media="(prefers-color-scheme: light)" id="syntax-light">
+<link rel="stylesheet" href="{{ get_url(path='giallo-dark.css', cachebust=true) | safe }}" media="(prefers-color-scheme: dark)" id="syntax-dark">
+
+{%- block structured_data %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "{{ config.extra.crate_name }}",
+  "description": {{ config.description | json_encode | safe }},
+  "codeRepository": "{{ config.extra.repo }}",
+  "programmingLanguage": "Rust",
+  "license": "https://spdx.org/licenses/MIT.html",
+  "url": "{{ config.base_url | safe }}",
+  "author": { "@type": "Person", "name": "{{ config.extra.author }}" }
+}
+</script>
+{%- endblock structured_data %}
+</head>
+
+<body class="{% block body_class %}{% endblock body_class %}">
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="bar">
+    <a class="brand" href="{{ get_url(path='/') | safe }}" aria-label="{{ config.title }} home">
+      <svg class="brand-mark" width="22" height="22" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="1.5" y="4" width="5" height="16" rx="1.5"/>
+        <rect x="9.5" y="4" width="5" height="16" rx="1.5" opacity=".62"/>
+        <rect x="17.5" y="4" width="5" height="16" rx="1.5" opacity=".32"/>
+      </svg>
+      <span class="brand-name">{{ config.title }}</span>
+    </a>
+
+    <nav class="site-nav" aria-label="Main">
+      <a href="{{ get_url(path='@/docs/_index.md') | safe }}"{% if "/docs" in current_path | default(value="/") %} aria-current="true"{% endif %}>Docs</a>
+      <a href="{{ get_url(path='@/docs/wire-formats.md') | safe }}">Wire formats</a>
+      <a href="{{ config.extra.docs_rs }}" rel="external noopener">API</a>
+      <a href="{{ config.extra.repo }}" rel="external noopener">GitHub</a>
+    </nav>
+
+    <div class="bar-actions">
+      <button type="button" class="icon-btn search-open" data-search-open aria-label="Search (press Command or Control K)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>
+        <kbd>⌘K</kbd>
+      </button>
+      <button type="button" class="icon-btn theme-toggle" data-theme-toggle aria-label="Switch between light and dark theme">
+        <svg class="i-sun" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.4v2.2M12 19.4v2.2M4.2 4.2l1.6 1.6M18.2 18.2l1.6 1.6M2.4 12h2.2M19.4 12h2.2M4.2 19.8l1.6-1.6M18.2 5.8l1.6-1.6"/></svg>
+        <svg class="i-moon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.5 14.4A8.6 8.6 0 1 1 9.6 3.5a6.9 6.9 0 0 0 10.9 10.9Z"/></svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+{% block content %}{% endblock content %}
+
+<footer class="site-footer">
+  <div class="wrap footer-grid">
+    <div>
+      <p class="footer-brand">{{ config.title }}</p>
+      <p class="muted">{{ config.extra.subtitle }}</p>
+      <p class="muted small">Dual-licensed under MIT or Apache-2.0.</p>
+    </div>
+    <nav aria-label="Documentation">
+      <p class="footer-head">Documentation</p>
+      <a href="{{ get_url(path='@/docs/quickstart.md') | safe }}">Quick start</a>
+      <a href="{{ get_url(path='@/docs/wire-formats.md') | safe }}">Wire formats</a>
+      <a href="{{ get_url(path='@/docs/producers.md') | safe }}">Producer configuration</a>
+      <a href="{{ get_url(path='@/docs/backends.md') | safe }}">Backends</a>
+    </nav>
+    <nav aria-label="Project">
+      <p class="footer-head">Project</p>
+      <a href="{{ config.extra.crates_io }}" rel="external noopener">crates.io</a>
+      <a href="{{ config.extra.docs_rs }}" rel="external noopener">API reference</a>
+      <a href="{{ config.extra.repo }}" rel="external noopener">Source</a>
+      <a href="{{ config.extra.repo }}/blob/{{ config.extra.repo_branch }}/CHANGELOG.md" rel="external noopener">Changelog</a>
+    </nav>
+  </div>
+</footer>
+
+<div class="search-modal" data-search-modal hidden>
+  <div class="search-backdrop" data-search-close></div>
+  <div class="search-panel" role="dialog" aria-modal="true" aria-label="Search the documentation">
+    <label class="visually-hidden" for="search-input">Search the documentation</label>
+    <input id="search-input" type="search" placeholder="Search the documentation…" autocomplete="off" spellcheck="false" data-search-input>
+    <div class="search-results" data-search-results aria-live="polite"></div>
+    <p class="search-hint"><kbd>↑</kbd><kbd>↓</kbd> to navigate · <kbd>↵</kbd> to open · <kbd>Esc</kbd> to close</p>
+  </div>
+</div>
+
+<script src="{{ get_url(path='elasticlunr.min.js') | safe }}" defer></script>
+<script src="{{ get_url(path='search_index.en.js') | safe }}" defer></script>
+<script src="{{ get_url(path='js/site.js', cachebust=true) | safe }}" defer></script>
+</body>
+</html>

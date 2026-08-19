@@ -200,6 +200,8 @@ jobs:
       # Every example that runs without a live registry is executed, not just
       # compiled — a compiling-but-broken example is still broken documentation.
       - run: cargo run --example confluent_encode_decode --features confluent
+      - run: cargo run --example schema_resolution --features confluent
+      - run: cargo run --example schema_guid_and_headers
       - run: cargo run --example custom_backend
       - run: cargo run --example protobuf_wire_format
       - run: cargo run --example protobuf_roundtrip --features protobuf
@@ -207,6 +209,23 @@ jobs:
       - run: cargo run --example apicurio_roundtrip --features apicurio
       - run: cargo run --example avro_roundtrip --features avro
       - run: cargo run --example json_roundtrip --features json
+
+  # ── Documentation site ───────────────────────────────────────────────────
+  #
+  # `zola check` builds the site, resolves every internal link, and fetches
+  # every external one. A renamed guide or a dead upstream link fails here
+  # rather than shipping.
+  site:
+    name: Documentation site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zola
+        run: |
+          curl -sSfL "https://github.com/getzola/zola/releases/download/v0.23.2/zola-v0.23.2-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin zola
+      - run: zola --root site build
+      - run: zola --root site check
 
   # ── Benchmarks ───────────────────────────────────────────────────────────
   #
@@ -277,6 +296,7 @@ jobs:
         docs,
         examples,
         bench,
+        site,
         conformance,
       ]
     runs-on: ubuntu-latest

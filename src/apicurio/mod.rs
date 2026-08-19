@@ -40,18 +40,27 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GROUP: &str = "default";
 const API_PREFIX: &str = "/apis/registry/v3";
 
+/// Apicurio's version expression for "whatever is current".
+const LATEST_VERSION_EXPRESSION: &str = "branch=latest";
+
 /// Page size used when walking Apicurio's paginated search / version endpoints.
 ///
 /// Apicurio caps `limit` server-side; 500 is comfortably within every 3.x
 /// default and keeps the number of round-trips low for large registries.
 const PAGE_SIZE: usize = 500;
 
-// Response header names (lowercase) that Apicurio v3 sets on content endpoints.
+/// The one response header Apicurio v3 still sets on a content endpoint, and
+/// only on `/ids/globalIds/{id}` with `returnArtifactType=true`.
+///
+/// Registry v2 also returned `X-Registry-GlobalId`, `-Version`, `-GroupId`, and
+/// `-ArtifactId`; v3 dropped them. Reading a schema's identity out of headers
+/// is therefore no longer possible, which is why the subject-addressed lookups
+/// below fetch version metadata explicitly instead of inventing an ID.
 const HDR_ARTIFACT_TYPE: &str = "x-registry-artifacttype";
-const HDR_GLOBAL_ID: &str = "x-registry-globalid";
-const HDR_VERSION: &str = "x-registry-version";
-const HDR_GROUP_ID: &str = "x-registry-groupid";
-const HDR_ARTIFACT_ID: &str = "x-registry-artifactid";
+
+/// Apicurio's name for the compatibility rule, in both the artifact-scoped and
+/// the global (`/admin`) rule namespaces.
+const COMPATIBILITY_RULE: &str = "COMPATIBILITY";
 
 // ── JSON request / response types ─────────────────────────────────────────────
 
@@ -117,6 +126,20 @@ struct CreateArtifactVersionInfo {
     global_id: i64,
 }
 
+/// `GET /groups/{g}/artifacts/{a}/versions/{expr}` — the version's identity.
+///
+/// The sibling `/content` route returns the schema text but nothing that
+/// identifies it, so both are needed to build a complete [`Schema`].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VersionMetaData {
+    global_id: i64,
+    version: Option<serde_json::Value>,
+    artifact_type: Option<String>,
+    group_id: Option<String>,
+    artifact_id: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ArtifactVersionList {
@@ -153,15 +176,36 @@ struct CompatibilityTestResult {
     compatible: bool,
 }
 
+/// `PUT /…/rules/{ruleType}` (`Rule`) and `POST /…/rules` (`CreateRule`) share
+/// one shape, which is why one struct serves both.
 #[derive(Serialize)]
-struct SetCompatibilityRuleRequest {
-    r#type: &'static str,
+#[serde(rename_all = "camelCase")]
+struct RuleRequest {
+    rule_type: &'static str,
     config: &'static str,
 }
 
 #[derive(Deserialize)]
 struct GetCompatibilityRuleResponse {
     config: String,
+}
+
+/// `POST /search/versions` — the read-only content lookup behind
+/// [`SchemaRegistryClient::lookup_schema`].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VersionSearchResults {
+    versions: Vec<SearchedVersion>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchedVersion {
+    global_id: i64,
+    version: Option<serde_json::Value>,
+    artifact_type: Option<String>,
+    group_id: Option<String>,
+    artifact_id: Option<String>,
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
@@ -194,7 +238,7 @@ enum ApicurioAuth {
 /// # async fn run() -> schemreg::error::Result<()> {
 /// let registry = ApicurioSchemaRegistry::new("http://localhost:8080")?;
 /// let schema = registry.get_latest_schema("default/orders-value").await?;
-/// println!("schema id = {}", schema.id);
+/// println!("schema id = {:?}", schema.id);
 /// # Ok(())
 /// # }
 /// ```
@@ -202,6 +246,8 @@ pub struct ApicurioSchemaRegistry {
     client: HttpClient,
     base_url: String,
     auth: ApicurioAuth,
+    /// Ask the registry to inline referenced content on every content fetch.
+    dereference: bool,
 }
 
 impl ApicurioSchemaRegistry {
@@ -225,6 +271,7 @@ impl ApicurioSchemaRegistry {
             client,
             base_url: url,
             auth: ApicurioAuth::None,
+            dereference: false,
         })
     }
 
@@ -237,6 +284,19 @@ impl ApicurioSchemaRegistry {
 
     fn api_url(&self, path: &str) -> String {
         format!("{}{}{}", self.base_url, API_PREFIX, path)
+    }
+
+    /// `references=DEREFERENCE` when the client was built with
+    /// [`dereference_references`](ApicurioSchemaRegistryBuilder::dereference_references),
+    /// as a query-string fragment ready to append.
+    ///
+    /// `sep` is `'?'` when the URL has no query yet and `'&'` when it does.
+    fn dereference_param(&self, sep: char) -> &'static str {
+        match (self.dereference, sep) {
+            (false, _) => "",
+            (true, '?') => "?references=DEREFERENCE",
+            (true, _) => "&references=DEREFERENCE",
+        }
     }
 
     /// Parse a subject string into an [`ArtifactId`] after validating it.
@@ -350,6 +410,34 @@ impl ApicurioSchemaRegistry {
         self.handle_json_response(resp.status, resp.content_type.as_deref(), &resp.body)
     }
 
+    /// POST a raw content body (not JSON-wrapped) and decode a JSON response.
+    ///
+    /// `POST /search/versions` takes the schema text itself as the request
+    /// body, with `Content-Type: */*`.
+    async fn post_content<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        content: &[u8],
+        content_type: &str,
+    ) -> Result<T> {
+        let auth = self.auth_header();
+        let auth_str = auth.as_deref().map(|z| z.as_str());
+        let resp = self
+            .client
+            .request(
+                "POST",
+                url,
+                &[
+                    ("Accept", "application/json"),
+                    ("Content-Type", content_type),
+                ],
+                Some(content),
+                auth_str,
+            )
+            .await?;
+        self.handle_json_response(resp.status, resp.content_type.as_deref(), &resp.body)
+    }
+
     /// PUT a JSON body and decode a JSON response.
     async fn put_json<T: serde::de::DeserializeOwned>(&self, url: &str, body: &[u8]) -> Result<T> {
         let auth = self.auth_header();
@@ -427,67 +515,134 @@ impl ApicurioSchemaRegistry {
             })
     }
 
-    /// Build a [`Schema`] from the raw content response of an Apicurio content endpoint.
+    /// Build a [`Schema`] from a `/ids/globalIds/{id}` content response.
     ///
-    /// Reads `X-Registry-*` headers to populate schema metadata. Falls back to
-    /// `fallback_id` and `fallback_subject` when headers are absent (e.g. older
-    /// Apicurio versions that do not emit them by default).
-    fn schema_from_content_response(
+    /// That route is the only one that still reports anything about the schema
+    /// in a header (`X-Registry-ArtifactType`, and only when asked). The global
+    /// ID is not echoed, but it is the value we looked the schema up by, so it
+    /// is known for certain. Subject and version are genuinely unavailable here
+    /// and stay `None` rather than being guessed.
+    fn schema_from_global_id_response(
         &self,
         resp: crate::http::HttpResponse,
-        fallback_id: Option<SchemaId>,
-        fallback_subject: Option<&str>,
+        id: SchemaId,
     ) -> Result<Arc<Schema>> {
-        let schema_type = resp
-            .headers
-            .get(HDR_ARTIFACT_TYPE)
-            .and_then(|s| s.parse::<SchemaType>().ok())
-            .unwrap_or(SchemaType::Avro);
-
-        let id = resp
-            .headers
-            .get(HDR_GLOBAL_ID)
-            .and_then(|s| s.parse::<i64>().ok())
-            .map(|v| -> Result<SchemaId> {
-                if v < 0 || v > i64::from(u32::MAX) {
-                    return Err(SchemaRegError::invalid_state(format!(
-                        "Apicurio global_id {v} is out of u32 range"
-                    )));
-                }
-                Ok(SchemaId::from(v as u32))
-            })
-            .transpose()?
-            .or(fallback_id)
-            .unwrap_or_else(|| SchemaId::from(0u32));
-
-        let version = resp
-            .headers
-            .get(HDR_VERSION)
-            .and_then(|s| s.parse::<i32>().ok())
-            .map(SchemaVersion::new);
-
-        let group_id = resp
-            .headers
-            .get(HDR_GROUP_ID)
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_GROUP.to_string());
-
-        let artifact_id_header = resp.headers.get(HDR_ARTIFACT_ID).cloned();
-
-        let subject = artifact_id_header
-            .map(|a| -> Arc<str> { Arc::from(format!("{group_id}/{a}").as_str()) })
-            .or_else(|| fallback_subject.map(Arc::from));
-
-        let schema_str = String::from_utf8(resp.body.to_vec()).map_err(|e| {
-            SchemaRegError::wire_format(format!("invalid UTF-8 in Apicurio schema content: {e}"))
-        })?;
+        let schema_type = self.artifact_type_from_headers(&resp);
+        let schema_str = Self::content_as_utf8(&resp)?;
 
         Ok(Arc::new(Schema {
-            id,
+            id: Some(id),
+            // Apicurio's native v3 API has no equivalent of a Confluent schema
+            // GUID; its global ID is the only identifier it reports.
+            guid: None,
             schema_type,
             schema: schema_str.into(),
-            version,
-            subject,
+            version: None,
+            subject: None,
+            references: Vec::new(),
+        }))
+    }
+
+    /// The artifact type from `X-Registry-ArtifactType`, defaulting to Avro.
+    ///
+    /// Avro is Apicurio's own default artifact type, so it is the right guess
+    /// when the header is absent — but it *is* a guess, which is why the
+    /// subject-addressed lookups read the type from version metadata instead.
+    fn artifact_type_from_headers(&self, resp: &crate::http::HttpResponse) -> SchemaType {
+        resp.headers
+            .get(HDR_ARTIFACT_TYPE)
+            .and_then(|s| s.parse::<SchemaType>().ok())
+            .unwrap_or(SchemaType::Avro)
+    }
+
+    fn content_as_utf8(resp: &crate::http::HttpResponse) -> Result<String> {
+        String::from_utf8(resp.body.to_vec()).map_err(|e| {
+            SchemaRegError::wire_format(format!("invalid UTF-8 in Apicurio schema content: {e}"))
+        })
+    }
+
+    /// Convert an Apicurio `globalId` into a [`SchemaId`].
+    ///
+    /// Apicurio numbers global IDs as `int64` while the Confluent wire format
+    /// carries a `u32`, so a registry that has outgrown 4 billion versions
+    /// cannot be framed at all. Failing loudly beats truncating into a valid
+    /// ID that points at a different schema.
+    fn global_id_to_schema_id(global_id: i64) -> Result<SchemaId> {
+        if global_id < 0 || global_id > i64::from(u32::MAX) {
+            return Err(SchemaRegError::invalid_state(format!(
+                "Apicurio global_id {global_id} is outside the u32 range the \
+                 Confluent wire format can carry"
+            )));
+        }
+        Ok(SchemaId::from(global_id as u32))
+    }
+
+    /// Resolve a version expression for the `/versions/{expr}` routes.
+    ///
+    /// [`SchemaVersion`] uses the Confluent convention where a negative value
+    /// means "latest"; Apicurio spells that `branch=latest`.
+    fn version_expression(version: SchemaVersion) -> String {
+        if version.as_i32() < 0 {
+            LATEST_VERSION_EXPRESSION.to_string()
+        } else {
+            percent_encode(&version.as_i32().to_string())
+        }
+    }
+
+    /// Fetch one version's metadata and content, and combine them.
+    ///
+    /// Two round-trips, deliberately: `/versions/{expr}/content` returns the
+    /// schema text and *nothing else* — Registry v3 removed the
+    /// `X-Registry-GlobalId` / `-Version` / `-ArtifactId` headers that v2 set.
+    /// Reading identity from that response is therefore impossible, and the
+    /// alternative to a second request is inventing a schema ID, which a
+    /// producer would then frame real records with.
+    ///
+    /// Neither call is on a cached path: `get_latest_schema` must always hit
+    /// the backend anyway, since a newer version can appear at any moment.
+    async fn version_schema(
+        &self,
+        artifact: &ArtifactId,
+        expression: &str,
+        subject: &str,
+    ) -> Result<Arc<Schema>> {
+        let group = percent_encode(&artifact.group);
+        let name = percent_encode(&artifact.artifact);
+
+        let meta: VersionMetaData = self
+            .get_json(&self.api_url(&format!(
+                "/groups/{group}/artifacts/{name}/versions/{expression}"
+            )))
+            .await?;
+
+        let content = self
+            .get_content(&self.api_url(&format!(
+                "/groups/{group}/artifacts/{name}/versions/{expression}/content{}",
+                self.dereference_param('?')
+            )))
+            .await?;
+
+        let schema_type = meta
+            .artifact_type
+            .as_deref()
+            .map(str::parse::<SchemaType>)
+            .transpose()?
+            .unwrap_or(SchemaType::Avro);
+
+        // Prefer the identity the server reported over the one we asked with:
+        // `branch=latest` resolves to a concrete version only server-side.
+        let resolved_subject = match (&meta.group_id, &meta.artifact_id) {
+            (Some(group), Some(name)) => Arc::from(format!("{group}/{name}").as_str()),
+            _ => Arc::from(subject),
+        };
+
+        Ok(Arc::new(Schema {
+            id: Some(Self::global_id_to_schema_id(meta.global_id)?),
+            guid: None,
+            schema_type,
+            schema: Self::content_as_utf8(&content)?.into(),
+            version: meta.version.as_ref().and_then(Self::parse_version),
+            subject: Some(resolved_subject),
             references: Vec::new(),
         }))
     }
@@ -523,13 +678,8 @@ impl ApicurioSchemaRegistry {
     /// Subject is parsed as `"{group}/{artifact}"` or `"{artifact}"` (default group).
     pub async fn get_latest_schema_impl(&self, subject: &str) -> Result<Arc<Schema>> {
         let artifact_id = Self::artifact_id(subject)?;
-        let url = self.api_url(&format!(
-            "/groups/{}/artifacts/{}/versions/branch=latest/content?returnArtifactType=true",
-            percent_encode(&artifact_id.group),
-            percent_encode(&artifact_id.artifact),
-        ));
-        let resp = self.get_content(&url).await?;
-        self.schema_from_content_response(resp, None, Some(subject))
+        self.version_schema(&artifact_id, LATEST_VERSION_EXPRESSION, subject)
+            .await
     }
 
     /// Retrieve a specific version of the artifact.
@@ -539,15 +689,9 @@ impl ApicurioSchemaRegistry {
         version: SchemaVersion,
     ) -> Result<Arc<Schema>> {
         let artifact_id = Self::artifact_id(subject)?;
-        let version_str = version.as_i32().to_string();
-        let url = self.api_url(&format!(
-            "/groups/{}/artifacts/{}/versions/{}/content?returnArtifactType=true",
-            percent_encode(&artifact_id.group),
-            percent_encode(&artifact_id.artifact),
-            percent_encode(&version_str),
-        ));
-        let resp = self.get_content(&url).await?;
-        self.schema_from_content_response(resp, None, Some(subject))
+        let expression = Self::version_expression(version);
+        self.version_schema(&artifact_id, &expression, subject)
+            .await
     }
 
     /// Register a schema and return its global ID.
@@ -583,13 +727,7 @@ impl ApicurioSchemaRegistry {
             SchemaRegError::invalid_state(format!("failed to serialise Apicurio request: {e}"))
         })?;
         let result: CreateArtifactResponse = self.post_json(&url, &body).await?;
-        let global_id = result.version.global_id;
-        if global_id < 0 || global_id > i64::from(u32::MAX) {
-            return Err(SchemaRegError::invalid_state(format!(
-                "Apicurio global_id {global_id} is out of u32 range"
-            )));
-        }
-        Ok(SchemaId::from(global_id as u32))
+        Self::global_id_to_schema_id(result.version.global_id)
     }
 
     /// Check compatibility of a schema against the latest version of the artifact.
@@ -620,6 +758,147 @@ impl ApicurioSchemaRegistry {
         })?;
         let result: CompatibilityTestResult = self.post_json(&url, &body).await?;
         Ok(result.compatible)
+    }
+
+    /// The URL prefix that owns COMPATIBILITY rules for `subject`.
+    ///
+    /// An empty subject addresses the registry-wide default, matching the
+    /// Confluent client's convention.
+    fn rule_scope(&self, subject: &str) -> Result<String> {
+        if subject.is_empty() {
+            return Ok(self.api_url("/admin"));
+        }
+        let artifact_id = Self::artifact_id(subject)?;
+        Ok(self.api_url(&format!(
+            "/groups/{}/artifacts/{}",
+            percent_encode(&artifact_id.group),
+            percent_encode(&artifact_id.artifact),
+        )))
+    }
+
+    /// POST a JSON body to an endpoint whose success answer is `204`.
+    async fn post_no_content(&self, url: &str, body: &[u8]) -> Result<()> {
+        let auth = self.auth_header();
+        let auth_str = auth.as_deref().map(|z| z.as_str());
+        let resp = self
+            .client
+            .request(
+                "POST",
+                url,
+                &[
+                    ("Accept", "application/json"),
+                    ("Content-Type", "application/json"),
+                ],
+                Some(body),
+                auth_str,
+            )
+            .await?;
+        if (200..300).contains(&resp.status) {
+            return Ok(());
+        }
+        let msg = self.parse_error_body(&resp.body);
+        Err(match resp.status {
+            401 | 403 => SchemaRegError::auth(resp.status, msg),
+            404 => SchemaRegError::api(40401, msg),
+            409 => SchemaRegError::api(40902, msg),
+            _ => SchemaRegError::http(resp.status, msg),
+        })
+    }
+
+    /// Look up an already-registered schema **without registering it**.
+    ///
+    /// Issues `POST /search/versions`, scoped to the subject's group and
+    /// artifact, with the schema text as the request body. Returns `Ok(None)`
+    /// when nothing matches — including when the artifact does not exist —
+    /// so "not registered" is an ordinary outcome rather than an error to
+    /// classify.
+    ///
+    /// The search is **not** canonicalised: a hit means the registry holds this
+    /// exact content, which is what lets the returned [`Schema`] carry the
+    /// caller's own schema text truthfully rather than a canonical form nobody
+    /// asked for.
+    ///
+    /// Apicurio's content search does not match versions that carry artifact
+    /// references ([apicurio-registry#6142]); for those, `register_schema` with
+    /// its idempotent `FIND_OR_CREATE_VERSION` remains the reliable route.
+    ///
+    /// [apicurio-registry#6142]: https://github.com/Apicurio/apicurio-registry/issues/6142
+    pub async fn lookup_schema_impl(
+        &self,
+        subject: &str,
+        schema: &str,
+        schema_type: SchemaType,
+        _references: &[SchemaReference],
+    ) -> Result<Option<Arc<Schema>>> {
+        let artifact_id = Self::artifact_id(subject)?;
+        let url = self.api_url(&format!(
+            "/search/versions?canonical=false&artifactType={}&groupId={}&artifactId={}&limit=1",
+            schema_type.as_str(),
+            percent_encode(&artifact_id.group),
+            percent_encode(&artifact_id.artifact),
+        ));
+
+        let found: VersionSearchResults = match self
+            .post_content(&url, schema.as_bytes(), schema_content_type(schema_type))
+            .await
+        {
+            Ok(results) => results,
+            // No such group or artifact is "not registered", not a failure.
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        let Some(hit) = found.versions.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let schema_type = hit
+            .artifact_type
+            .as_deref()
+            .map(str::parse::<SchemaType>)
+            .transpose()?
+            .unwrap_or(schema_type);
+        let resolved_subject = match (&hit.group_id, &hit.artifact_id) {
+            (Some(group), Some(name)) => Arc::from(format!("{group}/{name}").as_str()),
+            _ => Arc::from(subject),
+        };
+
+        Ok(Some(Arc::new(Schema {
+            id: Some(Self::global_id_to_schema_id(hit.global_id)?),
+            guid: None,
+            schema_type,
+            // The search was not canonicalised, so a hit means the registry
+            // stores exactly these bytes.
+            schema: Arc::from(schema),
+            version: hit.version.as_ref().and_then(Self::parse_version),
+            subject: Some(resolved_subject),
+            references: Vec::new(),
+        })))
+    }
+
+    /// Delete a single version of the artifact identified by `subject`.
+    ///
+    /// Apicurio has no soft-delete stage, so this is always permanent and the
+    /// `permanent` flag of
+    /// [`SchemaRegistryClient::delete_version`] is ignored.
+    ///
+    /// Version deletion is **disabled by default** in Apicurio Registry; a
+    /// server without `apicurio.rest.deletion.artifact-version.enabled=true`
+    /// answers `405 Method Not Allowed`, which surfaces as an
+    /// [`Http`](SchemaRegError::Http) error with that status.
+    pub async fn delete_artifact_version(
+        &self,
+        subject: &str,
+        version: SchemaVersion,
+    ) -> Result<()> {
+        let artifact_id = Self::artifact_id(subject)?;
+        let url = self.api_url(&format!(
+            "/groups/{}/artifacts/{}/versions/{}",
+            percent_encode(&artifact_id.group),
+            percent_encode(&artifact_id.artifact),
+            Self::version_expression(version),
+        ));
+        self.delete_no_content(&url).await
     }
 
     /// Delete the artifact (all its versions) identified by `subject`.
@@ -743,11 +1022,12 @@ impl fmt::Debug for ApicurioSchemaRegistry {
 impl SchemaRegistryClient for ApicurioSchemaRegistry {
     async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> {
         let url = self.api_url(&format!(
-            "/ids/globalIds/{}?returnArtifactType=true",
-            id.as_u32()
+            "/ids/globalIds/{}?returnArtifactType=true{}",
+            id.as_u32(),
+            self.dereference_param('&')
         ));
         let resp = self.get_content(&url).await?;
-        self.schema_from_content_response(resp, Some(id), None)
+        self.schema_from_global_id_response(resp, id)
     }
 
     async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
@@ -783,16 +1063,41 @@ impl SchemaRegistryClient for ApicurioSchemaRegistry {
         self.check_compatibility_impl(subject, schema, schema_type, references)
     }
 
+    /// Delete every version of the artifact, reporting which ones went.
+    ///
+    /// Apicurio's `DELETE /groups/{g}/artifacts/{a}` is always permanent — there
+    /// is no soft-delete stage — so `permanent` is ignored. The version list is
+    /// read before the delete rather than fabricated afterwards; if that read
+    /// fails the delete still proceeds and the list comes back empty, because
+    /// the caller asked for a deletion, not for an inventory.
     async fn delete_subject<'a>(
         &'a self,
         subject: &'a str,
         _permanent: bool,
     ) -> Result<Vec<SchemaVersion>> {
-        // Apicurio v3 DELETE /groups/{groupId}/artifacts/{artifactId} is always
-        // a permanent delete. The `permanent` flag is not applicable; we treat
-        // both modes as a hard delete and return an empty version list.
+        let versions = self.list_versions(subject).await.unwrap_or_default();
         self.delete_artifact(subject).await?;
-        Ok(Vec::new())
+        Ok(versions)
+    }
+
+    async fn delete_version<'a>(
+        &'a self,
+        subject: &'a str,
+        version: SchemaVersion,
+        _permanent: bool,
+    ) -> Result<SchemaVersion> {
+        self.delete_artifact_version(subject, version).await?;
+        Ok(version)
+    }
+
+    fn lookup_schema<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> impl std::future::Future<Output = Result<Option<Arc<Schema>>>> + Send + 'a {
+        self.lookup_schema_impl(subject, schema, schema_type, references)
     }
 
     fn get_subjects(&self) -> impl std::future::Future<Output = Result<Vec<String>>> + Send + '_ {
@@ -815,20 +1120,21 @@ impl SchemaRegistryClient for ApicurioSchemaRegistry {
         Ok(())
     }
 
+    /// Set the COMPATIBILITY rule for an artifact, or the global default when
+    /// `subject` is empty.
+    ///
+    /// An empty subject means the global default on the Confluent client too,
+    /// so the two backends answer the same question the same way — Apicurio
+    /// spells it `/admin/rules/COMPATIBILITY`.
+    ///
+    /// Apicurio separates *creating* a rule from *updating* one: `PUT` answers
+    /// 404 when the rule has never been configured, which is the common case.
+    /// A 404 is therefore followed by a `POST` that creates it, so a caller
+    /// does not have to know whether this subject has been configured before.
     async fn set_compatibility(&self, subject: &str, level: CompatibilityLevel) -> Result<()> {
-        if subject.is_empty() {
-            return Err(SchemaRegError::config(
-                "set_compatibility requires a non-empty subject name",
-            ));
-        }
-        let artifact_id = Self::artifact_id(subject)?;
-        let url = self.api_url(&format!(
-            "/groups/{}/artifacts/{}/rules/COMPATIBILITY",
-            percent_encode(&artifact_id.group),
-            percent_encode(&artifact_id.artifact),
-        ));
-        let req = SetCompatibilityRuleRequest {
-            r#type: "COMPATIBILITY",
+        let scope = self.rule_scope(subject)?;
+        let req = RuleRequest {
+            rule_type: COMPATIBILITY_RULE,
             config: level.as_str(),
         };
         let body = serde_json::to_vec(&req).map_err(|e| {
@@ -836,23 +1142,27 @@ impl SchemaRegistryClient for ApicurioSchemaRegistry {
                 "failed to serialise compatibility rule request: {e}"
             ))
         })?;
-        let _: serde_json::Value = self.put_json(&url, &body).await?;
-        Ok(())
+
+        match self
+            .put_json::<serde_json::Value>(&format!("{scope}/rules/{COMPATIBILITY_RULE}"), &body)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.is_not_found() => {
+                // The rule does not exist yet — create it.
+                self.post_no_content(&format!("{scope}/rules"), &body).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
+    /// Read the COMPATIBILITY rule for an artifact, or the global default when
+    /// `subject` is empty.
     async fn get_compatibility(&self, subject: &str) -> Result<CompatibilityLevel> {
-        if subject.is_empty() {
-            return Err(SchemaRegError::config(
-                "get_compatibility requires a non-empty subject name",
-            ));
-        }
-        let artifact_id = Self::artifact_id(subject)?;
-        let url = self.api_url(&format!(
-            "/groups/{}/artifacts/{}/rules/COMPATIBILITY",
-            percent_encode(&artifact_id.group),
-            percent_encode(&artifact_id.artifact),
-        ));
-        let resp: GetCompatibilityRuleResponse = self.get_json(&url).await?;
+        let scope = self.rule_scope(subject)?;
+        let resp: GetCompatibilityRuleResponse = self
+            .get_json(&format!("{scope}/rules/{COMPATIBILITY_RULE}"))
+            .await?;
         resp.config.parse()
     }
 }
@@ -885,6 +1195,8 @@ pub struct ApicurioSchemaRegistryBuilder {
     retry_policy: RetryPolicy,
     /// Hard ceiling on concurrent in-flight requests.
     max_concurrent_requests: Option<usize>,
+    /// Ask the registry to inline referenced content on every content fetch.
+    dereference: bool,
 }
 
 impl Default for ApicurioSchemaRegistryBuilder {
@@ -899,11 +1211,36 @@ impl Default for ApicurioSchemaRegistryBuilder {
             pool_max_idle_per_host: None,
             retry_policy: RetryPolicy::default(),
             max_concurrent_requests: None,
+            dereference: false,
         }
     }
 }
 
 impl ApicurioSchemaRegistryBuilder {
+    /// Ask the registry to inline referenced schemas into the content it
+    /// returns (`?references=DEREFERENCE`).
+    ///
+    /// This is the fix for the one thing the native v3 client otherwise cannot
+    /// do. Apicurio stores a referencing schema exactly as written and exposes
+    /// its references on a separate route, so a schema that names a type from
+    /// another artifact comes back unparseable and
+    /// [`AvroSchemaDecoder`](crate::AvroSchemaDecoder) has nothing to resolve
+    /// against — [`Schema::references`](crate::Schema::references) is empty on
+    /// this backend. Dereferencing moves the work server-side: the response is
+    /// self-contained, at no extra round-trip.
+    ///
+    /// **Off by default**, because it changes the bytes you get back. The
+    /// returned text is no longer the text that was registered, so it is the
+    /// wrong input for re-registering a schema elsewhere or for computing a
+    /// fingerprint. Turn it on for consumers; leave it off for tooling that
+    /// copies schemas between registries.
+    ///
+    /// Applies to both `get_schema_by_id` and the subject-addressed lookups.
+    pub fn dereference_references(mut self, dereference: bool) -> Self {
+        self.dereference = dereference;
+        self
+    }
+
     /// Set the Apicurio Registry URL (required).
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
@@ -1059,6 +1396,7 @@ impl ApicurioSchemaRegistryBuilder {
             client,
             base_url: url,
             auth: self.auth,
+            dereference: self.dereference,
         })
     }
 }
@@ -1089,6 +1427,7 @@ impl fmt::Debug for ApicurioSchemaRegistryBuilder {
             .field("root_certificates", &self.root_certificates.len())
             .field("identity", &self.identity.is_some())
             .field("pool_max_idle_per_host", &self.pool_max_idle_per_host)
+            .field("dereference", &self.dereference)
             .finish()
     }
 }
@@ -1139,6 +1478,7 @@ mod tests {
             auth: ApicurioAuth::Bearer {
                 token: zeroize::Zeroizing::new("secret".to_string()),
             },
+            dereference: false,
         };
         let dbg = format!("{registry:?}");
         assert!(dbg.contains("bearer(***)"));

@@ -39,7 +39,10 @@ struct Gate {
 impl MockRegistry {
     fn new(schemas: impl IntoIterator<Item = Schema>) -> Self {
         Self {
-            schemas: schemas.into_iter().map(|s| (s.id, s)).collect(),
+            schemas: schemas
+                .into_iter()
+                .filter_map(|s| s.id.map(|id| (id, s)))
+                .collect(),
             get_by_id_calls: AtomicU32::new(0),
             gate: None,
         }

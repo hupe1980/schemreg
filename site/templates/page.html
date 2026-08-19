@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block body_class %}docs{% endblock body_class %}
+
+{% block structured_data %}
+{{ super() }}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": {{ page.title | json_encode | safe }},
+  "description": {{ page.description | default(value=config.description) | json_encode | safe }},
+  "url": "{{ page.permalink | safe }}",
+  "inLanguage": "en",
+  "isPartOf": { "@type": "WebSite", "name": "{{ config.title }}", "url": "{{ config.base_url | safe }}" },
+  "author": { "@type": "Person", "name": "{{ config.extra.author }}" }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    { "@type": "ListItem", "position": 1, "name": "{{ config.title }}", "item": "{{ config.base_url | safe }}" },
+    { "@type": "ListItem", "position": 2, "name": "Documentation", "item": "{{ get_url(path='@/docs/_index.md') | safe }}" },
+    { "@type": "ListItem", "position": 3, "name": {{ page.title | json_encode | safe }}, "item": "{{ page.permalink | safe }}" }
+  ]
+}
+</script>
+{% endblock structured_data %}
+
+{% block content %}
+<div class="docs-shell">
+  {% include "partials/sidebar.html" %}
+
+  <main id="main" class="docs-main">
+    <nav class="breadcrumbs" aria-label="Breadcrumb">
+      <ol>
+        <li><a href="{{ get_url(path='/') | safe }}">Home</a></li>
+        <li><a href="{{ get_url(path='@/docs/_index.md') | safe }}">Docs</a></li>
+        <li aria-current="page">{{ page.title }}</li>
+      </ol>
+    </nav>
+
+    <article class="prose">
+      <header class="page-head">
+        <h1>{{ page.title }}</h1>
+        {% if page.description %}<p class="page-desc">{{ page.description }}</p>{% endif %}
+      </header>
+      {{ page.content | safe }}
+    </article>
+
+    {% include "partials/page-nav.html" %}
+  </main>
+
+  <aside class="toc" aria-label="On this page">
+    {% if page.toc | length > 0 %}
+    <p class="toc-head">On this page</p>
+    <nav>
+      <ul>
+        {% for h in page.toc %}
+        <li><a href="#{{ h.id }}">{{ h.title }}</a>
+          {% if h.children | length > 0 %}
+          <ul>{% for c in h.children %}<li><a href="#{{ c.id }}">{{ c.title }}</a></li>{% endfor %}</ul>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </nav>
+    {% endif %}
+    <p class="toc-edit">
+      <a href="{{ config.extra.repo }}/edit/{{ config.extra.repo_branch }}/site/content/{{ page.relative_path }}" rel="external noopener">Edit this page</a>
+    </p>
+  </aside>
+</div>
+{% endblock content %}

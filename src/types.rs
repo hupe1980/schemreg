@@ -12,8 +12,8 @@ use crate::error::{Result, SchemaRegError};
 /// Using a newtype prevents accidental conflation with [`SchemaVersion`],
 /// which is a signed 32-bit integer with different semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "confluent", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "confluent", serde(transparent))]
+#[cfg_attr(feature = "serde-impls", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde-impls", serde(transparent))]
 pub struct SchemaId(u32);
 
 impl SchemaId {
@@ -62,13 +62,291 @@ impl fmt::Display for SchemaId {
     }
 }
 
+// ── SchemaGuid ────────────────────────────────────────────────────────────
+
+/// Globally unique schema GUID, introduced by Confluent Platform 8.
+///
+/// A GUID is a 128-bit fingerprint of the schema — its definition, references,
+/// metadata, and rule set — so the same schema has the same GUID in every
+/// registry and every context. That is the property [`SchemaId`] lacks: an
+/// integer ID is assigned per registry, so the *same* schema has *different*
+/// IDs in a staging and a production cluster, which is why replication and
+/// multi-region setups have to rewrite the wire prefix.
+///
+/// GUIDs appear in three places:
+///
+/// - wire format v1 (`0x01` magic byte + 16 bytes) — see [`crate::wire`];
+/// - the `__key_schema_id` / `__value_schema_id` Kafka headers;
+/// - the `guid` field of every Confluent Schema Registry API response.
+///
+/// Wraps a [`uuid::Uuid`], whose byte order is already the big-endian
+/// ("network order") layout the wire format uses, so
+/// [`as_bytes`](Self::as_bytes) is exactly what goes on the topic. Converts
+/// freely to and from `Uuid` — a caller who already has one (from the AWS SDK,
+/// a database row, their own `uuid` dependency) can pass it straight in.
+///
+/// The newtype is not decoration: it keeps a schema GUID from being confused
+/// with a [`GlueSchemaVersionId`](crate::glue::GlueSchemaVersionId), which is
+/// also a UUID but names something else entirely.
+///
+/// # Example
+///
+/// ```rust
+/// use schemreg::SchemaGuid;
+///
+/// let guid: SchemaGuid = "550e8400-e29b-41d4-a716-446655440000".parse()?;
+/// assert_eq!(guid.to_string(), "550e8400-e29b-41d4-a716-446655440000");
+/// assert_eq!(guid.as_bytes()[0], 0x55);
+///
+/// // Free interop with the `uuid` crate.
+/// let raw: uuid::Uuid = guid.into();
+/// assert_eq!(SchemaGuid::from(raw), guid);
+/// # Ok::<(), schemreg::SchemaRegError>(())
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SchemaGuid(uuid::Uuid);
+
+impl SchemaGuid {
+    /// Wrap the 16 big-endian bytes exactly as they appear on the wire.
+    #[inline]
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(uuid::Uuid::from_bytes(bytes))
+    }
+
+    /// Return the 16 big-endian bytes as they appear on the wire.
+    #[inline]
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+
+    /// Borrow the underlying [`uuid::Uuid`].
+    #[inline]
+    #[must_use]
+    pub const fn as_uuid(&self) -> &uuid::Uuid {
+        &self.0
+    }
+}
+
+impl From<uuid::Uuid> for SchemaGuid {
+    #[inline]
+    fn from(uuid: uuid::Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl From<SchemaGuid> for uuid::Uuid {
+    #[inline]
+    fn from(guid: SchemaGuid) -> Self {
+        guid.0
+    }
+}
+
+impl From<[u8; 16]> for SchemaGuid {
+    #[inline]
+    fn from(bytes: [u8; 16]) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
+
+impl From<SchemaGuid> for [u8; 16] {
+    #[inline]
+    fn from(guid: SchemaGuid) -> Self {
+        guid.0.into_bytes()
+    }
+}
+
+impl fmt::Display for SchemaGuid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `Uuid`'s Display is the canonical hyphenated lowercase form.
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Debug for SchemaGuid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SchemaGuid({})", self.0)
+    }
+}
+
+impl FromStr for SchemaGuid {
+    type Err = SchemaRegError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        uuid::Uuid::parse_str(s)
+            .map(Self)
+            .map_err(|e| SchemaRegError::config(format!("invalid schema GUID '{s}': {e}")))
+    }
+}
+
+#[cfg(feature = "serde-impls")]
+impl serde::Serialize for SchemaGuid {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+#[cfg(feature = "serde-impls")]
+impl<'de> serde::Deserialize<'de> for SchemaGuid {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = <std::borrow::Cow<'de, str> as serde::Deserialize>::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+// ── SchemaKey ─────────────────────────────────────────────────────────────
+
+/// How a framed message names the schema it was written with.
+///
+/// Confluent's wire format has two versions, and both are in active use:
+///
+/// | Version | Magic byte | Identifier |
+/// |---|---|---|
+/// | v0 | `0x00` | 4-byte big-endian [`SchemaId`] |
+/// | v1 | `0x01` | 16-byte [`SchemaGuid`] |
+///
+/// v1 was added in Confluent Platform 8 and is what a producer emits once
+/// GUID-based identification is enabled. Since a consumer cannot know in
+/// advance which of the two a given record uses, decoding returns a
+/// `SchemaKey` rather than committing to either.
+///
+/// `SchemaKey` converts from both `u32`/[`SchemaId`] and [`SchemaGuid`], so
+/// encode call sites read the same as before:
+///
+/// ```rust
+/// use schemreg::{SchemaGuid, SchemaKey, encode_wire_format};
+///
+/// let by_id = encode_wire_format(42u32, b"payload");
+/// assert_eq!(by_id[0], 0x00);
+///
+/// let guid: SchemaGuid = "550e8400-e29b-41d4-a716-446655440000".parse()?;
+/// let by_guid = encode_wire_format(guid, b"payload");
+/// assert_eq!(by_guid[0], 0x01);
+///
+/// assert_eq!(SchemaKey::from(42u32).as_id().map(|i| i.as_u32()), Some(42));
+/// # Ok::<(), schemreg::SchemaRegError>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SchemaKey {
+    /// Wire format v0 — a registry-assigned 32-bit ID.
+    Id(SchemaId),
+    /// Wire format v1 — a registry-independent 128-bit schema fingerprint.
+    Guid(SchemaGuid),
+}
+
+impl SchemaKey {
+    /// The schema ID, or `None` when the message named a GUID instead.
+    #[inline]
+    #[must_use]
+    pub fn as_id(self) -> Option<SchemaId> {
+        match self {
+            Self::Id(id) => Some(id),
+            Self::Guid(_) => None,
+        }
+    }
+
+    /// The schema GUID, or `None` when the message named an ID instead.
+    #[inline]
+    #[must_use]
+    pub fn as_guid(self) -> Option<SchemaGuid> {
+        match self {
+            Self::Guid(guid) => Some(guid),
+            Self::Id(_) => None,
+        }
+    }
+
+    /// The wire-format magic byte this key is encoded behind
+    /// (`0x00` for an ID, `0x01` for a GUID).
+    #[inline]
+    #[must_use]
+    pub fn magic_byte(self) -> u8 {
+        match self {
+            Self::Id(_) => crate::wire::MAGIC_BYTE_V0,
+            Self::Guid(_) => crate::wire::MAGIC_BYTE_V1,
+        }
+    }
+
+    /// Number of bytes this key occupies on the wire, magic byte included.
+    #[inline]
+    #[must_use]
+    pub fn encoded_len(self) -> usize {
+        match self {
+            Self::Id(_) => crate::wire::PREFIX_LEN_V0,
+            Self::Guid(_) => crate::wire::PREFIX_LEN_V1,
+        }
+    }
+}
+
+impl From<SchemaId> for SchemaKey {
+    #[inline]
+    fn from(id: SchemaId) -> Self {
+        Self::Id(id)
+    }
+}
+
+impl From<u32> for SchemaKey {
+    #[inline]
+    fn from(id: u32) -> Self {
+        Self::Id(SchemaId::new(id))
+    }
+}
+
+impl From<SchemaGuid> for SchemaKey {
+    #[inline]
+    fn from(guid: SchemaGuid) -> Self {
+        Self::Guid(guid)
+    }
+}
+
+impl PartialEq<SchemaId> for SchemaKey {
+    fn eq(&self, other: &SchemaId) -> bool {
+        matches!(self, Self::Id(id) if id == other)
+    }
+}
+
+impl PartialEq<u32> for SchemaKey {
+    fn eq(&self, other: &u32) -> bool {
+        matches!(self, Self::Id(id) if id.as_u32() == *other)
+    }
+}
+
+impl PartialEq<SchemaKey> for u32 {
+    fn eq(&self, other: &SchemaKey) -> bool {
+        other == self
+    }
+}
+
+impl PartialEq<SchemaGuid> for SchemaKey {
+    fn eq(&self, other: &SchemaGuid) -> bool {
+        matches!(self, Self::Guid(guid) if guid == other)
+    }
+}
+
+impl fmt::Display for SchemaKey {
+    /// Renders as `id 42` or `guid 550e8400-…`.
+    ///
+    /// Goes through `Formatter::pad` so width and alignment in a format string
+    /// apply to the whole rendering — `{key:<24}` lines up a column of mixed
+    /// IDs and GUIDs, which `write!` alone would silently ignore.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Id(id) => f.pad(&format!("id {id}")),
+            Self::Guid(guid) => f.pad(&format!("guid {guid}")),
+        }
+    }
+}
+
 /// Schema version within a subject.
 ///
 /// Registry APIs use signed 32-bit integers for version numbers; negative
 /// values (`-1`) conventionally refer to the latest version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "confluent", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "confluent", serde(transparent))]
+#[cfg_attr(feature = "serde-impls", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde-impls", serde(transparent))]
 pub struct SchemaVersion(i32);
 
 impl SchemaVersion {
@@ -157,7 +435,7 @@ impl FromStr for SchemaType {
         } else if s.eq_ignore_ascii_case("JSON") {
             Ok(Self::Json)
         } else {
-            Err(SchemaRegError::invalid_state(format!(
+            Err(SchemaRegError::config(format!(
                 "unknown schema type: '{s}'"
             )))
         }
@@ -195,8 +473,19 @@ impl SchemaReference {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
-    /// Globally unique schema ID.
-    pub id: SchemaId,
+    /// Registry-assigned schema ID, as it appears in wire format v0.
+    ///
+    /// `None` when the schema was fetched by GUID: `GET /schemas/guids/{guid}`
+    /// does not report a numeric ID, and a registry-assigned ID is not
+    /// derivable from a GUID — the same schema has different IDs in different
+    /// registries, which is the reason GUIDs exist.
+    pub id: Option<SchemaId>,
+    /// Registry-independent schema fingerprint, as it appears in wire format v1.
+    ///
+    /// `None` when the registry does not report one — every Confluent Schema
+    /// Registry before Platform 8, and every backend that has no equivalent
+    /// concept (Apicurio's native API, AWS Glue).
+    pub guid: Option<SchemaGuid>,
     /// Schema type (Avro, Protobuf, or JSON Schema).
     pub schema_type: SchemaType,
     /// Schema definition string.
@@ -220,19 +509,37 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// Create a schema with the given ID, type, and definition.
+    /// Create a schema identified by an ID or a GUID.
     ///
-    /// `version`, `subject`, and `references` default to `None`/empty.
+    /// `key` accepts a `u32`, a [`SchemaId`], or a [`SchemaGuid`] and populates
+    /// the matching field; the other stays `None`. `version`, `subject`, and
+    /// `references` default to `None`/empty.
     ///
-    /// Accepts any type that converts to `Arc<str>`: `&str`, `String`,
+    /// `schema` accepts anything convertible to `Arc<str>`: `&str`, `String`,
     /// or an already-allocated `Arc<str>`.
+    ///
+    /// ```rust
+    /// use schemreg::{Schema, SchemaGuid, SchemaId, SchemaType};
+    ///
+    /// let by_id = Schema::new(7u32, SchemaType::Avro, r#""string""#);
+    /// assert_eq!(by_id.id, Some(SchemaId::new(7)));
+    /// assert_eq!(by_id.guid, None);
+    ///
+    /// let guid: SchemaGuid = "550e8400-e29b-41d4-a716-446655440000".parse()?;
+    /// let by_guid = Schema::new(guid, SchemaType::Avro, r#""string""#);
+    /// assert_eq!(by_guid.id, None);
+    /// assert_eq!(by_guid.guid, Some(guid));
+    /// # Ok::<(), schemreg::SchemaRegError>(())
+    /// ```
     pub fn new(
-        id: impl Into<SchemaId>,
+        key: impl Into<SchemaKey>,
         schema_type: SchemaType,
         schema: impl Into<Arc<str>>,
     ) -> Self {
+        let key = key.into();
         Self {
-            id: id.into(),
+            id: key.as_id(),
+            guid: key.as_guid(),
             schema_type,
             schema: schema.into(),
             version: None,
@@ -242,6 +549,7 @@ impl Schema {
     }
 
     /// Set the subject and version.
+    #[must_use]
     pub fn with_subject(
         mut self,
         subject: impl Into<Arc<str>>,
@@ -253,9 +561,30 @@ impl Schema {
     }
 
     /// Set the schema references.
+    #[must_use]
     pub fn with_references(mut self, references: Vec<SchemaReference>) -> Self {
         self.references = references;
         self
+    }
+
+    /// Set the registry-independent schema GUID.
+    #[must_use]
+    pub fn with_guid(mut self, guid: SchemaGuid) -> Self {
+        self.guid = Some(guid);
+        self
+    }
+
+    /// The identifier to frame a payload written against this schema with.
+    ///
+    /// Prefers the [`guid`](Self::guid) when the registry reported one, since a
+    /// GUID identifies the same schema in every registry and an ID does not;
+    /// falls back to the [`id`](Self::id). `None` only if the registry reported
+    /// neither, which no backend in this crate produces.
+    #[must_use]
+    pub fn key(&self) -> Option<SchemaKey> {
+        self.guid
+            .map(SchemaKey::Guid)
+            .or_else(|| self.id.map(SchemaKey::Id))
     }
 }
 
@@ -312,19 +641,26 @@ impl fmt::Display for CompatibilityLevel {
 impl FromStr for CompatibilityLevel {
     type Err = SchemaRegError;
 
+    /// Parses case-insensitively, matching [`SchemaType`]. Apicurio returns
+    /// these values verbatim from a rule config; Confluent uppercases them.
     fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "BACKWARD" => Ok(Self::Backward),
-            "BACKWARD_TRANSITIVE" => Ok(Self::BackwardTransitive),
-            "FORWARD" => Ok(Self::Forward),
-            "FORWARD_TRANSITIVE" => Ok(Self::ForwardTransitive),
-            "FULL" => Ok(Self::Full),
-            "FULL_TRANSITIVE" => Ok(Self::FullTransitive),
-            "NONE" => Ok(Self::None),
-            _ => Err(SchemaRegError::invalid_state(format!(
-                "unknown compatibility level: '{s}'"
-            ))),
-        }
+        const LEVELS: [(&str, CompatibilityLevel); 7] = [
+            ("BACKWARD", CompatibilityLevel::Backward),
+            (
+                "BACKWARD_TRANSITIVE",
+                CompatibilityLevel::BackwardTransitive,
+            ),
+            ("FORWARD", CompatibilityLevel::Forward),
+            ("FORWARD_TRANSITIVE", CompatibilityLevel::ForwardTransitive),
+            ("FULL", CompatibilityLevel::Full),
+            ("FULL_TRANSITIVE", CompatibilityLevel::FullTransitive),
+            ("NONE", CompatibilityLevel::None),
+        ];
+        LEVELS
+            .iter()
+            .find(|(name, _)| s.eq_ignore_ascii_case(name))
+            .map(|(_, level)| *level)
+            .ok_or_else(|| SchemaRegError::config(format!("unknown compatibility level: '{s}'")))
     }
 }
 
@@ -489,7 +825,7 @@ mod tests {
     #[test]
     fn test_schema_new() {
         let s = Schema::new(1u32, SchemaType::Avro, r#"{"type":"string"}"#);
-        assert_eq!(s.id, SchemaId::new(1));
+        assert_eq!(s.id, Some(SchemaId::new(1)));
         assert_eq!(s.schema_type, SchemaType::Avro);
         assert_eq!(s.schema, Arc::from(r#"{"type":"string"}"#));
         assert_eq!(s.version, None);

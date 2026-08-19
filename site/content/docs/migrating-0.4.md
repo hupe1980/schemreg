@@ -1,11 +1,14 @@
-# Migrating from 0.3.x to 0.4.0
++++
+title = "Migrating to 0.4"
+description = "Upgrade path from schemreg 0.3.x to 0.4.0, including the critical Protobuf message-index framing fix."
+weight = 13
++++
 
-0.4.0 is a correctness release. Most upgrades are a version bump; the changes
-below are the ones that need a code edit or a decision.
+Most upgrades from 0.3.x are a version bump. The sections below are the ones
+that need a code edit or a decision.
 
-Start with the [CHANGELOG](../CHANGELOG.md) for the full list.
-
----
+For the complete list of changes see the
+[CHANGELOG](https://github.com/hupe1980/schemreg/blob/main/CHANGELOG.md).
 
 ## 1. Protobuf bytes changed — and 0.3.0's were wrong
 
@@ -104,7 +107,7 @@ schemreg = { version = "0.4", features = ["confluent"] }
 
 To genuinely use `aws-lc-rs`, install it as the process-default `CryptoProvider`
 in your application and depend on `reqwest` with a `-no-provider` feature. See
-[Security → Crypto provider](security.md#crypto-provider).
+[Security → Crypto provider](@/docs/security.md#crypto-provider).
 
 ---
 

@@ -22,6 +22,12 @@ const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum number of HTTP redirects followed for a single request.
 const MAX_REDIRECTS: usize = 3;
 
+/// `User-Agent` sent on every request.
+///
+/// Registries and the proxies in front of them attribute load and rate limits
+/// per client; an unset agent shows up as an anonymous blob in their logs.
+const USER_AGENT: &str = concat!("schemreg/", env!("CARGO_PKG_VERSION"));
+
 /// An HTTP response returned by [`HttpClient::request`].
 pub(crate) struct HttpResponse {
     pub status: u16,
@@ -181,6 +187,7 @@ impl HttpClient {
     /// left at their defaults.
     pub fn with_config(config: HttpClientConfig) -> Result<Self> {
         let mut builder = Client::builder()
+            .user_agent(USER_AGENT)
             // Schema registries never legitimately need a long redirect chain.
             // Bounding it low limits SSRF-style redirect pivots and keeps a
             // misconfigured proxy loop from burning the request timeout.
@@ -232,6 +239,12 @@ impl HttpClient {
     /// network-level errors) are retried according to the configured
     /// [`RetryPolicy`]. When a concurrency ceiling is configured, the permit is
     /// held for the whole logical request including retries.
+    ///
+    /// Retrying is safe for every request this crate issues, including the
+    /// `POST`s: registering a schema and testing compatibility are both
+    /// idempotent server-side — re-registering identical content returns the
+    /// existing ID rather than creating a second version. A caller adding new
+    /// non-idempotent operations must revisit that.
     pub async fn request(
         &self,
         method: &str,
@@ -315,7 +328,9 @@ impl HttpClient {
                     b.len()
                 )));
             }
-            builder = builder.body(b.to_vec());
+            // `Bytes::copy_from_slice` costs the same single copy `to_vec`
+            // would, but reqwest can then clone it per retry attempt for free.
+            builder = builder.body(Bytes::copy_from_slice(b));
         }
 
         let response = builder.send().await.map_err(SchemaRegError::network)?;

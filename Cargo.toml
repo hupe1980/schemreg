@@ -1,24 +1,31 @@
 [package]
 name        = "schemreg"
-version     = "0.4.0"
+version     = "0.5.0"
 edition     = "2024"
 rust-version = "1.88"
 authors     = ["hupe1980"]
-description = "Async Confluent + AWS Glue schema registry client — wire format, traits, caching, HTTP"
+description = "Async schema registry client for Kafka — Confluent (schema ID, GUID, and header framing), Apicurio v3, and AWS Glue"
 license     = "MIT OR Apache-2.0"
 repository  = "https://github.com/hupe1980/schemreg"
 documentation = "https://docs.rs/schemreg"
+homepage    = "https://hupe1980.github.io/schemreg"
 readme      = "README.md"
-keywords    = ["kafka", "schema-registry", "confluent", "avro", "glue"]
-exclude     = ["/.github", "/conformance"]
+keywords    = ["kafka", "schema-registry", "confluent", "avro", "protobuf"]
+exclude     = ["/.github", "/conformance", "/site"]
 categories  = ["encoding", "network-programming", "asynchronous"]
 
 [features]
 default          = []
+# Internal: `serde` impls on the public identifier types (SchemaId,
+# SchemaVersion, SchemaGuid). Enabled by every feature that speaks JSON to a
+# registry, so the derives follow `serde` rather than one particular backend.
+# Not documented as a user-facing knob; enable `confluent`, `apicurio`, `avro`,
+# or `json` instead.
+serde-impls      = ["dep:serde"]
 # Enable the built-in Confluent Schema Registry HTTP client and encoder.
 # The wire codec and WireFormatDecoder are always available without it.
 confluent        = [
-    "dep:serde",
+    "serde-impls",
     "dep:serde_json",
     "dep:reqwest",
     "dep:zeroize",
@@ -29,7 +36,7 @@ confluent        = [
 # Pairs AvroSchemaEncoder / AvroSchemaDecoder with any SchemaRegistryClient.
 # Does NOT require the `confluent` feature — the Confluent wire codec is
 # always available and the encoder/decoder accept any SchemaRegistryClient impl.
-avro             = ["dep:apache-avro", "dep:serde"]
+avro             = ["dep:apache-avro", "serde-impls"]
 # Enable the AWS Glue Schema Registry SDK client.
 # The Glue wire-format codec (18-byte header, ZLIB) and all Glue types are
 # always available without this feature. Only the AWS SDK client
@@ -43,7 +50,7 @@ native-tls-roots = ["reqwest?/rustls-tls-native-roots"]
 # Uses jsonschema (draft 2020-12) for schema validation and serde_json for
 # serialisation. Pairs JsonSchemaEncoder / JsonSchemaDecoder with any
 # SchemaRegistryClient impl. Does NOT require the `confluent` feature.
-json             = ["dep:jsonschema", "dep:serde", "dep:serde_json"]
+json             = ["dep:jsonschema", "serde-impls", "dep:serde_json"]
 # Enable Protobuf encode/decode + Confluent wire-format framing, including
 # automatic derivation of the message-index path from the message descriptor.
 # Uses prost for (de)serialisation and prost-reflect for descriptor reflection.
@@ -54,7 +61,7 @@ protobuf         = ["dep:prost", "dep:prost-reflect"]
 # address model). Supports Avro, JSON Schema, and Protobuf artifact types.
 # Does NOT require the `confluent` feature.
 apicurio         = [
-    "dep:serde",
+    "serde-impls",
     "dep:serde_json",
     "dep:reqwest",
     "dep:zeroize",
@@ -86,6 +93,9 @@ tracing      = "0.1"
 
 # Synchronization (non-poisoning RwLock)
 parking_lot  = "0.12"
+
+# Confluent schema GUID + Glue schema-version ID. `std` only: no RNG, no deps.
+uuid         = { version = "1", default-features = false, features = ["std"] }
 
 # avro feature
 apache-avro  = { version = "0.21", default-features = false, optional = true }
@@ -145,6 +155,10 @@ required-features = ["protobuf"]
 
 [[example]]
 name = "confluent_encode_decode"
+
+[[example]]
+name = "schema_resolution"
+required-features = ["confluent"]
 
 [package.metadata.docs.rs]
 all-features = true

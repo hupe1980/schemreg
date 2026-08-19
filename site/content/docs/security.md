@@ -1,8 +1,10 @@
-# Security
++++
+title = "Security"
+description = "Threat model and controls: credential handling, path-traversal defence, TLS posture, denial-of-service bounds, schema-reference traversal, and supply-chain gates."
+weight = 9
++++
 
 What this crate defends against, how, and what it deliberately does not.
-
----
 
 ## Threat model
 
@@ -13,7 +15,9 @@ kinds of untrusted input:
    producer is compromised or if the topic is multi-tenant.
 2. **Registry responses** — trusted less than they look; a compromised or
    misconfigured registry, or anything on the path to it, can return arbitrary
-   bytes.
+   bytes. Note that a registry response can also *direct further requests*: a
+   schema's `references` list names other subjects to fetch, so the response is
+   an input to a traversal, not just a value.
 
 And one kind of caller-supplied input that is often attacker-influenced without
 anyone noticing: **subject names**, which are frequently derived from topic
@@ -30,6 +34,7 @@ names, tenant identifiers, or request fields.
 | `Debug` output | Renders `basic(***)` / `bearer(***)`; never the value |
 | `tracing` events | No credential is ever a field. Events carry URL, status, attempt, delay, error text |
 | In URLs | `user:pass@host` is rejected at construction, authority-scoped so `?q=a@b` still works |
+| In headers | Only `Authorization` carries them; the `User-Agent` is a fixed `schemreg/{version}` string with nothing caller-derived in it |
 | Over cleartext | A hard `Config` error off-loopback. See below |
 
 ### The loopback exemption
@@ -39,9 +44,8 @@ non-loopback host, and a warning for `localhost`, `127.0.0.0/8`, and `::1`.
 
 This is the same "potentially trustworthy origin" rule browsers apply: loopback
 traffic never leaves the machine, so there is no network on which to intercept
-it. `http://localhost:8081` with basic auth is the standard docker-compose and
-local-development setup, and refusing it outright pushed people towards worse
-workarounds.
+it — and `http://localhost:8081` with basic auth is the standard
+docker-compose setup.
 
 A private-range address like `10.0.0.5` is **not** exempt. It is still a real
 network with real switches.
@@ -80,6 +84,10 @@ independently, because it splits on `/` before encoding — so `../secrets` woul
 otherwise become `/groups/../artifacts/secrets` and escape the group boundary
 that is Apicurio's whole multi-tenancy mechanism.
 
+Every Apicurio operation routes through one `artifact_id` constructor that
+performs those checks, so a route added later cannot skip them by calling
+`ArtifactId::from_subject` directly.
+
 ---
 
 ## TLS
@@ -114,12 +122,43 @@ application and depend on `reqwest` with a `-no-provider` feature.
 | Oversized request | 4 MiB cap on schema text, checked before the socket is touched |
 | Decompression bomb | Glue ZLIB output capped at 128 MiB **during** decompression |
 | Protobuf index explosion | Count capped at 512 before any `Vec::with_capacity` sized from input |
-| Varint overflow | Shift-width guard; out-of-domain values rejected |
+| Varint overflow | Shift-width guard; out-of-domain and negative values rejected |
+| Schema-reference chain | Avro **and** JSON Schema dependency closures capped at 32 levels deep and 256 schemas; a visited set makes a reference **cycle** terminate instead of recursing |
 | Unbounded cache growth | Every cache is bounded (default 1 000 entries) with FIFO eviction |
 | Oversized subject | 512 bytes |
 | Retry amplification | Bounded attempts, capped delay, `Retry-After` honoured, **jittered** back-off |
 | Connection exhaustion | `max_concurrent_requests` on both builders; coalescing collapses same-ID bursts |
-| JSON Schema remote `$ref` | `jsonschema` is built without `resolve-http` — schema compilation **cannot** make outbound requests (no SSRF) |
+| JSON Schema remote `$ref` | `jsonschema` is built without `resolve-http`, **and** the retriever this crate installs answers only from schemas already fetched via the registry's own `references` list — compilation cannot make outbound requests (no SSRF) |
+
+### Schema-reference traversal
+
+Resolving a schema that uses the `references` mechanism means following a graph
+the **registry** controls. Three bounds keep that from becoming a
+denial-of-service against the client, and they apply identically to the Avro and
+the JSON Schema resolver:
+
+- a visited set keyed by `(subject, version)`, so a cycle `A → B → A`
+  terminates and a diamond is fetched once rather than once per path;
+- a depth cap of 32, which no real schema graph approaches;
+- a total cap of 256 resolved schemas.
+
+Nothing in the Confluent API forbids a cycle, so this is a real shape a registry
+can be made to return, not a theoretical one.
+
+For JSON Schema, bounding the traversal to the registry's own reference list is
+also what closes the SSRF path. A `$ref` is a URI, and a permissive resolver
+would fetch it. The retriever installed here has no network access: it answers
+from the fetched closure and from documents the caller supplied to
+`dependencies`, and errors on anything else.
+
+### Producer write permissions
+
+`SchemaResolution::AutoRegister` is the default and needs `Subject:Write` — a
+usability default, not a security one: a producer holding write credentials
+creates schema versions the moment its local schema drifts.
+[`LookupOnly`](@/docs/producers.md) needs only `Subject:Read` and turns that
+drift into a startup failure. Where the registry is a governance boundary, grant
+read-only credentials and set it.
 
 ### Retry jitter
 
@@ -147,9 +186,8 @@ hostile or mistaken `Retry-After: 86400` cannot wedge the caller.
 | Source registry | crates.io only; git and path dependencies rejected |
 | `Cargo.lock` | committed; the MSRV job builds `--locked` |
 
-Running `cargo deny` with the *default* feature set — as this project did before
-0.4.0 — scans almost nothing, because every backend is optional. If you adopt
-this pattern, set `[graph] all-features = true`.
+With every backend optional, `cargo deny` on the *default* feature set scans
+almost nothing. `[graph] all-features = true` is what makes the gate real.
 
 ---
 

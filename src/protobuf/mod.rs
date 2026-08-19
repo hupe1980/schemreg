@@ -7,7 +7,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.4", features = ["protobuf"] }
+//! schemreg = { version = "0.5", features = ["protobuf"] }
 //! ```
 //!
 //! # Why this module exists
@@ -69,12 +69,15 @@ use prost::Message;
 use prost_reflect::MessageDescriptor;
 
 use crate::cache_inner::InMemoryCache;
-use crate::codec_cache::{DEFAULT_MAX_SUBJECT_CACHE_ENTRIES, subject_resolution_cancelled};
 use crate::error::{Result, SchemaRegError};
+use crate::resolver::{
+    DEFAULT_MAX_SUBJECT_CACHE_ENTRIES, Framing, SchemaResolution, resolve_schema_key,
+    subject_resolution_cancelled,
+};
 use crate::subject::SubjectNameStrategy;
 use crate::traits::SchemaRegistryClient;
-use crate::types::{EncodeTarget, SchemaId, SchemaReference, SchemaType};
-use crate::wire::{decode_protobuf_message_indexes, decode_wire_format_bytes};
+use crate::types::{EncodeTarget, SchemaId, SchemaKey, SchemaReference, SchemaType};
+use crate::wire::{HeaderFramed, decode_protobuf_message_indexes, decode_wire_format_bytes};
 
 /// Field number of `FileDescriptorProto.message_type`.
 const FILE_MESSAGE_TYPE_FIELD: i32 = 4;
@@ -100,45 +103,58 @@ const NESTED_TYPE_FIELD: i32 = 3;
 /// let path = message_index_path(&Order::default().descriptor())?;
 /// assert_eq!(path, vec![0]); // first top-level message
 /// ```
-pub fn message_index_path(descriptor: &MessageDescriptor) -> Result<Vec<i32>> {
-    let path = descriptor.path();
+pub fn message_index_path(descriptor: &MessageDescriptor) -> Result<Vec<u32>> {
+    message_index_path_from(descriptor.path(), descriptor.full_name())
+}
 
+/// The whole of [`message_index_path`], over a raw descriptor path.
+///
+/// Split out so the tests can drive malformed shapes — an enum's path, an odd
+/// length — that `prost-reflect` will not construct. A test that re-implemented
+/// this validation would pass while the real function was broken.
+fn message_index_path_from(path: &[i32], full_name: &str) -> Result<Vec<u32>> {
     // A message path alternates (field number, index): [4, i] then [3, j]...
     if path.len() < 2 || !path.len().is_multiple_of(2) {
         return Err(SchemaRegError::config(format!(
-            "descriptor for '{}' has an unexpected path {:?}; expected an \
-             alternating message_type/nested_type chain",
-            descriptor.full_name(),
-            path
+            "descriptor for '{full_name}' has an unexpected path {path:?}; expected an \
+             alternating message_type/nested_type chain"
         )));
     }
     if path[0] != FILE_MESSAGE_TYPE_FIELD {
         return Err(SchemaRegError::config(format!(
-            "descriptor for '{}' does not start at FileDescriptorProto.message_type \
+            "descriptor for '{full_name}' does not start at FileDescriptorProto.message_type \
              (field {FILE_MESSAGE_TYPE_FIELD}); got field {}",
-            descriptor.full_name(),
             path[0]
         )));
     }
     for (level, chunk) in path.chunks_exact(2).enumerate().skip(1) {
         if chunk[0] != NESTED_TYPE_FIELD {
             return Err(SchemaRegError::config(format!(
-                "descriptor for '{}' has a non-nested_type segment at level {level}: \
+                "descriptor for '{full_name}' has a non-nested_type segment at level {level}: \
                  expected field {NESTED_TYPE_FIELD}, got {}",
-                descriptor.full_name(),
                 chunk[0]
             )));
         }
     }
 
-    Ok(path.iter().skip(1).step_by(2).copied().collect())
+    path.iter()
+        .skip(1)
+        .step_by(2)
+        .map(|&position| {
+            u32::try_from(position).map_err(|_| {
+                SchemaRegError::config(format!(
+                    "descriptor for '{full_name}' has a negative position {position} in its path"
+                ))
+            })
+        })
+        .collect()
 }
 
 // ── Encoder ───────────────────────────────────────────────────────────────
 
 /// Cached subject-resolution entry.
 struct EncoderEntry {
-    schema_id: SchemaId,
+    key: SchemaKey,
 }
 
 /// Serialises a [`prost::Message`] to Confluent-framed Protobuf bytes.
@@ -153,11 +169,13 @@ struct EncoderEntry {
 pub struct ProtobufSchemaEncoder<C> {
     registry: C,
     schema_str: String,
-    message_indexes: Vec<i32>,
+    message_indexes: Vec<u32>,
     /// Fully-qualified message name, used by the record-name subject strategies.
     full_name: String,
     strategy: SubjectNameStrategy,
     references: Vec<SchemaReference>,
+    resolution: SchemaResolution,
+    framing: Framing,
     cache: InMemoryCache<String, EncoderEntry>,
 }
 
@@ -167,6 +185,8 @@ impl<C> std::fmt::Debug for ProtobufSchemaEncoder<C> {
             .field("full_name", &self.full_name)
             .field("message_indexes", &self.message_indexes)
             .field("strategy", &self.strategy)
+            .field("resolution", &self.resolution)
+            .field("framing", &self.framing)
             .field("cached_subjects", &self.cache.len())
             .finish_non_exhaustive()
     }
@@ -183,22 +203,31 @@ impl<C: SchemaRegistryClient> ProtobufSchemaEncoder<C> {
     /// Derived from the descriptor unless overridden with
     /// [`message_indexes`](ProtobufSchemaEncoderBuilder::message_indexes).
     #[must_use]
-    pub fn message_indexes(&self) -> &[i32] {
+    pub fn message_indexes(&self) -> &[u32] {
         &self.message_indexes
     }
 
-    /// Return the cached schema ID for `subject`, if it has been resolved.
+    /// Return the cached identifier for `subject`, if it has been resolved.
     #[must_use]
-    pub fn cached_schema_id(&self, subject: &str) -> Option<SchemaId> {
-        self.cache.get(&subject.to_string()).map(|e| e.schema_id)
+    pub fn cached_schema_key(&self, subject: &str) -> Option<SchemaKey> {
+        self.cache.get(&subject.to_string()).map(|e| e.key)
     }
 
-    /// Number of `subject → schema ID` mappings currently cached.
+    /// Return the cached schema ID for `subject`, if it has been resolved
+    /// **and** framed as a numeric ID (`None` under [`Framing::SchemaGuid`]).
+    #[must_use]
+    pub fn cached_schema_id(&self, subject: &str) -> Option<SchemaId> {
+        self.cached_schema_key(subject).and_then(SchemaKey::as_id)
+    }
+
+    /// Number of `subject → identifier` mappings currently cached.
     pub fn cached_subject_count(&self) -> usize {
         self.cache.len()
     }
 
-    /// Forget the cached schema ID for `subject`.
+    /// Forget the cached identifier for `subject`, forcing the next encode to
+    /// resolve it again — the way to pick up a newer version under
+    /// [`SchemaResolution::UseLatestVersion`] without a restart.
     pub fn invalidate_subject(&self, subject: &str) {
         self.cache.invalidate(&subject.to_string());
     }
@@ -206,16 +235,17 @@ impl<C: SchemaRegistryClient> ProtobufSchemaEncoder<C> {
     async fn resolve_subject(&self, subject: &str) -> Result<Arc<EncoderEntry>> {
         self.cache
             .get_or_fetch(subject.to_string(), || async {
-                let schema_id = self
-                    .registry
-                    .register_schema(
-                        subject,
-                        &self.schema_str,
-                        SchemaType::Protobuf,
-                        &self.references,
-                    )
-                    .await?;
-                Ok(Arc::new(EncoderEntry { schema_id }))
+                let key = resolve_schema_key(
+                    &self.registry,
+                    self.resolution,
+                    self.framing,
+                    subject,
+                    &self.schema_str,
+                    SchemaType::Protobuf,
+                    &self.references,
+                )
+                .await?;
+                Ok(Arc::new(EncoderEntry { key }))
             })
             .await
     }
@@ -239,9 +269,37 @@ impl<C: SchemaRegistryClient> ProtobufSchemaEncoder<C> {
         let entry = self.resolve_subject(&subject).await?;
         let body = message.encode_to_vec();
         Ok(crate::wire::encode_protobuf_wire_format(
-            entry.schema_id,
+            entry.key,
             &self.message_indexes,
             &body,
+        ))
+    }
+
+    /// Serialise `message` with the identifier **and** the message-index array
+    /// in a Kafka header instead of in the payload prefix.
+    ///
+    /// The header value carries the magic byte, the identifier, and the
+    /// message-index path; the payload is bare Protobuf. Write both, or a
+    /// consumer can recover neither the schema nor the message type.
+    ///
+    /// # Errors
+    ///
+    /// As [`encode`](Self::encode).
+    pub async fn encode_with_header<M: Message>(
+        &self,
+        message: &M,
+        topic: &str,
+        target: EncodeTarget,
+    ) -> Result<HeaderFramed> {
+        let subject = self
+            .strategy
+            .subject_name(topic, Some(&self.full_name), target)?;
+        let entry = self.resolve_subject(&subject).await?;
+        Ok(HeaderFramed::new(
+            target,
+            entry.key,
+            Some(&self.message_indexes),
+            Bytes::from(message.encode_to_vec()),
         ))
     }
 }
@@ -251,9 +309,11 @@ pub struct ProtobufSchemaEncoderBuilder<C> {
     registry: Option<C>,
     schema: Option<String>,
     descriptor: Option<MessageDescriptor>,
-    message_indexes: Option<Vec<i32>>,
+    message_indexes: Option<Vec<u32>>,
     strategy: SubjectNameStrategy,
     references: Vec<SchemaReference>,
+    resolution: SchemaResolution,
+    framing: Framing,
     max_subject_cache_entries: usize,
 }
 
@@ -268,6 +328,8 @@ impl<C> std::fmt::Debug for ProtobufSchemaEncoderBuilder<C> {
             )
             .field("message_indexes", &self.message_indexes)
             .field("strategy", &self.strategy)
+            .field("resolution", &self.resolution)
+            .field("framing", &self.framing)
             .finish()
     }
 }
@@ -281,8 +343,23 @@ impl<C: SchemaRegistryClient> ProtobufSchemaEncoderBuilder<C> {
             message_indexes: None,
             strategy: SubjectNameStrategy::TopicName,
             references: Vec::new(),
+            resolution: SchemaResolution::default(),
+            framing: Framing::default(),
             max_subject_cache_entries: DEFAULT_MAX_SUBJECT_CACHE_ENTRIES,
         }
+    }
+
+    /// Choose how a subject resolves to an identifier
+    /// (default: [`SchemaResolution::AutoRegister`]).
+    pub fn resolution(mut self, resolution: SchemaResolution) -> Self {
+        self.resolution = resolution;
+        self
+    }
+
+    /// Choose the wire-format version (default: [`Framing::SchemaId`], v0).
+    pub fn framing(mut self, framing: Framing) -> Self {
+        self.framing = framing;
+        self
     }
 
     /// Set the schema registry client (required).
@@ -316,7 +393,7 @@ impl<C: SchemaRegistryClient> ProtobufSchemaEncoderBuilder<C> {
     /// comes from the same `.proto` that was registered. Use this only when the
     /// registered schema's message ordering differs from the compiled
     /// descriptor's, which is itself a situation worth fixing at the source.
-    pub fn message_indexes(mut self, indexes: Vec<i32>) -> Self {
+    pub fn message_indexes(mut self, indexes: Vec<u32>) -> Self {
         self.message_indexes = Some(indexes);
         self
     }
@@ -376,6 +453,8 @@ impl<C: SchemaRegistryClient> ProtobufSchemaEncoderBuilder<C> {
             full_name: descriptor.full_name().to_string(),
             strategy: self.strategy,
             references: self.references,
+            resolution: self.resolution,
+            framing: self.framing,
             cache: InMemoryCache::new(
                 Some(self.max_subject_cache_entries.max(1)),
                 subject_resolution_cancelled,
@@ -389,10 +468,10 @@ impl<C: SchemaRegistryClient> ProtobufSchemaEncoderBuilder<C> {
 /// A Confluent-framed Protobuf message, unframed.
 #[derive(Debug, Clone)]
 pub struct UnframedProtobuf {
-    /// Schema ID from the wire header.
-    pub schema_id: SchemaId,
+    /// The schema identifier the wire prefix named — an ID (v0) or a GUID (v1).
+    pub key: SchemaKey,
     /// Message-index path identifying which message type was serialised.
-    pub message_indexes: Vec<i32>,
+    pub message_indexes: Vec<u32>,
     /// The Protobuf payload, header and message-index stripped.
     pub payload: Bytes,
 }
@@ -411,7 +490,7 @@ pub struct UnframedProtobuf {
 /// answer.
 pub struct ProtobufSchemaDecoder<C> {
     registry: C,
-    expected_indexes: Option<Vec<i32>>,
+    expected_indexes: Option<Vec<u32>>,
     expected_name: Option<String>,
 }
 
@@ -462,8 +541,8 @@ impl<C: SchemaRegistryClient> ProtobufSchemaDecoder<C> {
     /// Returns a wire-format error if the header or the message-index array is
     /// malformed.
     pub fn unframe(&self, data: &Bytes) -> Result<UnframedProtobuf> {
-        let (schema_id, after_header) = decode_wire_format_bytes(data)?;
-        let (message_indexes, offset) = decode_protobuf_message_indexes(&after_header)?;
+        let (key, after_prefix) = decode_wire_format_bytes(data)?;
+        let (message_indexes, offset) = decode_protobuf_message_indexes(&after_prefix)?;
 
         if let Some(expected) = &self.expected_indexes
             && message_indexes != *expected
@@ -479,9 +558,9 @@ impl<C: SchemaRegistryClient> ProtobufSchemaDecoder<C> {
         }
 
         Ok(UnframedProtobuf {
-            schema_id,
+            key,
             message_indexes,
-            payload: after_header.slice(offset..),
+            payload: after_prefix.slice(offset..),
         })
     }
 
@@ -506,7 +585,7 @@ impl<C: SchemaRegistryClient> ProtobufSchemaDecoder<C> {
     /// Returns an error if the framing is invalid or the registry lookup fails.
     pub async fn schema_for(&self, data: &Bytes) -> Result<Arc<crate::types::Schema>> {
         let unframed = self.unframe(data)?;
-        self.registry.get_schema_by_id(unframed.schema_id).await
+        self.registry.get_schema_by_key(unframed.key).await
     }
 }
 
@@ -562,7 +641,7 @@ mod tests {
             .expect("the synthetic descriptor set is well-formed")
     }
 
-    fn index_for(pool: &DescriptorPool, name: &str) -> Vec<i32> {
+    fn index_for(pool: &DescriptorPool, name: &str) -> Vec<u32> {
         let Some(descriptor) = pool.get_message_by_name(name) else {
             unreachable!("{name} must exist in the pool")
         };
@@ -636,8 +715,8 @@ mod tests {
     #[test]
     fn a_non_message_path_is_rejected() {
         // Field 5 is FileDescriptorProto.enum_type, not message_type.
-        let err =
-            validate_path_shape(&[5, 0], "test.Colour").expect_err("an enum path must be rejected");
+        let err = message_index_path_from(&[5, 0], "test.Colour")
+            .expect_err("an enum path must be rejected");
         assert!(err.is_config_error(), "{err}");
     }
 
@@ -645,29 +724,31 @@ mod tests {
     fn a_malformed_path_is_rejected() {
         for bad in [vec![], vec![4], vec![4, 0, 3]] {
             assert!(
-                validate_path_shape(&bad, "test.X").is_err(),
+                message_index_path_from(&bad, "test.X").is_err(),
                 "{bad:?} must be rejected"
             );
         }
         // A second segment that is not nested_type (field 3).
-        assert!(validate_path_shape(&[4, 0, 2, 1], "test.X").is_err());
+        assert!(message_index_path_from(&[4, 0, 2, 1], "test.X").is_err());
+        // A negative position cannot be a descriptor index.
+        assert!(message_index_path_from(&[4, -1], "test.X").is_err());
     }
 
-    /// Mirror of the validation inside [`message_index_path`], callable with a
-    /// raw path so malformed shapes `prost-reflect` will not construct can
-    /// still be covered.
-    fn validate_path_shape(path: &[i32], name: &str) -> Result<Vec<i32>> {
-        if path.len() < 2 || !path.len().is_multiple_of(2) {
-            return Err(SchemaRegError::config(format!("{name}: bad path length")));
+    /// The raw-path entry point must agree with the descriptor one, or the
+    /// tests above would be validating a different function than production
+    /// uses.
+    #[test]
+    fn the_raw_path_entry_point_matches_the_descriptor_one() {
+        let pool = test_pool();
+        for name in ["test.Order", "test.Invoice.Tax.Rate"] {
+            let Some(descriptor) = pool.get_message_by_name(name) else {
+                unreachable!("{name} must exist in the pool")
+            };
+            assert_eq!(
+                message_index_path(&descriptor).ok(),
+                message_index_path_from(descriptor.path(), descriptor.full_name()).ok(),
+                "{name}"
+            );
         }
-        if path[0] != FILE_MESSAGE_TYPE_FIELD {
-            return Err(SchemaRegError::config(format!("{name}: not a message")));
-        }
-        for chunk in path.chunks_exact(2).skip(1) {
-            if chunk[0] != NESTED_TYPE_FIELD {
-                return Err(SchemaRegError::config(format!("{name}: bad nesting")));
-            }
-        }
-        Ok(path.iter().skip(1).step_by(2).copied().collect())
     }
 }

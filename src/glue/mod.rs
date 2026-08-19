@@ -101,63 +101,78 @@ impl std::error::Error for WarmGlueCacheError {}
 
 /// Schema version identifier used by the AWS Glue Schema Registry.
 ///
-/// Internally a 128-bit UUID stored as big-endian bytes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GlueSchemaVersionId([u8; UUID_SIZE]);
+/// Wraps a [`uuid::Uuid`], whose byte order is already the big-endian
+/// ("network order") layout the Glue wire header uses, so
+/// [`as_bytes`](Self::as_bytes) is exactly what goes on the topic. Converts
+/// freely to and from `Uuid`, which is what the AWS SDK hands back as a string.
+///
+/// The newtype keeps a Glue version ID from being confused with a
+/// [`SchemaGuid`](crate::SchemaGuid) — also a UUID, but a Confluent concept.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GlueSchemaVersionId(uuid::Uuid);
 
 impl GlueSchemaVersionId {
-    /// Create from raw big-endian UUID bytes.
-    pub fn from_bytes(bytes: [u8; UUID_SIZE]) -> Self {
-        Self(bytes)
+    /// Wrap the 16 big-endian bytes exactly as they appear in the wire header.
+    #[inline]
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; UUID_SIZE]) -> Self {
+        Self(uuid::Uuid::from_bytes(bytes))
     }
 
-    /// Return the raw big-endian UUID bytes.
-    pub fn as_bytes(&self) -> &[u8; UUID_SIZE] {
+    /// Return the 16 big-endian bytes as they appear in the wire header.
+    #[inline]
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; UUID_SIZE] {
+        self.0.as_bytes()
+    }
+
+    /// Borrow the underlying [`uuid::Uuid`].
+    #[inline]
+    #[must_use]
+    pub const fn as_uuid(&self) -> &uuid::Uuid {
         &self.0
     }
 }
 
-impl From<[u8; UUID_SIZE]> for GlueSchemaVersionId {
-    fn from(bytes: [u8; UUID_SIZE]) -> Self {
-        Self(bytes)
+impl From<uuid::Uuid> for GlueSchemaVersionId {
+    #[inline]
+    fn from(uuid: uuid::Uuid) -> Self {
+        Self(uuid)
     }
 }
 
-impl From<GlueSchemaVersionId> for [u8; UUID_SIZE] {
+impl From<GlueSchemaVersionId> for uuid::Uuid {
+    #[inline]
     fn from(id: GlueSchemaVersionId) -> Self {
         id.0
     }
 }
 
+impl From<[u8; UUID_SIZE]> for GlueSchemaVersionId {
+    #[inline]
+    fn from(bytes: [u8; UUID_SIZE]) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
+
+impl From<GlueSchemaVersionId> for [u8; UUID_SIZE] {
+    #[inline]
+    fn from(id: GlueSchemaVersionId) -> Self {
+        id.0.into_bytes()
+    }
+}
+
 impl fmt::Display for GlueSchemaVersionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let b = &self.0;
-        write!(
-            f,
-            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            b[0],
-            b[1],
-            b[2],
-            b[3],
-            b[4],
-            b[5],
-            b[6],
-            b[7],
-            b[8],
-            b[9],
-            b[10],
-            b[11],
-            b[12],
-            b[13],
-            b[14],
-            b[15]
-        )
+        // `Uuid`'s Display is the canonical hyphenated lowercase form, which is
+        // the shape Glue's `SchemaVersionId` field uses.
+        self.0.fmt(f)
     }
 }
 
 impl fmt::Debug for GlueSchemaVersionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "GlueSchemaVersionId({self})")
+        write!(f, "GlueSchemaVersionId({})", self.0)
     }
 }
 
@@ -165,40 +180,9 @@ impl FromStr for GlueSchemaVersionId {
     type Err = SchemaRegError;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let bytes = s.as_bytes();
-        if bytes.len() != 36 {
-            return Err(SchemaRegError::invalid_state(format!(
-                "invalid UUID: expected 36 characters, got {}",
-                bytes.len()
-            )));
-        }
-        if bytes[8] != b'-' || bytes[13] != b'-' || bytes[18] != b'-' || bytes[23] != b'-' {
-            return Err(SchemaRegError::invalid_state(
-                "invalid UUID format: expected dashes at positions 8, 13, 18, 23",
-            ));
-        }
-        let hex_positions: [usize; UUID_SIZE] =
-            [0, 2, 4, 6, 9, 11, 14, 16, 19, 21, 24, 26, 28, 30, 32, 34];
-        let mut uuid_bytes = [0u8; UUID_SIZE];
-        for (i, &pos) in hex_positions.iter().enumerate() {
-            uuid_bytes[i] = parse_hex_byte(bytes[pos], bytes[pos + 1]).ok_or_else(|| {
-                SchemaRegError::invalid_state("invalid UUID: non-hexadecimal character")
-            })?;
-        }
-        Ok(Self(uuid_bytes))
-    }
-}
-
-fn parse_hex_byte(hi: u8, lo: u8) -> Option<u8> {
-    Some((hex_digit(hi)? << 4) | hex_digit(lo)?)
-}
-
-fn hex_digit(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
+        uuid::Uuid::parse_str(s).map(Self).map_err(|e| {
+            SchemaRegError::config(format!("invalid Glue schema version ID '{s}': {e}"))
+        })
     }
 }
 
@@ -415,7 +399,7 @@ pub(crate) fn validate_glue_wire_header(
     };
     let mut uuid_bytes = [0u8; UUID_SIZE];
     uuid_bytes.copy_from_slice(&data[2..GLUE_HEADER_SIZE]);
-    Ok((GlueSchemaVersionId(uuid_bytes), compression))
+    Ok((GlueSchemaVersionId::from_bytes(uuid_bytes), compression))
 }
 
 #[cfg(feature = "glue")]

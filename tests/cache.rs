@@ -402,7 +402,7 @@ async fn cached_delegates_get_latest_schema() {
     let cached = CachedSchemaRegistry::new(mock);
 
     let schema = cached.get_latest_schema("subject-5").await.unwrap();
-    assert_eq!(schema.id, 5u32);
+    assert_eq!(schema.id, Some(SchemaId::from(5u32)));
 
     // get_latest_schema always goes to backend but caches by ID.
     let schema2 = cached.get_schema_by_id(SchemaId::from(5u32)).await.unwrap();
@@ -423,7 +423,7 @@ async fn get_schema_by_id_returns_shared_pointer() {
 
     // Both arcs point to the same allocation — zero-copy cache hit.
     assert!(std::sync::Arc::ptr_eq(&arc1, &arc2));
-    assert_eq!(arc1.id, 7u32);
+    assert_eq!(arc1.id, Some(SchemaId::from(7u32)));
     // Only one backend call.
     assert_eq!(cached.inner().calls(), 1);
 }
@@ -519,4 +519,174 @@ async fn aborted_leader_unblocks_waiters_with_error() {
             Ok(_inner) => {}
         }
     }
+}
+
+// ── Cross-identifier indexing and delete invalidation ─────────────────────
+
+/// A registry that reports **both** identifiers, as Confluent Platform 8 does,
+/// and counts each kind of lookup separately.
+#[derive(Default)]
+struct DualIdRegistry {
+    by_id: AtomicU32,
+    by_guid: AtomicU32,
+    deletes: AtomicU32,
+}
+
+const DUAL_GUID: schemreg::SchemaGuid = schemreg::SchemaGuid::from_bytes([0x5A; 16]);
+
+impl DualIdRegistry {
+    fn schema(&self, subject: &str) -> Arc<Schema> {
+        Arc::new(
+            Schema::new(SchemaId::from(4u32), SchemaType::Avro, r#""string""#)
+                .with_guid(DUAL_GUID)
+                .with_subject(subject, 1i32),
+        )
+    }
+}
+
+impl SchemaRegistryClient for DualIdRegistry {
+    async fn get_schema_by_id(&self, _: SchemaId) -> Result<Arc<Schema>> {
+        self.by_id.fetch_add(1, Ordering::SeqCst);
+        Ok(self.schema("orders-value"))
+    }
+    async fn get_schema_by_guid(&self, _: schemreg::SchemaGuid) -> Result<Arc<Schema>> {
+        self.by_guid.fetch_add(1, Ordering::SeqCst);
+        Ok(self.schema("orders-value"))
+    }
+    async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
+        Ok(self.schema(subject))
+    }
+    async fn get_schema_by_version(&self, subject: &str, _: SchemaVersion) -> Result<Arc<Schema>> {
+        Ok(self.schema(subject))
+    }
+    async fn register_schema(
+        &self,
+        _: &str,
+        _: &str,
+        _: SchemaType,
+        _: &[SchemaReference],
+    ) -> Result<SchemaId> {
+        Ok(SchemaId::from(4u32))
+    }
+    async fn delete_subject(&self, _: &str, _: bool) -> Result<Vec<SchemaVersion>> {
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![SchemaVersion::new(1)])
+    }
+    async fn delete_version(&self, _: &str, v: SchemaVersion, _: bool) -> Result<SchemaVersion> {
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        Ok(v)
+    }
+}
+
+/// One schema, two identifiers, one round-trip. A by-ID fetch must index the
+/// GUID it reported, so a later v1-framed record is served locally — the two
+/// maps share one `Arc<Schema>`, so the duplicate costs a pointer.
+#[tokio::test]
+async fn a_by_id_fetch_indexes_the_guid_it_reported() {
+    let registry = Arc::new(DualIdRegistry::default());
+    let cached = CachedSchemaRegistry::new(Arc::clone(&registry));
+
+    let by_id = cached.get_schema_by_id(SchemaId::from(4u32)).await.unwrap();
+    let by_guid = cached.get_schema_by_guid(DUAL_GUID).await.unwrap();
+
+    assert_eq!(registry.by_id.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        registry.by_guid.load(Ordering::SeqCst),
+        0,
+        "the GUID lookup must be served from the ID fetch"
+    );
+    assert!(Arc::ptr_eq(&by_id, &by_guid), "both maps share one schema");
+}
+
+/// …and symmetrically.
+#[tokio::test]
+async fn a_by_guid_fetch_indexes_the_id_it_reported() {
+    let registry = Arc::new(DualIdRegistry::default());
+    let cached = CachedSchemaRegistry::new(Arc::clone(&registry));
+
+    cached.get_schema_by_guid(DUAL_GUID).await.unwrap();
+    cached.get_schema_by_id(SchemaId::from(4u32)).await.unwrap();
+
+    assert_eq!(registry.by_guid.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.by_id.load(Ordering::SeqCst), 0);
+}
+
+/// A cached entry that names a deleted subject must go. Serving it afterwards
+/// would report a subject the registry no longer lists.
+#[tokio::test]
+async fn deleting_a_subject_drops_what_was_cached_under_it() {
+    let registry = Arc::new(DualIdRegistry::default());
+    let cached = CachedSchemaRegistry::new(Arc::clone(&registry));
+
+    cached.get_latest_schema("orders-value").await.unwrap();
+    assert_eq!(cached.cache_len(), 1);
+    assert_eq!(cached.guid_cache_len(), 1);
+
+    let deleted = cached.delete_subject("orders-value", true).await.unwrap();
+    assert_eq!(deleted, vec![SchemaVersion::new(1)]);
+    assert!(
+        cached.cache_is_empty(),
+        "both identifier caches must be emptied"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_version_drops_what_was_cached_under_its_subject() {
+    let registry = Arc::new(DualIdRegistry::default());
+    let cached = CachedSchemaRegistry::new(Arc::clone(&registry));
+
+    cached.get_latest_schema("orders-value").await.unwrap();
+    assert_eq!(cached.cache_len(), 1);
+
+    cached
+        .delete_version("orders-value", SchemaVersion::new(1), false)
+        .await
+        .unwrap();
+    assert!(cached.cache_is_empty());
+    assert_eq!(registry.deletes.load(Ordering::SeqCst), 1);
+}
+
+/// A failed delete must not empty the cache — the subject is still there.
+#[tokio::test]
+async fn a_failed_delete_leaves_the_cache_alone() {
+    struct Failing;
+    impl SchemaRegistryClient for Failing {
+        async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> {
+            Ok(Arc::new(
+                Schema::new(id, SchemaType::Avro, r#""string""#).with_subject("orders-value", 1i32),
+            ))
+        }
+        async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
+            Ok(Arc::new(
+                Schema::new(SchemaId::from(1u32), SchemaType::Avro, r#""string""#)
+                    .with_subject(subject, 1i32),
+            ))
+        }
+        async fn get_schema_by_version(&self, s: &str, _: SchemaVersion) -> Result<Arc<Schema>> {
+            self.get_latest_schema(s).await
+        }
+        async fn register_schema(
+            &self,
+            _: &str,
+            _: &str,
+            _: SchemaType,
+            _: &[SchemaReference],
+        ) -> Result<SchemaId> {
+            Ok(SchemaId::from(1u32))
+        }
+        async fn delete_subject(&self, _: &str, _: bool) -> Result<Vec<SchemaVersion>> {
+            Err(schemreg::SchemaRegError::auth(403, "no"))
+        }
+    }
+
+    let cached = CachedSchemaRegistry::new(Failing);
+    cached.get_latest_schema("orders-value").await.unwrap();
+    assert_eq!(cached.cache_len(), 1);
+
+    assert!(cached.delete_subject("orders-value", true).await.is_err());
+    assert_eq!(
+        cached.cache_len(),
+        1,
+        "a delete that never happened must not invalidate"
+    );
 }

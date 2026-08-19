@@ -217,7 +217,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     assert_eq!(&decoded_msg.payload[..], &raw_avro[..]);
 
     if let Some(SchemaMetadata::Confluent(schema)) = decoded_msg.schema_metadata {
-        println!("Schema ID:     {}", schema.id);
+        println!("Schema ID:     {:?}", schema.id);
         println!("Schema type:   {:?}", schema.schema_type);
         println!(
             "Subject:       {}",

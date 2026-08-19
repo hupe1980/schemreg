@@ -39,7 +39,7 @@ struct Fixture {
     note: String,
     schema_type: String,
     framed: Vec<u8>,
-    message_indexes: Option<Vec<i32>>,
+    message_indexes: Option<Vec<u32>>,
 }
 
 /// Minimal extraction from the fixture JSON.
@@ -56,7 +56,7 @@ fn fixtures() -> Vec<Fixture> {
         Some(&rest[..end])
     }
 
-    fn indexes(block: &str) -> Option<Vec<i32>> {
+    fn indexes(block: &str) -> Option<Vec<u32>> {
         let start = block.find("\"message_indexes\": ")? + "\"message_indexes\": ".len();
         let rest = &block[start..];
         if rest.starts_with("null") {
@@ -70,7 +70,7 @@ fn fixtures() -> Vec<Fixture> {
         Some(
             inner
                 .split(',')
-                .filter_map(|s| s.trim().parse::<i32>().ok())
+                .filter_map(|s| s.trim().parse::<u32>().ok())
                 .collect(),
         )
     }
@@ -152,8 +152,11 @@ fn avro_and_json_frames_have_no_message_index() {
         .into_iter()
         .filter(|f| f.schema_type == "AVRO" || f.schema_type == "JSON")
     {
-        let (schema_id, payload) =
+        let (key, payload) =
             decode_wire_format(&f.framed).unwrap_or_else(|e| panic!("{}: {e}", f.name));
+        let schema_id = key
+            .as_id()
+            .unwrap_or_else(|| panic!("{}: reference fixtures use wire format v0", f.name));
         assert!(schema_id.as_u32() > 0, "{}: registry-assigned ID", f.name);
         assert!(!payload.is_empty(), "{}: payload present", f.name);
 

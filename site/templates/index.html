@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block body_class %}landing{% endblock body_class %}
+
+{% block structured_data %}
+{{ super() }}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "name": "{{ config.title }}",
+  "url": "{{ config.base_url | safe }}",
+  "description": {{ config.description | json_encode | safe }}
+}
+</script>
+{% endblock structured_data %}
+
+{% block content %}
+<main id="main">
+
+  <!-- ── Hero ───────────────────────────────────────────────────────── -->
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <p class="eyebrow">
+          <span class="pill">v{{ config.extra.crate_version }}</span>
+          <span>Rust {{ section.extra.msrv }}+</span>
+          <span>MIT or Apache-2.0</span>
+        </p>
+        <h1>{{ config.extra.tagline }}</h1>
+        <p class="lede">{{ config.extra.subtitle }}</p>
+
+        <div class="install">
+          <code id="install-cmd">cargo add {{ config.extra.crate_name }} --features confluent,avro</code>
+          <button type="button" class="copy-btn" data-copy="#install-cmd" aria-label="Copy the install command">Copy</button>
+        </div>
+
+        <p class="cta-row">
+          <a class="btn btn-primary" href="{{ get_url(path='@/docs/quickstart.md') | safe }}">Get started</a>
+          <a class="btn" href="{{ get_url(path='@/docs/wire-formats.md') | safe }}">Read the wire-format guide</a>
+        </p>
+
+        <ul class="hero-facts">
+          {% for fact in section.extra.facts %}
+          <li><strong>{{ fact.value }}</strong> {{ fact.label }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+
+      <div class="hero-code">{{ section.extra.hero_code | markdown | safe }}</div>
+    </div>
+  </section>
+
+  <!-- ── Wire formats ───────────────────────────────────────────────── -->
+  <section class="band" aria-labelledby="formats-h">
+    <div class="wrap">
+      <h2 id="formats-h">Four framings, one decode path</h2>
+      <p class="section-lede">
+        A Kafka record names its schema in whichever way its <em>producer</em> chose.
+        A consumer cannot know in advance, so decoding reports which one it found
+        instead of committing to either.
+      </p>
+
+      <div class="format-grid">
+        {% for f in section.extra.formats %}
+        <article class="format-card">
+          <h3>{{ f.name }}</h3>
+          <p class="format-meta">{{ f.meta }}</p>
+          <pre class="bytes" aria-label="Byte layout for {{ f.name }}"><code>{{ f.bytes }}</code></pre>
+          <p>{{ f.body }}</p>
+        </article>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Features ───────────────────────────────────────────────────── -->
+  <section class="band alt" aria-labelledby="features-h">
+    <div class="wrap">
+      <h2 id="features-h">What you get</h2>
+      <div class="feature-grid">
+        {% for f in section.extra.features %}
+        <article class="feature">
+          <h3>{{ f.title }}</h3>
+          <p>{{ f.body }}</p>
+        </article>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Producer configuration ─────────────────────────────────────── -->
+  <section class="band" aria-labelledby="producers-h">
+    <div class="wrap split">
+      <div>
+        <h2 id="producers-h">Producers that never write to your registry</h2>
+        <p class="section-lede">
+          The default registers schemas — the same default the Confluent Java
+          serdes ship, and the same one that quietly creates a production version
+          the first time a developer's local schema drifts. One setting turns that
+          into a startup failure instead.
+        </p>
+        <ul class="checklist">
+          {% for item in section.extra.producer_points %}
+          <li>{{ item | markdown(inline=true) | safe }}</li>
+          {% endfor %}
+        </ul>
+        <p><a class="arrow-link" href="{{ get_url(path='@/docs/producers.md') | safe }}">Producer configuration guide</a></p>
+      </div>
+      <div class="code-panel">{{ section.extra.producer_code | markdown | safe }}</div>
+    </div>
+  </section>
+
+  <!-- ── Backends ───────────────────────────────────────────────────── -->
+  <section class="band alt" aria-labelledby="backends-h">
+    <div class="wrap">
+      <h2 id="backends-h">Registry support</h2>
+      <div class="table-scroll">
+        <table class="matrix">
+          <thead>
+            <tr><th scope="col">Registry</th><th scope="col">Framing</th><th scope="col">Status</th></tr>
+          </thead>
+          <tbody>
+            {% for r in section.extra.backends %}
+            <tr>
+              <th scope="row">{{ r.name }}</th>
+              <td><code>{{ r.framing }}</code></td>
+              <td><span class="status {{ r.state }}">{{ r.status }}</span></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p><a class="arrow-link" href="{{ get_url(path='@/docs/backends.md') | safe }}">Choosing a backend</a></p>
+    </div>
+  </section>
+
+  <!-- ── Correctness ────────────────────────────────────────────────── -->
+  <section class="band" aria-labelledby="trust-h">
+    <div class="wrap split">
+      <div>
+        <h2 id="trust-h">Conformance is verified, not asserted</h2>
+        <p class="section-lede">
+          A golden vector written from the same misreading as the implementation
+          agrees with it perfectly — and disagrees with every other Kafka client.
+          So the Confluent framings are pinned against bytes produced by the
+          official <code>confluent-kafka-python</code> serializers, decoded
+          <em>and</em> re-encoded byte-identically, across every message-index
+          shape.
+        </p>
+        <p class="cta-row">
+          <a class="btn" href="{{ get_url(path='@/docs/testing.md') | safe }}">Testing strategy</a>
+          <a class="btn" href="{{ get_url(path='@/docs/security.md') | safe }}">Security posture</a>
+        </p>
+      </div>
+      <div>
+        <dl class="stat-grid">
+          {% for s in section.extra.stats %}
+          <div class="stat"><dt>{{ s.label }}</dt><dd>{{ s.value }}</dd></div>
+          {% endfor %}
+        </dl>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Close ──────────────────────────────────────────────────────── -->
+  <section class="band closing">
+    <div class="wrap center">
+      <h2>Start with the quick start</h2>
+      <p class="section-lede">Encode, frame, and decode a record in about thirty lines — against a real registry or an in-memory stub.</p>
+      <p class="cta-row center-row">
+        <a class="btn btn-primary" href="{{ get_url(path='@/docs/quickstart.md') | safe }}">Quick start</a>
+        <a class="btn" href="{{ config.extra.docs_rs }}" rel="external noopener">API reference</a>
+      </p>
+    </div>
+  </section>
+
+</main>
+{% endblock content %}

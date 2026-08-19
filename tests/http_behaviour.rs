@@ -106,7 +106,7 @@ async fn recovers_when_a_transient_failure_clears() {
         .get_schema_by_id(SchemaId::from(7u32))
         .await
         .expect("the third attempt succeeds");
-    assert_eq!(schema.id, 7u32);
+    assert_eq!(schema.id, Some(SchemaId::from(7u32)));
     assert_eq!(server.received_requests().await.unwrap().len(), 3);
 }
 

@@ -22,12 +22,18 @@ use crate::cache_inner::InMemoryCache;
 use crate::error::{Result, SchemaRegError};
 use crate::traits::{AnySchemaCache, SchemaRegistryClient};
 use crate::types::{
-    CompatibilityLevel, Schema, SchemaId, SchemaReference, SchemaType, SchemaVersion,
+    CompatibilityLevel, Schema, SchemaGuid, SchemaId, SchemaReference, SchemaType, SchemaVersion,
 };
 
 fn schema_lookup_cancelled_error(id: &SchemaId) -> SchemaRegError {
     SchemaRegError::invalid_state(format!(
         "schema lookup cancelled before completion for id {id}"
+    ))
+}
+
+fn guid_lookup_cancelled_error(guid: &SchemaGuid) -> SchemaRegError {
+    SchemaRegError::invalid_state(format!(
+        "schema lookup cancelled before completion for guid {guid}"
     ))
 }
 
@@ -90,10 +96,22 @@ impl std::error::Error for WarmCacheError {}
 pub struct CachedSchemaRegistry<C> {
     inner: C,
     cache: InMemoryCache<SchemaId, Schema>,
+    /// Keyed by GUID, for wire format v1. Separate from `cache` rather than
+    /// keyed by `SchemaKey`, so that a schema reached by both identifiers is
+    /// findable under either without a second backend call — the two maps hold
+    /// the same `Arc<Schema>`, so the duplicate costs one pointer.
+    guid_cache: InMemoryCache<SchemaGuid, Schema>,
 }
 
 /// Default maximum number of cached schema entries, matching the Java client default.
 pub const DEFAULT_MAX_CACHE_ENTRIES: usize = 1000;
+
+/// Both identifier caches' invalidation counters at one instant.
+#[derive(Clone, Copy)]
+struct Generations {
+    id: u64,
+    guid: u64,
+}
 
 /// Maximum number of concurrent in-flight fetches issued by `warm_cache`.
 ///
@@ -118,6 +136,42 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         Self {
             inner,
             cache: InMemoryCache::new(Some(max_entries), schema_lookup_cancelled_error),
+            guid_cache: InMemoryCache::new(Some(max_entries), guid_lookup_cancelled_error),
+        }
+    }
+
+    /// Both caches' invalidation counters, sampled together.
+    ///
+    /// Each must be carried separately from before the fetch to after it:
+    /// `insert_if_current` re-checks its counter *inside* the write lock, and a
+    /// value re-read after the fetch would compare current against current and
+    /// pass unconditionally — defeating the check it exists to feed.
+    fn generations(&self) -> Generations {
+        Generations {
+            id: self.cache.generation(),
+            guid: self.guid_cache.generation(),
+        }
+    }
+
+    /// Index `schema` under whichever identifiers the registry reported,
+    /// unless it was invalidated while the fetch was in flight.
+    fn populate(&self, schema: &Arc<Schema>, at: Generations) {
+        self.index_by_id(schema, at);
+        self.index_by_guid(schema, at);
+    }
+
+    /// Index `schema` under its numeric ID, if it reported one.
+    fn index_by_id(&self, schema: &Arc<Schema>, at: Generations) {
+        if let Some(id) = schema.id {
+            self.cache.insert_if_current(id, Arc::clone(schema), at.id);
+        }
+    }
+
+    /// Index `schema` under its GUID, if it reported one.
+    fn index_by_guid(&self, schema: &Arc<Schema>, at: Generations) {
+        if let Some(guid) = schema.guid {
+            self.guid_cache
+                .insert_if_current(guid, Arc::clone(schema), at.guid);
         }
     }
 
@@ -126,29 +180,49 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         &self.inner
     }
 
-    /// Number of schemas currently in the cache.
+    /// Number of schemas cached by ID.
+    ///
+    /// Does not count GUID-keyed entries: a schema reachable by both
+    /// identifiers is one schema, and counting it twice would make the number
+    /// useless as a cache-occupancy signal.
     pub fn cache_len(&self) -> usize {
         self.cache.len()
     }
 
-    /// Returns `true` if the cache contains no schemas.
-    pub fn cache_is_empty(&self) -> bool {
-        self.cache.is_empty()
+    /// Number of schemas cached by GUID (wire format v1).
+    pub fn guid_cache_len(&self) -> usize {
+        self.guid_cache.len()
     }
 
-    /// Clear the schema cache.
+    /// Returns `true` if no schema is cached under either identifier.
+    pub fn cache_is_empty(&self) -> bool {
+        self.cache.is_empty() && self.guid_cache.is_empty()
+    }
+
+    /// Clear every cached schema.
     pub fn clear_cache(&self) {
         self.cache.clear();
+        self.guid_cache.clear();
     }
 
     /// Remove a single schema ID from the cache.
+    ///
+    /// Does not touch the GUID cache: the two identifiers are looked up
+    /// independently and the mapping between them is not known locally. Use
+    /// [`invalidate_guid`](Self::invalidate_guid) or
+    /// [`invalidate_all`](Self::invalidate_all) to drop the other.
     pub fn invalidate(&self, schema_id: impl Into<SchemaId>) {
         self.cache.invalidate(&schema_id.into());
     }
 
+    /// Remove a single schema GUID from the cache.
+    pub fn invalidate_guid(&self, guid: SchemaGuid) {
+        self.guid_cache.invalidate(&guid);
+    }
+
     /// Remove all cached schemas.
     pub fn invalidate_all(&self) {
-        self.cache.clear();
+        self.clear_cache();
     }
 
     /// Pre-fetch a set of schema IDs into the cache with bounded concurrency.
@@ -197,46 +271,79 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         }
     }
 
-    /// Invalidate all cached schemas whose `subject` field matches `subject`.
+    /// Retrieve a schema by its registry-independent GUID (wire format v1).
     ///
-    /// Performs an O(n) scan of the cache.
+    /// Cached forever, for the same reason IDs are: a GUID is a fingerprint of
+    /// the schema, so it can never come to mean something else.
+    ///
+    /// If the response also carries a numeric ID, the ID cache is populated too,
+    /// so a later v0-framed record naming the same schema is served locally.
+    pub async fn get_schema_by_guid(&self, guid: SchemaGuid) -> Result<Arc<Schema>> {
+        let at = self.generations();
+        let schema = self
+            .guid_cache
+            .get_or_fetch(guid, || self.inner.get_schema_by_guid(guid))
+            .await?;
+        self.index_by_id(&schema, at);
+        Ok(schema)
+    }
+
+    /// Invalidate every cached schema registered under `subject`.
+    ///
+    /// One O(n) scan of the cache. Schemas fetched by ID carry no subject, so
+    /// only entries populated through `get_latest_schema` /
+    /// `get_schema_by_version` can match.
     pub fn invalidate_subject(&self, subject: &str) {
-        let ids: Vec<SchemaId> = self
-            .cache
-            .keys_matching(|s: &Schema| s.subject.as_deref() == Some(subject));
-        for id in ids {
-            self.cache.invalidate(&id);
-        }
+        self.cache
+            .invalidate_matching(|s: &Schema| s.subject.as_deref() == Some(subject));
+        self.guid_cache
+            .invalidate_matching(|s: &Schema| s.subject.as_deref() == Some(subject));
     }
 
     // ── Inherent duplicates for trait-free callers ────────────────────────
 
     /// Retrieve a schema by its globally unique ID.
+    ///
+    /// If the registry also reported a GUID — Confluent Platform 8 and newer do
+    /// — the GUID cache is populated from the same `Arc<Schema>`, so a v1-framed
+    /// record naming the same schema is served locally instead of costing a
+    /// second round-trip. The duplicate entry is one pointer.
     pub async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> {
-        self.cache
+        let at = self.generations();
+        let schema = self
+            .cache
             .get_or_fetch(id, || self.inner.get_schema_by_id(id))
-            .await
+            .await?;
+        self.index_by_guid(&schema, at);
+        Ok(schema)
     }
 
     /// Retrieve the latest schema registered under the given subject.
+    ///
+    /// Always hits the backend — a newer version may be registered at any
+    /// moment — but populates the ID and GUID caches so that a later
+    /// [`get_schema_by_id`](Self::get_schema_by_id) or
+    /// [`get_schema_by_guid`](Self::get_schema_by_guid) for the same schema is
+    /// served locally.
     pub async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
-        let generation = self.cache.generation();
+        let at = self.generations();
         let schema = self.inner.get_latest_schema(subject).await?;
-        self.cache
-            .insert_if_current(schema.id, Arc::clone(&schema), generation);
+        self.populate(&schema, at);
         Ok(schema)
     }
 
     /// Retrieve a specific version of a schema under a subject.
+    ///
+    /// Populates the identifier caches in the same way as
+    /// [`get_latest_schema`](Self::get_latest_schema).
     pub async fn get_schema_by_version(
         &self,
         subject: &str,
         version: SchemaVersion,
     ) -> Result<Arc<Schema>> {
-        let generation = self.cache.generation();
+        let at = self.generations();
         let schema = self.inner.get_schema_by_version(subject, version).await?;
-        self.cache
-            .insert_if_current(schema.id, Arc::clone(&schema), generation);
+        self.populate(&schema, at);
         Ok(schema)
     }
 
@@ -252,6 +359,46 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             .register_schema(subject, schema, schema_type, references)
             .await
     }
+
+    /// Delete a subject, then drop everything cached under it.
+    ///
+    /// The invalidation is the point: a cached entry that carries this subject
+    /// describes a version that no longer exists — soft-deleted (hidden, but
+    /// still resolvable by ID) or gone for good. Serving it afterwards would
+    /// report a subject the registry no longer lists.
+    ///
+    /// Entries fetched by bare ID or GUID carry no subject and are untouched,
+    /// which is correct for a soft delete and unavoidable for a permanent one:
+    /// nothing local records which IDs belonged to the subject.
+    pub async fn delete_subject(
+        &self,
+        subject: &str,
+        permanent: bool,
+    ) -> Result<Vec<SchemaVersion>> {
+        let deleted = self.inner.delete_subject(subject, permanent).await?;
+        self.invalidate_subject(subject);
+        Ok(deleted)
+    }
+
+    /// Delete one version under a subject, then drop everything cached under
+    /// that subject.
+    ///
+    /// Invalidation is by subject rather than by version: a cached entry knows
+    /// which subject it came from, and dropping the subject's entries is both
+    /// cheap and exact enough — the next lookup re-fetches.
+    pub async fn delete_version(
+        &self,
+        subject: &str,
+        version: SchemaVersion,
+        permanent: bool,
+    ) -> Result<SchemaVersion> {
+        let deleted = self
+            .inner
+            .delete_version(subject, version, permanent)
+            .await?;
+        self.invalidate_subject(subject);
+        Ok(deleted)
+    }
 }
 
 impl<C> fmt::Debug for CachedSchemaRegistry<C> {
@@ -266,6 +413,30 @@ impl<C> fmt::Debug for CachedSchemaRegistry<C> {
 impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
     async fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<Schema>> {
         self.get_schema_by_id(id).await
+    }
+
+    async fn get_schema_by_guid(&self, guid: SchemaGuid) -> Result<Arc<Schema>> {
+        self.get_schema_by_guid(guid).await
+    }
+
+    fn lookup_schema<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> impl Future<Output = Result<Option<Arc<Schema>>>> + Send + 'a {
+        self.inner
+            .lookup_schema(subject, schema, schema_type, references)
+    }
+
+    async fn delete_version(
+        &self,
+        subject: &str,
+        version: SchemaVersion,
+        permanent: bool,
+    ) -> Result<SchemaVersion> {
+        self.delete_version(subject, version, permanent).await
     }
 
     async fn get_latest_schema(&self, subject: &str) -> Result<Arc<Schema>> {
@@ -302,12 +473,8 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
             .check_compatibility(subject, schema, schema_type, references)
     }
 
-    fn delete_subject<'a>(
-        &'a self,
-        subject: &'a str,
-        permanent: bool,
-    ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
-        self.inner.delete_subject(subject, permanent)
+    async fn delete_subject(&self, subject: &str, permanent: bool) -> Result<Vec<SchemaVersion>> {
+        self.delete_subject(subject, permanent).await
     }
 
     fn get_subjects(&self) -> impl Future<Output = Result<Vec<String>>> + Send + '_ {
@@ -385,6 +552,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use tokio::sync::{Notify, Semaphore};
+
+    fn ok_id(schema: &Schema) -> SchemaId {
+        match schema.id {
+            Some(id) => id,
+            None => unreachable!("the mock registry always reports an id"),
+        }
+    }
 
     fn ok<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> T {
         match result {
@@ -695,7 +869,7 @@ mod tests {
             .await
             .expect("second lookup timed out")
             .expect("second task failed");
-        assert_eq!(schema.id, 9u32);
+        assert_eq!(schema.id, Some(SchemaId::from(9u32)));
     }
 
     #[tokio::test]
@@ -704,7 +878,7 @@ mod tests {
         let schema = ok(cached.get_latest_schema("test-value").await);
         assert_eq!(cached.cache_len(), 1);
 
-        let by_id = ok(cached.get_schema_by_id(schema.id).await);
+        let by_id = ok(cached.get_schema_by_id(ok_id(&schema)).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 0);
         assert_eq!(by_id.id, schema.id);
     }
@@ -717,7 +891,7 @@ mod tests {
             .await);
         assert_eq!(cached.cache_len(), 1);
 
-        let by_id = ok(cached.get_schema_by_id(schema.id).await);
+        let by_id = ok(cached.get_schema_by_id(ok_id(&schema)).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 0);
         assert_eq!(by_id.id, schema.id);
     }

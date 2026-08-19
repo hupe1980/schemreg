@@ -12,7 +12,8 @@
 use bytes::Bytes;
 use schemreg::{
     DetectedWireFormat, GlueCompression, GlueDataFormat, GlueSchema, GlueSchemaVersionId, SchemaId,
-    decode_wire_format, decode_wire_format_bytes, detect_wire_format, encode_wire_format,
+    SchemaKey, decode_wire_format, decode_wire_format_bytes, detect_wire_format,
+    encode_wire_format,
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -104,8 +105,8 @@ fn confluent_bytes_empty_payload() {
 #[test]
 fn confluent_decode_empty() {
     let err = decode_wire_format(&[]).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("too short") || msg.contains("short"), "{msg}");
+    assert!(err.is_wire_format_error(), "{err}");
+    assert!(err.to_string().contains("empty"), "{err}");
 }
 
 #[test]
@@ -118,10 +119,18 @@ fn confluent_decode_truncated_header() {
 
 #[test]
 fn confluent_decode_wrong_magic_byte() {
-    // Magic byte should be 0x00.
+    // 0x00 is v0 and 0x01 is v1; 0x02 is assigned to neither.
+    let err = decode_wire_format(&[0x02, 0x00, 0x00, 0x00, 0x01, 0x42]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("magic byte"), "{msg}");
+}
+
+/// A v1 prefix needs 17 bytes; a shorter buffer is truncated, not unknown.
+#[test]
+fn confluent_decode_truncated_v1_prefix() {
     let err = decode_wire_format(&[0x01, 0x00, 0x00, 0x00, 0x01, 0x42]).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("magic byte") || msg.contains("0x01"), "{msg}");
+    assert!(msg.contains("too short"), "{msg}");
 }
 
 #[test]
@@ -139,7 +148,7 @@ fn detect_confluent_happy() {
     assert_eq!(
         detect_wire_format(&framed),
         DetectedWireFormat::Confluent {
-            schema_id: SchemaId::from(42u32),
+            key: SchemaKey::Id(SchemaId::from(42u32)),
             payload_offset: 5
         }
     );
@@ -151,7 +160,7 @@ fn detect_confluent_id_zero() {
     assert_eq!(
         detect_wire_format(&framed),
         DetectedWireFormat::Confluent {
-            schema_id: SchemaId::from(0u32),
+            key: SchemaKey::Id(SchemaId::from(0u32)),
             payload_offset: 5
         }
     );
@@ -163,7 +172,7 @@ fn detect_confluent_id_max() {
     assert_eq!(
         detect_wire_format(&framed),
         DetectedWireFormat::Confluent {
-            schema_id: SchemaId::from(u32::MAX),
+            key: SchemaKey::Id(SchemaId::from(u32::MAX)),
             payload_offset: 5
         }
     );
@@ -334,7 +343,8 @@ fn glue_version_id_case_insensitive() {
 #[test]
 fn glue_version_id_wrong_length() {
     let err = "not-a-uuid".parse::<GlueSchemaVersionId>().unwrap_err();
-    assert!(err.to_string().contains("36") || err.to_string().contains("UUID"));
+    assert!(err.is_config_error(), "{err}");
+    assert!(err.to_string().contains("not-a-uuid"), "{err}");
 }
 
 #[test]
@@ -343,7 +353,7 @@ fn glue_version_id_bad_dash_positions() {
     let err = "550e8400e29b41d4a716446655440000---"
         .parse::<GlueSchemaVersionId>()
         .unwrap_err();
-    assert!(err.to_string().contains("UUID") || err.to_string().contains("dash"));
+    assert!(err.is_config_error(), "{err}");
 }
 
 #[test]
@@ -351,7 +361,7 @@ fn glue_version_id_non_hex() {
     let err = "zzzz8400-e29b-41d4-a716-446655440000"
         .parse::<GlueSchemaVersionId>()
         .unwrap_err();
-    assert!(err.to_string().contains("hex") || err.to_string().contains("UUID"));
+    assert!(err.is_config_error(), "{err}");
 }
 
 #[test]
@@ -454,14 +464,6 @@ fn protobuf_golden_nested_message_index_2() {
     assert_eq!(&framed[7..], b"x");
 }
 
-/// Negative index -1 — ZigZag(-1) = 1.
-#[test]
-fn protobuf_golden_negative_index_minus1() {
-    let framed = encode_protobuf_wire_format(5, &[-1], b"");
-    assert_eq!(framed[5], 0x02, "ZigZag(count=1)=2");
-    assert_eq!(framed[6], 0x01, "ZigZag(-1)=1");
-}
-
 /// Multiple message indexes (deeply nested schema path).
 #[test]
 fn protobuf_golden_multi_index() {
@@ -473,16 +475,15 @@ fn protobuf_golden_multi_index() {
     assert_eq!(&framed[8..], b"data");
 }
 
-/// Round-trip: encode then decode message indexes, including the i32 extremes.
+/// Round-trip: encode then decode message indexes, including the u32 extremes.
 #[test]
 fn protobuf_roundtrip_message_indexes() {
     for indexes in [
-        vec![0i32],
+        vec![0u32],
         vec![1],
-        vec![-1],
         vec![0, 1, 2],
-        vec![i32::MAX],
-        vec![i32::MIN],
+        vec![u32::MAX],
+        vec![u32::MAX, 0, 7],
     ] {
         let framed = encode_protobuf_wire_format(1, &indexes, b"payload");
         let after_header = &framed[5..];

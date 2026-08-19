@@ -1,0 +1,67 @@
+name: Documentation site
+
+# Builds the Zola site in `site/` and publishes it to GitHub Pages.
+#
+# Link checking lives in `ci.yml` so a pull request fails on a broken link
+# before it merges; this workflow only publishes what is already on `main`.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  # Republish on demand — useful after changing the Pages settings themselves.
+  workflow_dispatch:
+
+# GITHUB_TOKEN needs these to publish an artifact to Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; queue rather than cancel, so a merged change is
+# never dropped because a later one arrived while it was building.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  ZOLA_VERSION: "0.23.2"
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zola
+        run: |
+          curl -sSfL "https://github.com/getzola/zola/releases/download/v${ZOLA_VERSION}/zola-v${ZOLA_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin zola
+          zola --version
+
+      - uses: actions/configure-pages@v5
+        id: pages
+
+      # `--base-url` comes from the Pages settings rather than config.toml, so a
+      # fork or a custom domain publishes with working absolute URLs — which the
+      # canonical, Open Graph, and sitemap tags all depend on.
+      - name: Build
+        run: zola --root site build --base-url "${{ steps.pages.outputs.base_url }}"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/public
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment
