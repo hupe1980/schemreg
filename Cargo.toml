@@ -1,6 +1,6 @@
 [package]
 name        = "schemreg"
-version     = "0.5.0"
+version     = "0.6.0"
 edition     = "2024"
 rust-version = "1.88"
 authors     = ["hupe1980"]
@@ -36,7 +36,10 @@ confluent        = [
 # Pairs AvroSchemaEncoder / AvroSchemaDecoder with any SchemaRegistryClient.
 # Does NOT require the `confluent` feature — the Confluent wire codec is
 # always available and the encoder/decoder accept any SchemaRegistryClient impl.
-avro             = ["dep:apache-avro", "serde-impls"]
+# `serde_json` adds nothing to the tree here — `apache-avro` already depends on
+# it — and buys the ability to read a schema's declared name before parsing it,
+# which is what makes a reference closure de-duplicable.
+avro             = ["dep:apache-avro", "serde-impls", "dep:serde_json"]
 # Enable the AWS Glue Schema Registry SDK client.
 # The Glue wire-format codec (18-byte header, ZLIB) and all Glue types are
 # always available without this feature. Only the AWS SDK client
@@ -135,6 +138,10 @@ harness = false
 
 [[example]]
 name = "avro_roundtrip"
+required-features = ["avro"]
+
+[[example]]
+name = "avro_references"
 required-features = ["avro"]
 
 [[example]]

@@ -1,7 +1,7 @@
 +++
 title = "Migrating to 0.4"
 description = "Upgrade path from schemreg 0.3.x to 0.4.0, including the critical Protobuf message-index framing fix."
-weight = 13
+weight = 14
 +++
 
 Most upgrades from 0.3.x are a version bump. The sections below are the ones
@@ -143,7 +143,7 @@ Existing slice call sites still compile — `&[T]` implements `IntoIterator`.
 |---|---|
 | `RetryPolicy` | Configurable retries with **jitter** (new). `RetryPolicy::none()` if you retry at a higher layer |
 | `max_concurrent_requests` | A hard ceiling for cold starts that fan out to thousands of distinct schema IDs |
-| `AvroSchemaDecoder::with_reader_schema` | Avro schema resolution — defaulted fields, dropped fields, numeric promotion |
+| `AvroSchemaDecoder` reader schemas | Avro schema resolution — defaulted fields, dropped fields, numeric promotion. Spelled `with_reader_schema` in 0.4 and 0.5; `builder().reader_schema(..)` since 0.6 |
 | `protobuf` feature | Descriptor-derived message-index paths; wrong-type rejection |
 | `health_check()` | Now on the Glue trait too; usable for readiness probes on all three backends |
 | `Arc<dyn DynSchemaRegistryClient>` | Now also implements `SchemaRegistryClient`, so erasure composes with `CachedSchemaRegistry` and the encoders |

@@ -56,14 +56,20 @@ multiple-versions = "deny"
 # A wildcard version requirement makes the build non-reproducible.
 wildcards = "deny"
 allow-wildcard-paths = true
-# Duplicates below are all forced by the AWS SDK / smithy runtime, which still
-# pins the http 0.2 line while reqwest and hyper are on 1.x. They only appear
-# with the `glue` feature enabled. Recheck on every aws-sdk-glue bump: each
-# entry should disappear on its own once smithy migrates.
+# Every entry below is a duplicate an upstream dependency forces, not one this
+# crate chooses, and none of them is a second copy of anything that handles
+# untrusted bytes at runtime. Recheck on each dependency bump: each should
+# disappear on its own as upstream migrates.
 skip = [
-    { name = "getrandom", reason = "aws-smithy-* pins getrandom 0.2; rustls/rand use 0.3" },
+    # http 0.2 vs 1.x, forced by the AWS SDK; only present with `glue`.
     { name = "http", reason = "aws-sigv4 / aws-smithy-http pin http 0.2; reqwest+hyper use 1.x" },
     { name = "http-body", reason = "transitively pinned alongside http 0.2" },
+    # getrandom 0.2 / 0.3 / 0.4 all appear, and r-efi is its UEFI backend —
+    # a target this crate is never built for.
+    { name = "getrandom", reason = "ring pins 0.2, jsonschema and rand use 0.3, tempfile and jobserver use 0.4" },
+    { name = "r-efi", reason = "UEFI backend of getrandom; its 0.3 and 0.4 lines pull different majors" },
+    # Proc-macro build graph only — neither version reaches the binary.
+    { name = "syn", reason = "bon-macros (via apache-avro) is on syn 3; prost-derive and strum_macros are still on syn 2" },
     { name = "windows-sys", reason = "several crates pin different windows-sys minor lines" },
     { name = "hashbrown", reason = "indexmap and std-internal versions differ" },
 ]

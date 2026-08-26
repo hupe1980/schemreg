@@ -1,7 +1,7 @@
 +++
 title = "Migrating to 0.5"
 description = "Upgrade path from schemreg 0.4.x to 0.5.0: SchemaKey decoding, optional schema IDs, producer resolution policy, and the behavioural changes without a compile error."
-weight = 12
+weight = 13
 +++
 
 Most of what follows is a compile error, so the compiler walks you through it.
@@ -151,6 +151,11 @@ dependency closure and parses the set together.
 
 Decoding needs no change. **Encoding does**, if your schema uses references:
 supply the definitions locally, dependencies first.
+
+*(0.6 note: "decoding needs no change" held only for a decoder without a reader
+schema — a reader schema with references needs its own definitions, and
+dependency order stopped mattering. See the
+[0.6 guide](@/docs/migrating-0.6.md).)*
 
 ```rust,ignore
 let encoder = AvroSchemaEncoder::builder()

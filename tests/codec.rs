@@ -212,8 +212,10 @@ mod avro_codec {
             .schema(WRITER)
             .build()
             .unwrap();
-        let dec = AvroSchemaDecoder::new(Arc::clone(&reg))
-            .with_reader_schema(READER)
+        let dec = AvroSchemaDecoder::builder()
+            .registry(Arc::clone(&reg))
+            .reader_schema(READER)
+            .build()
             .expect("READER is valid Avro");
 
         let framed = enc
@@ -245,13 +247,23 @@ mod avro_codec {
         );
     }
 
+    /// Malformed JSON and a schema naming a type nobody supplied both fail at
+    /// construction — but for different reasons, and the messages have to say
+    /// which. Asserting only `is_config_error()` here is what let a missing
+    /// reader-side reference masquerade as a syntax error.
     #[tokio::test]
-    async fn with_reader_schema_rejects_invalid_json() {
+    async fn a_reader_schema_that_is_not_avro_is_rejected_at_construction() {
         let reg = Arc::new(MockRegistry::new([]));
-        let err = AvroSchemaDecoder::new(reg)
-            .with_reader_schema("{ not avro")
+        let err = AvroSchemaDecoder::builder()
+            .registry(reg)
+            .reader_schema("{ not avro")
+            .build()
             .expect_err("invalid reader schema must be rejected at construction");
         assert!(err.is_config_error(), "{err}");
+        assert!(
+            !err.to_string().contains("reader_dependencies"),
+            "malformed JSON must not be blamed on a missing dependency: {err}"
+        );
     }
 
     #[tokio::test]
@@ -263,7 +275,11 @@ mod avro_codec {
             .schema(WRITER)
             .build()
             .unwrap();
-        let dec = AvroSchemaDecoder::with_max_cache_entries(Arc::clone(&reg), 1);
+        let dec = AvroSchemaDecoder::builder()
+            .registry(Arc::clone(&reg))
+            .max_cache_entries(1)
+            .build()
+            .unwrap();
 
         let payload = enc
             .encode(

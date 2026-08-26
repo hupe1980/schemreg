@@ -7,7 +7,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.5", features = ["protobuf"] }
+//! schemreg = { version = "0.6", features = ["protobuf"] }
 //! ```
 //!
 //! # Why this module exists
@@ -127,7 +127,7 @@ fn message_index_path_from(path: &[i32], full_name: &str) -> Result<Vec<u32>> {
             path[0]
         )));
     }
-    for (level, chunk) in path.chunks_exact(2).enumerate().skip(1) {
+    for (level, chunk) in path.as_chunks::<2>().0.iter().enumerate().skip(1) {
         if chunk[0] != NESTED_TYPE_FIELD {
             return Err(SchemaRegError::config(format!(
                 "descriptor for '{full_name}' has a non-nested_type segment at level {level}: \

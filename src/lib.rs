@@ -257,7 +257,7 @@ pub use apicurio::{ApicurioSchemaRegistry, ApicurioSchemaRegistryBuilder};
 
 #[cfg(feature = "avro")]
 pub use avro::{
-    AvroSchemaDecoder, AvroSchemaEncoder, AvroSchemaEncoderBuilder,
+    AvroSchemaDecoder, AvroSchemaDecoderBuilder, AvroSchemaEncoder, AvroSchemaEncoderBuilder,
     DEFAULT_MAX_AVRO_SCHEMA_CACHE_ENTRIES,
 };
 

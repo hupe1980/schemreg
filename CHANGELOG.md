@@ -8,6 +8,89 @@ one is listed under a `Breaking` heading with the migration it requires.
 
 ---
 
+## [0.6.0] — 2026-08-26
+
+Avro schema references, on the side that had been left out: a **reader** schema
+may now name types defined in other subjects. Along the way the dependency set
+became order-free, and every way it can be wrong became a `build()` error that
+names the type and the list that should hold it.
+
+See the [0.6 migration guide](https://hupe1980.github.io/schemreg/docs/migrating-0-6/)
+for the upgrade path.
+
+### 🐛 Fixed
+
+- **A reader schema may reference other schemas.** `with_reader_schema` parsed
+  its argument as a standalone schema, so a reader schema naming
+  `com.example.Address` failed with `Unknown primitive type` before the registry
+  was contacted — inlining the definition was the only way through. Reader
+  schemas now carry their own dependency set, and the codec is handed a reader
+  name table alongside the writer's (`from_avro_datum_reader_schemata`), which
+  is what actually resolves the references during decoding. Writer-side
+  references were resolved in 0.5; the reader side is what this closes.
+- **A reference closure spanning two subjects that hold the same type.** The
+  closure de-duplicated by subject, so one type registered under two subjects
+  reached the parser twice and failed with `Two schemas with the same fullname
+  were given`. Identical definitions now collapse; contradictory ones are an
+  error rather than a coin toss.
+- **Two different documents under one JSON Schema `$ref`.** The reference set
+  was a map, so the last one to arrive won, silently — the same hazard the Avro
+  side had, in the codec next door. Identical documents still collapse;
+  contradictory ones are a `build()` error. Lookup by a `$ref`'s final path
+  segment is unchanged and still first-wins, since distinct URIs ending in the
+  same file name is a normal thing rather than a contradiction.
+- **A reference to a type nested inside another schema now fails consistently.**
+  `apache-avro` resolves such a name against a `HashMap` of top-level schemas
+  and, failing that, against whatever it has parsed so far — so it resolved
+  roughly one parse in two, and a schema set could work on one process start and
+  fail on the next. Refused every time now, with both ways out named in the
+  message.
+
+### ✨ Added
+
+- **`AvroSchemaDecoderBuilder`**, reached through `AvroSchemaDecoder::builder()`:
+  `reader_schema`, `reader_dependencies`, `max_cache_entries`, and `registry`.
+  A reader schema and its definitions can only be validated together, which a
+  chain of infallible `with_*` calls has nowhere to do.
+- **`reader_schema_parsed` / `reader_dependencies_parsed`** take
+  `apache_avro::Schema` values directly — the shape `#[derive(AvroSchema)]` and
+  `Schema::parse_list` hand out — with no round-trip through JSON. There is
+  deliberately no encoder counterpart: an encoder sends its schema to the
+  registry as text, and re-serialising a parsed schema would register something
+  subtly different from what the author wrote.
+- **`AvroSchemaDecoder::has_reader_schema`**.
+
+### ⚡ Changed
+
+- **Dependency order no longer matters.** `dependencies` and
+  `reader_dependencies` are sorted definitions-first before the Avro codec sees
+  them. Listing a schema before something it references used to build fine and
+  then fail on the first encode with `Unresolved schema reference`; the bytes
+  are identical either way, so the order was never anything but a trap.
+- **Two schemas that reference each other are reported at `build()`**, naming
+  both, instead of failing at encode time with `Unresolved schema reference`.
+  Avro can encode a schema that refers to itself — a linked list, a tree — but
+  the name table is resolved in one pass, so a cross-schema cycle has no valid
+  order at all. Self-references are unaffected.
+- **A missing definition names itself and the fix.** The Avro parser reports an
+  unresolved type name as `Unknown primitive type`, which says nothing about
+  references and sends people hunting for a typo. Every such error now names the
+  type, the schema that references it, and the list that should hold it —
+  `AvroSchemaEncoderBuilder::dependencies`, the registry's `references`, or
+  `AvroSchemaDecoderBuilder::reader_dependencies`, whichever applies.
+- **The `avro` feature enables `serde_json`.** Nothing new in the dependency
+  tree — `apache-avro` already depends on it — and it is what lets a schema's
+  declared name be read before the schema is parsed.
+
+### 💥 Breaking
+
+- **`AvroSchemaDecoder::with_reader_schema` → `AvroSchemaDecoder::builder().reader_schema(..)`.**
+- **`AvroSchemaDecoder::with_max_cache_entries` → `AvroSchemaDecoder::builder().max_cache_entries(..)`.**
+- `AvroSchemaDecoder::new(registry)` is unchanged. The JSON and Protobuf
+  decoders keep their `with_*` methods — none of their settings can fail.
+
+---
+
 ## [0.5.0] — 2026-08-19
 
 Support for the wire formats Confluent Platform 8 introduced — a 16-byte schema
