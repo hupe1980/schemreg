@@ -280,8 +280,8 @@ async fn dependencies_make_the_encoder_validate_through_references() {
     assert!(err.is_wire_format_error(), "{err}");
 }
 
-/// Order must not matter: JSON Schema resolves by URI, unlike Avro's
-/// declaration-ordered name table.
+/// Order must not matter: JSON Schema resolves by URI, and the Avro side sorts
+/// its set before use, so neither codec cares how the list is written.
 #[tokio::test]
 async fn dependency_order_is_irrelevant() {
     for deps in [
@@ -297,6 +297,44 @@ async fn dependency_order_is_irrelevant() {
                 .is_ok()
         );
     }
+}
+
+/// The same document supplied twice under one `$ref` — a diamond, or one
+/// schema registered under two subjects — is one document, not a conflict.
+#[test]
+fn an_identical_duplicate_dependency_is_accepted() {
+    JsonSchemaEncoder::builder()
+        .registry(Arc::new(RefRegistry::chain()))
+        .schema(ORDER)
+        .dependencies([
+            (ADDRESS_REF, ADDRESS),
+            (CITY_REF, CITY),
+            (ADDRESS_REF, ADDRESS),
+        ])
+        .build()
+        .expect("the same document twice is still one document");
+}
+
+/// Two *different* documents under one `$ref` cannot both be right. Keeping
+/// whichever landed last would validate against a document nobody named.
+#[test]
+fn contradictory_duplicate_dependencies_are_rejected() {
+    const OTHER_ADDRESS: &str = r#"{"type":"object",
+        "properties":{"city":{"type":"string"}},"required":["city"]}"#;
+
+    let err = JsonSchemaEncoder::builder()
+        .registry(Arc::new(RefRegistry::chain()))
+        .schema(ORDER)
+        .dependencies([
+            (ADDRESS_REF, ADDRESS),
+            (CITY_REF, CITY),
+            (ADDRESS_REF, OTHER_ADDRESS),
+        ])
+        .build()
+        .expect_err("two documents for one $ref");
+
+    assert!(err.is_config_error(), "{err}");
+    assert!(err.to_string().contains(ADDRESS_REF), "{err}");
 }
 
 /// Compilation must never reach the network. `jsonschema` is built without

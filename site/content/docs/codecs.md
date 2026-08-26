@@ -55,16 +55,26 @@ fields, dropped fields, promoted numeric types — matching the Confluent Java
 `SpecificAvroDeserializer`:
 
 ```rust,ignore
-let decoder = AvroSchemaDecoder::new(cached).with_reader_schema(r#"{
-    "type": "record", "name": "Order", "namespace": "com.example",
-    "fields": [
-        {"name": "id",  "type": "int"},
-        {"name": "qty", "type": "int", "default": 7}
-    ]
-}"#)?;
+let decoder = AvroSchemaDecoder::builder()
+    .registry(cached)
+    .reader_schema(r#"{
+        "type": "record", "name": "Order", "namespace": "com.example",
+        "fields": [
+            {"name": "id",  "type": "int"},
+            {"name": "qty", "type": "int", "default": 7}
+        ]
+    }"#)
+    .build()?;
 
 // A payload written before `qty` existed decodes with qty = 7.
 ```
+
+`AvroSchemaDecoder::new(registry)` is the shorthand for a decoder with no reader
+schema and the default cache bound.
+
+If the reader schema is already an `apache_avro::Schema` — what
+`#[derive(AvroSchema)]` gives you — pass it with `reader_schema_parsed` instead
+and skip the round-trip through JSON.
 
 ### Schema references
 
@@ -72,27 +82,51 @@ A schema that names a type defined in another subject is stored by the registry
 exactly as written, so it is **not** parseable on its own — the definition of
 `com.example.Address` lives elsewhere.
 
-`AvroSchemaDecoder` fetches the transitive dependency closure and parses the set
-together. A diamond is fetched once per subject, and a cycle terminates instead
-of recursing.
+Three schemas can be in that position, and they take their definitions from
+three different places:
 
-The encoder needs the same definitions locally, and Avro resolves a named type
-only against definitions that came **earlier** in the list:
+| Schema | Definitions come from |
+|---|---|
+| The encoder's schema | `dependencies`, supplied locally |
+| The writer schema a decoder fetched | the registry, walked automatically from `references` |
+| A decoder's reader schema | `reader_dependencies`, supplied locally |
+
+The decoder walks the transitive closure of the writer schema itself: a diamond
+is fetched once per subject, and a cycle terminates instead of recursing. The
+two local cases are the ones you write out:
 
 ```rust,ignore
 let encoder = AvroSchemaEncoder::builder()
     .registry(cached.clone())
     .schema(ORDER)                        // references com.example.Address
-    .dependencies([ADDRESS])              // defined before ORDER uses it
+    .dependencies([ADDRESS])
     .references(vec![SchemaReference::new(
         "com.example.Address", "address-value", 1i32,
     )])
     .build()?;
+
+let decoder = AvroSchemaDecoder::builder()
+    .registry(cached)
+    .reader_schema(ORDER_READER)          // also references com.example.Address
+    .reader_dependencies([ADDRESS])
+    .build()?;
 ```
 
-`references` is what the registry stores; `dependencies` is what the local Avro
-parser needs. A dependency listed after its user stays unresolved and fails at
-encode time, so `build()` is the place that tells you.
+`references` is what the registry stores; `dependencies` and
+`reader_dependencies` are what the local Avro parser needs. A reader schema is
+never registered, so it needs a list of its own.
+
+Order does not matter in either list, and a definition supplied twice is fine as
+long as the copies agree. Everything that can go wrong is a `build()` error
+naming the type and the list that should hold it:
+
+- a type nothing defines;
+- two schemas that reference *each other* (Avro can encode a schema that refers
+  to itself, but not two that refer to each other);
+- two different definitions of one name — the shape a reference closure takes
+  when it spans two versions of the same subject;
+- a reference to a type that exists only *nested inside* another schema rather
+  than as a schema of its own. Give it its own subject, or inline it.
 
 ## JSON Schema
 
@@ -130,7 +164,9 @@ the decoder fetches the transitive closure and compiles the set together.
 
 The encoder is given the same documents locally as `(name, schema)` pairs, where
 `name` is the `$ref` string — the same value that goes in
-`SchemaReference::name`:
+`SchemaReference::name`. Order does not matter, and the same document supplied
+twice is fine; two *different* documents under one `$ref` are a `build()`
+error:
 
 ```rust,ignore
 let encoder = JsonSchemaEncoder::builder()
@@ -202,10 +238,9 @@ validators, keyed by the wire identifier; each encoder keeps one of resolved
 subjects. Defaults are 1 000 entries.
 
 ```rust,ignore
-AvroSchemaDecoder::with_max_cache_entries(registry, 4096);
+AvroSchemaDecoder::builder().registry(registry).max_cache_entries(4096).build()?;
 JsonSchemaDecoder::new(registry).with_max_cache_entries(4096);
-
-AvroSchemaEncoder::builder().max_subject_cache_entries(64);
+AvroSchemaEncoder::builder().max_subject_cache_entries(64) /* … */.build()?;
 ```
 
 Thirty-two consumers hitting a cold schema ID compile it once, not thirty-two

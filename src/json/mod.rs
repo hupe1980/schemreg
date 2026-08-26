@@ -17,7 +17,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.5", features = ["json"] }
+//! schemreg = { version = "0.6", features = ["json"] }
 //! ```
 //!
 //! # Layered model
@@ -121,6 +121,16 @@ impl ReferenceSet {
     }
 
     /// Index `schema` under `name` and under `name`'s final path segment.
+    ///
+    /// The same document arriving twice — a diamond, or one schema registered
+    /// under two subjects — is one document. Two *different* documents under
+    /// one name are rejected: a `$ref` resolves to exactly one thing, and
+    /// keeping whichever landed last would validate against a document the
+    /// author never named.
+    ///
+    /// The final-segment index is different, and keeps first-wins: distinct
+    /// URIs routinely end in the same file name, and that collision is
+    /// expected rather than a contradiction.
     fn insert(&mut self, name: &str, schema: Value) -> Result<()> {
         if self.by_key.len() >= MAX_REFERENCES * 2 {
             return Err(SchemaRegError::config(format!(
@@ -134,7 +144,21 @@ impl ReferenceSet {
                 .entry(tail.to_string())
                 .or_insert(schema.clone());
         }
-        self.by_key.insert(name.to_string(), schema);
+        match self.by_key.entry(name.to_string()) {
+            std::collections::hash_map::Entry::Occupied(existing) => {
+                if *existing.get() != schema {
+                    return Err(SchemaRegError::config(format!(
+                        "two different documents were supplied for the JSON Schema reference \
+                         '{name}'; a `$ref` resolves to one document, so the set must agree on \
+                         it (a reference closure spanning two versions of the same subject does \
+                         not)"
+                    )));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(schema);
+            }
+        }
         Ok(())
     }
 

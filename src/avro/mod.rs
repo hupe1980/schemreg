@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.5", features = ["avro"] }
+//! schemreg = { version = "0.6", features = ["avro"] }
 //! ```
 //!
 //! # Layered model
@@ -27,6 +27,24 @@
 //! └──────────────────────────────────────────────────────┘
 //! ```
 //!
+//! # Schema references
+//!
+//! A schema that names a type defined in another subject is stored by the
+//! registry exactly as written, so it is not parseable on its own. Three
+//! schemas can be in that position, and they take their definitions from three
+//! different places:
+//!
+//! | Schema | Definitions come from |
+//! |---|---|
+//! | The encoder's schema | [`AvroSchemaEncoderBuilder::dependencies`] |
+//! | The writer schema a decoder fetched | the registry, walked from `references` |
+//! | A decoder's reader schema | [`AvroSchemaDecoderBuilder::reader_dependencies`] |
+//!
+//! Order does not matter in either list, and anything wrong with a set — a
+//! type nothing defines, two definitions of one type, two schemas referencing
+//! each other — is a `build()` error naming the type and the list that should
+//! hold it.
+//!
 //! # Examples
 //!
 //! ## Round-trip with a mock registry
@@ -34,31 +52,40 @@
 //! ```rust,ignore
 //! use apache_avro::types::Value;
 //! use schemreg::avro::{AvroSchemaDecoder, AvroSchemaEncoder};
-//! use schemreg::CachedSchemaRegistry;
-//! use schemreg::ConfluentSchemaRegistry;
+//! use schemreg::{CachedSchemaRegistry, ConfluentSchemaRegistry, EncodeTarget};
 //!
 //! let registry = CachedSchemaRegistry::new(
 //!     ConfluentSchemaRegistry::builder()
 //!         .url("http://localhost:8081")
-//!         .build()
-//!         .unwrap(),
+//!         .build()?,
 //! );
 //!
 //! // Encoder: registers the schema once, caches the ID.
 //! let encoder = AvroSchemaEncoder::builder()
 //!     .registry(registry.clone())
 //!     .schema(r#"{"type":"record","name":"Order","namespace":"com.example","fields":[{"name":"id","type":"int"}]}"#)
-//!     .build()
-//!     .unwrap();
+//!     .build()?;
 //!
 //! let value = Value::Record(vec![("id".to_string(), Value::Int(42))]);
-//! let framed: bytes::Bytes = encoder.encode(value, "orders", false).await.unwrap();
+//! let framed: bytes::Bytes = encoder.encode(value, "orders", EncodeTarget::Value).await?;
 //!
 //! // Decoder: fetches the schema by ID on first decode, caches it.
 //! let decoder = AvroSchemaDecoder::new(registry);
-//! let decoded: Value = decoder.decode(framed).await.unwrap();
+//! let decoded: Value = decoder.decode(framed).await?;
 //! println!("{decoded:?}");
 //! ```
+//!
+//! ## Decoding against a reader schema that has references
+//!
+//! ```rust,ignore
+//! let decoder = AvroSchemaDecoder::builder()
+//!     .registry(registry)
+//!     .reader_schema(CUSTOMER)          // "address": "com.example.Address"
+//!     .reader_dependencies([ADDRESS])   // the definition it needs
+//!     .build()?;
+//! ```
+
+mod schema_set;
 
 use std::sync::Arc;
 
@@ -67,6 +94,7 @@ use apache_avro::types::Value;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use self::schema_set::{MAX_REFERENCES, ResolvedAvroSchema, SchemaRole};
 use crate::cache_inner::InMemoryCache;
 use crate::error::{Result, SchemaRegError};
 use crate::resolver::{
@@ -93,97 +121,6 @@ pub const DEFAULT_MAX_AVRO_SCHEMA_CACHE_ENTRIES: usize = 1000;
 /// forbids `A → B → A` — and following one would recurse until the stack ran
 /// out. Real schema graphs are a handful of levels deep at most.
 const MAX_REFERENCE_DEPTH: usize = 32;
-
-/// Maximum number of referenced schemas resolved for a single root schema.
-const MAX_REFERENCES: usize = 256;
-
-/// A parsed Avro schema plus the referenced schemas it needs to be usable.
-///
-/// A schema that names an externally defined type parses into a tree containing
-/// `Schema::Ref` nodes, which `to_avro_datum` / `from_avro_datum` cannot follow
-/// on their own — they panic or error on the unresolved reference. The
-/// `*_schemata` variants take the dependency set alongside the root, so the two
-/// must travel together.
-struct ResolvedAvroSchema {
-    root: AvroSchema,
-    /// Empty when `root` is self-contained, which is the common case.
-    schemata: Vec<AvroSchema>,
-}
-
-impl ResolvedAvroSchema {
-    /// Parse `schema_str` together with the schemas it depends on.
-    ///
-    /// `deps` must be ordered **dependencies first**: `apache-avro`'s
-    /// `parse_list` resolves a named type only if its definition appeared
-    /// earlier in the list, and leaves a dangling `Schema::Ref` otherwise —
-    /// which surfaces much later as "unresolved schema reference" from the
-    /// serializer rather than from the parser. The reference-closure walk emits
-    /// that order naturally (it pushes each dependency after its own
-    /// dependencies); [`AvroSchemaEncoderBuilder::dependencies`] documents the
-    /// same requirement for the caller-supplied case.
-    fn parse(schema_str: &str, deps: &[String]) -> Result<Self> {
-        if deps.is_empty() {
-            return Ok(Self {
-                root: AvroSchema::parse_str(schema_str)
-                    .map_err(|e| SchemaRegError::config(format!("invalid Avro schema: {e}")))?,
-                schemata: Vec::new(),
-            });
-        }
-
-        // The root goes last so that every dependency is already defined, and
-        // the whole list doubles as the name table the codec resolves against.
-        let mut inputs: Vec<&str> = deps.iter().map(String::as_str).collect();
-        inputs.push(schema_str);
-
-        let schemata = AvroSchema::parse_list(&inputs).map_err(|e| {
-            SchemaRegError::config(format!(
-                "invalid Avro schema (with {} referenced schema(s)): {e}",
-                deps.len()
-            ))
-        })?;
-
-        // `parse_list` preserves input order, so the root is the last entry.
-        let root = schemata
-            .last()
-            .cloned()
-            .ok_or_else(|| SchemaRegError::config("Avro schema list resolved to nothing"))?;
-        Ok(Self { root, schemata })
-    }
-
-    /// The fully-qualified name of the root type, if it is a named type.
-    fn fullname(&self) -> Option<String> {
-        schema_fullname(&self.root)
-    }
-
-    fn serialize(&self, value: Value) -> Result<Vec<u8>> {
-        let result = if self.schemata.is_empty() {
-            apache_avro::to_avro_datum(&self.root, value)
-        } else {
-            apache_avro::to_avro_datum_schemata(&self.root, self.schemata.iter().collect(), value)
-        };
-        result.map_err(|e| SchemaRegError::wire_format(format!("Avro serialization failed: {e}")))
-    }
-
-    fn deserialize(&self, mut bytes: &[u8], reader_schema: Option<&AvroSchema>) -> Result<Value> {
-        let result = if self.schemata.is_empty() {
-            apache_avro::from_avro_datum(&self.root, &mut bytes, reader_schema)
-        } else {
-            apache_avro::from_avro_datum_schemata(
-                &self.root,
-                self.schemata.iter().collect(),
-                &mut bytes,
-                reader_schema,
-            )
-        };
-        result.map_err(|e| SchemaRegError::wire_format(format!("Avro deserialization failed: {e}")))
-    }
-}
-
-/// Parse a self-contained Avro schema JSON string.
-fn parse_avro_schema(schema_str: &str) -> Result<AvroSchema> {
-    AvroSchema::parse_str(schema_str)
-        .map_err(|e| SchemaRegError::config(format!("invalid Avro schema: {e}")))
-}
 
 /// Depth-first fetch of every schema transitively referenced by `schema`.
 ///
@@ -229,9 +166,9 @@ async fn collect_reference_closure<C: SchemaRegistryClient>(
             .get_schema_by_version(&reference.subject, reference.version)
             .await?;
 
-        // Depth-first: a dependency's own dependencies must be in the list too,
-        // and `parse_str_with_list` resolves cross-references within the set
-        // regardless of order.
+        // Depth-first, so a dependency's own dependencies land in the set too.
+        // The order they land in does not matter: `ResolvedAvroSchema` sorts
+        // the set before the codec sees it.
         Box::pin(collect_reference_closure(
             registry,
             &referenced.references,
@@ -244,18 +181,6 @@ async fn collect_reference_closure<C: SchemaRegistryClient>(
         out.push(referenced.schema.to_string());
     }
     Ok(())
-}
-
-/// Return the fully-qualified name of a named Avro schema type
-/// (Record, Enum, or Fixed).  Returns `None` for primitive / union / array /
-/// map schemas.
-fn schema_fullname(schema: &AvroSchema) -> Option<String> {
-    match schema {
-        AvroSchema::Record(rs) => Some(rs.name.fullname(rs.name.namespace.clone())),
-        AvroSchema::Enum(es) => Some(es.name.fullname(es.name.namespace.clone())),
-        AvroSchema::Fixed(fs) => Some(fs.name.fullname(fs.name.namespace.clone())),
-        _ => None,
-    }
 }
 
 // ── AvroSchemaEncoder ─────────────────────────────────────────────────────
@@ -514,11 +439,15 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoderBuilder<C> {
     /// [`references`](Self::references) server-side — but serialising a value
     /// locally needs the definitions in hand.
     ///
-    /// **List dependencies before the schemas that use them.** Avro resolves a
-    /// named type only against definitions that came earlier, so a schema
-    /// placed before something it references stays an unresolved reference and
-    /// fails at encode time rather than at `build()`. For a chain
-    /// `Address ← Customer ← Order`, pass `[ADDRESS, CUSTOMER]`.
+    /// **Order does not matter**, and a definition supplied twice is fine as
+    /// long as the copies agree. The set must be *complete*, though — a
+    /// dependency's own dependencies belong in it too. Anything missing,
+    /// contradictory, or circular is an error here, naming the type it could
+    /// not resolve.
+    ///
+    /// A reference must name a type another schema defines at its **top
+    /// level**; one defined only inside another schema is rejected, because
+    /// Avro resolves such a name inconsistently.
     ///
     /// ```rust,no_run
     /// # use schemreg::{AvroSchemaEncoder, SchemaReference, SchemaRegistryClient};
@@ -531,7 +460,7 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoderBuilder<C> {
     /// let encoder = AvroSchemaEncoder::builder()
     ///     .registry(registry)
     ///     .schema(ORDER)
-    ///     .dependencies([ADDRESS])       // defined before ORDER uses it
+    ///     .dependencies([ADDRESS])       // in any order
     ///     .references(vec![SchemaReference::new(
     ///         "com.example.Address", "address-value", 1i32,
     ///     )])
@@ -558,7 +487,8 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoderBuilder<C> {
         let schema_str = self
             .schema
             .ok_or_else(|| SchemaRegError::config("AvroSchemaEncoder: schema must be set"))?;
-        let avro_schema = ResolvedAvroSchema::parse(&schema_str, &self.dependencies)?;
+        let avro_schema =
+            ResolvedAvroSchema::parse(&schema_str, &self.dependencies, SchemaRole::WriterLocal)?;
         let fullname = avro_schema.fullname();
         Ok(AvroSchemaEncoder {
             registry,
@@ -592,15 +522,21 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoderBuilder<C> {
 /// [`DEFAULT_MAX_AVRO_SCHEMA_CACHE_ENTRIES`]) and **coalescing**: when N tasks
 /// decode messages carrying a schema ID that is not yet cached, exactly one
 /// registry lookup and one schema parse happen; the rest wait for the result.
-/// Use [`with_max_cache_entries`](Self::with_max_cache_entries) to resize it.
+/// Use [`builder`](Self::builder) to resize it.
 ///
 /// # Schema evolution
 ///
 /// By default the payload is decoded with the **writer** schema, which is what
 /// the wire header identifies. Supply a **reader** schema with
-/// [`with_reader_schema`](Self::with_reader_schema) to get Avro's full schema
+/// [`AvroSchemaDecoderBuilder::reader_schema`] to get Avro's full schema
 /// resolution — defaulted fields, dropped fields, promoted numeric types —
 /// matching the behaviour of the Confluent Java `SpecificAvroDeserializer`.
+///
+/// # Schema references
+///
+/// The writer schema's closure is fetched from the registry automatically. A
+/// reader schema naming externally defined types takes its definitions from
+/// [`AvroSchemaDecoderBuilder::reader_dependencies`].
 ///
 /// # Serde support
 ///
@@ -608,8 +544,8 @@ impl<C: SchemaRegistryClient> AvroSchemaEncoderBuilder<C> {
 /// concrete Rust type implementing [`serde::Deserialize`].
 pub struct AvroSchemaDecoder<C> {
     registry: C,
-    /// Optional reader schema used for Avro schema resolution.
-    reader_schema: Option<Arc<AvroSchema>>,
+    /// Reader schema and its dependencies, when schema resolution is wanted.
+    reader_schema: Option<Arc<ResolvedAvroSchema>>,
     schema_cache: InMemoryCache<SchemaKey, ResolvedAvroSchema>,
 }
 
@@ -629,42 +565,31 @@ fn avro_schema_lookup_cancelled(key: &SchemaKey) -> SchemaRegError {
 }
 
 impl<C: SchemaRegistryClient> AvroSchemaDecoder<C> {
-    /// Create a new `AvroSchemaDecoder` backed by the given registry client.
-    pub fn new(registry: C) -> Self {
-        Self::with_max_cache_entries(registry, DEFAULT_MAX_AVRO_SCHEMA_CACHE_ENTRIES)
-    }
-
-    /// Create a decoder whose parsed-schema cache holds at most `max_entries`.
+    /// Create a decoder that decodes with the writer schema the wire header
+    /// names, with the default cache bound.
     ///
-    /// The oldest entry is evicted once the bound is reached. Values below 1 are
-    /// clamped to 1.
-    pub fn with_max_cache_entries(registry: C, max_entries: usize) -> Self {
+    /// Reach for [`builder`](Self::builder) to configure a reader schema or
+    /// resize the cache.
+    pub fn new(registry: C) -> Self {
         Self {
             registry,
             reader_schema: None,
             schema_cache: InMemoryCache::new(
-                Some(max_entries.max(1)),
+                Some(DEFAULT_MAX_AVRO_SCHEMA_CACHE_ENTRIES),
                 avro_schema_lookup_cancelled,
             ),
         }
     }
 
-    /// Decode against an explicit **reader** schema, enabling Avro schema
-    /// resolution between the writer schema named by the wire header and the
-    /// schema this consumer was compiled against.
-    ///
-    /// Without a reader schema, a payload written with a newer writer schema is
-    /// decoded structurally as that writer schema — fields the consumer does not
-    /// know about appear in the [`Value`], and fields the consumer expects but
-    /// the writer dropped are simply absent. With a reader schema, Avro applies
-    /// its documented resolution rules instead.
-    ///
-    /// # Errors
-    ///
-    /// Returns a configuration error if `schema` is not valid Avro schema JSON.
-    pub fn with_reader_schema(mut self, schema: &str) -> Result<Self> {
-        self.reader_schema = Some(Arc::new(parse_avro_schema(schema)?));
-        Ok(self)
+    /// Create a builder for `AvroSchemaDecoder`.
+    pub fn builder() -> AvroSchemaDecoderBuilder<C> {
+        AvroSchemaDecoderBuilder::new()
+    }
+
+    /// Whether a reader schema is configured.
+    #[must_use]
+    pub fn has_reader_schema(&self) -> bool {
+        self.reader_schema.is_some()
     }
 
     /// Number of parsed writer schemas currently cached.
@@ -693,7 +618,12 @@ impl<C: SchemaRegistryClient> AvroSchemaDecoder<C> {
                     &mut deps,
                 )
                 .await?;
-                ResolvedAvroSchema::parse(&registry_schema.schema, &deps).map(Arc::new)
+                ResolvedAvroSchema::parse(
+                    &registry_schema.schema,
+                    &deps,
+                    SchemaRole::WriterRegistry,
+                )
+                .map(Arc::new)
             })
             .await
     }
@@ -729,6 +659,243 @@ impl<C: SchemaRegistryClient> AvroSchemaDecoder<C> {
                 "failed to deserialize Avro value into target type: {e}"
             ))
         })
+    }
+}
+
+// ── AvroSchemaDecoderBuilder ──────────────────────────────────────────────
+
+/// Builder for [`AvroSchemaDecoder`].
+///
+/// Only [`registry`](Self::registry) is required — everything else has a
+/// working default, and `AvroSchemaDecoder::new(registry)` is the shorthand for
+/// taking all of them.
+///
+/// ```rust,no_run
+/// # use schemreg::{AvroSchemaDecoder, SchemaRegistryClient};
+/// # fn build<C: SchemaRegistryClient>(registry: C) -> schemreg::Result<()> {
+/// const ADDRESS: &str = r#"{"type":"record","name":"Address","namespace":"com.example",
+///     "fields":[{"name":"city","type":"string"}]}"#;
+/// const CUSTOMER: &str = r#"{"type":"record","name":"Customer","namespace":"com.example",
+///     "fields":[{"name":"name","type":"string"},
+///               {"name":"address","type":"com.example.Address"}]}"#;
+///
+/// let decoder = AvroSchemaDecoder::builder()
+///     .registry(registry)
+///     .reader_schema(CUSTOMER)
+///     .reader_dependencies([ADDRESS])
+///     .build()?;
+/// # let _ = decoder;
+/// # Ok(())
+/// # }
+/// ```
+pub struct AvroSchemaDecoderBuilder<C> {
+    registry: Option<C>,
+    reader_schema: Option<ReaderSchemaInput>,
+    reader_dependencies: ReaderDependencies,
+    max_cache_entries: usize,
+}
+
+/// A reader schema as the caller supplied it: JSON, or already parsed.
+enum ReaderSchemaInput {
+    Json(String),
+    Parsed(Box<AvroSchema>),
+}
+
+/// Definitions backing the reader schema's references, in whichever form the
+/// reader schema itself was given.
+enum ReaderDependencies {
+    Json(Vec<String>),
+    Parsed(Vec<AvroSchema>),
+}
+
+impl Default for ReaderDependencies {
+    fn default() -> Self {
+        Self::Json(Vec::new())
+    }
+}
+
+impl ReaderDependencies {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Json(deps) => deps.is_empty(),
+            Self::Parsed(deps) => deps.is_empty(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Json(deps) => deps.len(),
+            Self::Parsed(deps) => deps.len(),
+        }
+    }
+}
+
+impl<C: SchemaRegistryClient> AvroSchemaDecoderBuilder<C> {
+    fn new() -> Self {
+        Self {
+            registry: None,
+            reader_schema: None,
+            reader_dependencies: ReaderDependencies::default(),
+            max_cache_entries: DEFAULT_MAX_AVRO_SCHEMA_CACHE_ENTRIES,
+        }
+    }
+
+    /// Set the schema registry client (required).
+    pub fn registry(mut self, registry: C) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// Decode against an explicit **reader** schema, enabling Avro schema
+    /// resolution between the writer schema the wire header names and the
+    /// schema this consumer was written against.
+    ///
+    /// Without one, the payload is decoded structurally as the writer schema.
+    /// With one, Avro applies its resolution rules: defaults are filled in,
+    /// unknown fields are dropped, numeric types are promoted.
+    ///
+    /// If the schema names types defined elsewhere, pair this with
+    /// [`reader_dependencies`](Self::reader_dependencies).
+    pub fn reader_schema(mut self, schema: impl Into<String>) -> Self {
+        self.reader_schema = Some(ReaderSchemaInput::Json(schema.into()));
+        self
+    }
+
+    /// Supply the JSON of every schema the reader schema references.
+    ///
+    /// A writer schema's references come from the registry, which stores them
+    /// alongside it. A reader schema is local and the registry has never seen
+    /// it, so its definitions have to come from here.
+    ///
+    /// Order does not matter, and a definition supplied twice is fine as long
+    /// as the copies agree.
+    pub fn reader_dependencies(
+        mut self,
+        schemas: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.reader_dependencies =
+            ReaderDependencies::Json(schemas.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Set an already-parsed reader schema — what `MyRecord::get_schema()`
+    /// returns under `#[derive(AvroSchema)]` — skipping the JSON round-trip.
+    ///
+    /// Pair with
+    /// [`reader_dependencies_parsed`](Self::reader_dependencies_parsed) when it
+    /// carries unresolved references.
+    ///
+    /// There is no encoder counterpart on purpose: an encoder sends its schema
+    /// to the registry as text, and re-serialising a parsed schema would
+    /// register something subtly different from what the author wrote.
+    pub fn reader_schema_parsed(mut self, schema: AvroSchema) -> Self {
+        self.reader_schema = Some(ReaderSchemaInput::Parsed(Box::new(schema)));
+        self
+    }
+
+    /// Supply already-parsed definitions for the reader schema's references.
+    ///
+    /// As [`reader_dependencies`](Self::reader_dependencies). Duplicates
+    /// compare by Avro's parsing canonical form, so docs and attributes do not
+    /// make two copies of one schema differ.
+    pub fn reader_dependencies_parsed(
+        mut self,
+        schemas: impl IntoIterator<Item = AvroSchema>,
+    ) -> Self {
+        self.reader_dependencies = ReaderDependencies::Parsed(schemas.into_iter().collect());
+        self
+    }
+
+    /// Bound the parsed-writer-schema cache (default:
+    /// [`DEFAULT_MAX_AVRO_SCHEMA_CACHE_ENTRIES`]).
+    ///
+    /// The oldest entry is evicted once the bound is reached. Values below 1
+    /// are clamped to 1.
+    pub fn max_cache_entries(mut self, max_entries: usize) -> Self {
+        self.max_cache_entries = max_entries;
+        self
+    }
+
+    /// Build the decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if `registry` was not set, if the reader
+    /// schema is not valid Avro, if it references a type nothing supplied, or
+    /// if the supplied definitions contradict each other.
+    pub fn build(self) -> Result<AvroSchemaDecoder<C>> {
+        let registry = self
+            .registry
+            .ok_or_else(|| SchemaRegError::config("AvroSchemaDecoder: registry must be set"))?;
+
+        let reader_schema = match (self.reader_schema, self.reader_dependencies) {
+            (Some(ReaderSchemaInput::Json(schema)), ReaderDependencies::Json(deps)) => Some(
+                ResolvedAvroSchema::parse(&schema, &deps, SchemaRole::Reader)?,
+            ),
+            (Some(ReaderSchemaInput::Parsed(schema)), ReaderDependencies::Parsed(deps)) => Some(
+                ResolvedAvroSchema::from_parsed(*schema, deps, SchemaRole::Reader)?,
+            ),
+            // Mixed forms: the dependencies were set in the other
+            // representation from the schema. Nothing sensible to resolve
+            // against, and silently ignoring them would decode wrongly.
+            (Some(ReaderSchemaInput::Json(schema)), ReaderDependencies::Parsed(deps)) => {
+                if !deps.is_empty() {
+                    return Err(mixed_reader_forms("reader_dependencies_parsed"));
+                }
+                Some(ResolvedAvroSchema::parse(&schema, &[], SchemaRole::Reader)?)
+            }
+            (Some(ReaderSchemaInput::Parsed(schema)), ReaderDependencies::Json(deps)) => {
+                if !deps.is_empty() {
+                    return Err(mixed_reader_forms("reader_dependencies"));
+                }
+                Some(ResolvedAvroSchema::from_parsed(
+                    *schema,
+                    Vec::new(),
+                    SchemaRole::Reader,
+                )?)
+            }
+            (None, deps) if !deps.is_empty() => {
+                return Err(SchemaRegError::config(
+                    "AvroSchemaDecoder: reader dependencies were supplied without a \
+                     reader schema; they resolve that schema's references and do \
+                     nothing on their own",
+                ));
+            }
+            (None, _) => None,
+        };
+
+        Ok(AvroSchemaDecoder {
+            registry,
+            reader_schema: reader_schema.map(Arc::new),
+            schema_cache: InMemoryCache::new(
+                Some(self.max_cache_entries.max(1)),
+                avro_schema_lookup_cancelled,
+            ),
+        })
+    }
+}
+
+fn mixed_reader_forms(setter: &'static str) -> SchemaRegError {
+    SchemaRegError::config(format!(
+        "AvroSchemaDecoder: the reader schema and `{setter}` were given in different \
+         forms; supply both as JSON, or both already parsed"
+    ))
+}
+
+impl<C: SchemaRegistryClient> Default for AvroSchemaDecoderBuilder<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C> std::fmt::Debug for AvroSchemaDecoderBuilder<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AvroSchemaDecoderBuilder")
+            .field("registry", &self.registry.is_some())
+            .field("reader_schema_set", &self.reader_schema.is_some())
+            .field("reader_dependencies", &self.reader_dependencies.len())
+            .field("max_cache_entries", &self.max_cache_entries)
+            .finish()
     }
 }
 

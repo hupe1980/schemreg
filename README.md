@@ -22,7 +22,7 @@ and **AWS Glue Schema Registry**, with Avro, JSON Schema, and Protobuf codecs.
 - ✅ **Verified against the official serializers**, not just against itself — bytes from `confluent-kafka-python`, decoded *and* re-encoded byte-identically ([conformance harness](conformance/README.md)).
 - 🚀 **Bounded caching** with thundering-herd coalescing and cancellation safety. No unbounded map on any message-driven path.
 - 🧬 **Protobuf message-index paths derived from the descriptor**, so they cannot drift from the `.proto`.
-- 🔗 **Schema references resolved transitively**, for both Avro and JSON Schema.
+- 🔗 **Schema references resolved transitively**, for both Avro and JSON Schema — writer *and* reader schemas, in any dependency order.
 - 🔌 **Pluggable backend** via the `SchemaRegistryClient` trait, usable generically *and* as `dyn`.
 
 ## ✨ Features
@@ -35,7 +35,7 @@ Everything is opt-in; the default feature set pulls in no transport stack at all
 | `confluent` | 🌐 Confluent HTTP client + framing encoder, TLS via rustls |
 | `apicurio` | 🗂️ Native Apicurio Registry v3 client (`/apis/registry/v3/`) |
 | `glue` | ☁️ AWS Glue SDK client, ZLIB compression |
-| `avro` | 🪶 Avro encode / decode, with transitive schema-reference resolution |
+| `avro` | 🪶 Avro encode / decode, with transitive schema-reference resolution and reader-schema evolution |
 | `json` | 📋 JSON Schema validate / serialise, with cross-subject `$ref` resolution |
 | `protobuf` | 🧬 Protobuf encode / decode, with descriptor-derived message-index paths |
 | `native-tls-roots` | 🔒 Add the platform root store to the HTTPS trust anchors |
@@ -203,6 +203,7 @@ of them are executed in CI.
 | [`protobuf_wire_format`](examples/protobuf_wire_format.rs) | 🧬 Message-index framing, with hex dumps |
 | [`protobuf_roundtrip`](examples/protobuf_roundtrip.rs) | 🧬 Descriptor-derived paths and wrong-type rejection |
 | [`avro_roundtrip`](examples/avro_roundtrip.rs) | 🪶 Avro encode → framing → decode, plus serde |
+| [`avro_references`](examples/avro_references.rs) | 🔗 Cross-subject references on the writer *and* reader side |
 | [`json_roundtrip`](examples/json_roundtrip.rs) | 📋 JSON Schema validation on encode and decode |
 | [`glue_roundtrip`](examples/glue_roundtrip.rs) | ☁️ Glue framing, with and without ZLIB |
 | [`apicurio_roundtrip`](examples/apicurio_roundtrip.rs) | 🗂️ Apicurio v3 group-scoped round-trip |
@@ -219,6 +220,7 @@ cargo run --example schema_resolution --features confluent
 | [hupe1980.github.io/schemreg](https://hupe1980.github.io/schemreg/) | Guides: wire formats, producers, codecs, Kafka integration, caching, backends, resilience, security, performance, testing |
 | [docs.rs/schemreg](https://docs.rs/schemreg) | API reference |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes and breaking changes |
+| [Migrating to 0.6](https://hupe1980.github.io/schemreg/docs/migrating-0-6/) | Upgrading from 0.5.x |
 | [Migrating to 0.5](https://hupe1980.github.io/schemreg/docs/migrating-0-5/) | Upgrading from 0.4.x |
 | [conformance/](conformance/README.md) | The cross-language conformance harness |
 
