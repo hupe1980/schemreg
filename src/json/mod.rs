@@ -17,7 +17,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.6", features = ["json"] }
+//! schemreg = { version = "0.7", features = ["json"] }
 //! ```
 //!
 //! # Layered model
@@ -79,7 +79,7 @@ use crate::resolver::{
 use crate::subject::SubjectNameStrategy;
 use crate::traits::SchemaRegistryClient;
 use crate::types::{EncodeTarget, SchemaId, SchemaKey, SchemaReference, SchemaType};
-use crate::wire::{HeaderFramed, decode_wire_format_bytes, encode_wire_format};
+use crate::wire::{HeaderFramed, WireRecord, encode_wire_format, unframe};
 
 /// Default bound on the number of compiled JSON Schema validators a
 /// [`JsonSchemaDecoder`] keeps in memory.
@@ -813,18 +813,22 @@ impl<C: SchemaRegistryClient> JsonSchemaDecoder<C> {
             .await
     }
 
-    /// Decode a Confluent-framed JSON message to a [`serde_json::Value`].
+    /// Decode a JSON Schema record to a [`serde_json::Value`].
+    ///
+    /// Pass the record's bytes for prefix framing, or a [`WireRecord`] built
+    /// with [`WireRecord::from_headers`] to honour a schema-id header first.
     ///
     /// # Errors
     ///
-    /// - Invalid Confluent wire header or truncated data.
+    /// - Invalid framing (no prefix and no header, or truncated).
     /// - Registry lookup failure.
     /// - JSON parse failure.
     /// - Validation failure when `validate_on_decode` is `true`.
-    pub async fn decode(&self, data: Bytes) -> Result<Value> {
-        let (key, payload) = decode_wire_format_bytes(&data)?;
+    pub async fn decode(&self, record: impl Into<WireRecord>) -> Result<Value> {
+        let unframed = unframe(&record.into(), false)?;
+        let key = unframed.key;
 
-        let value: Value = serde_json::from_slice(&payload).map_err(|e| {
+        let value: Value = serde_json::from_slice(&unframed.payload).map_err(|e| {
             SchemaRegError::wire_format(format!("JSON deserialisation failed: {e}"))
         })?;
 
@@ -846,8 +850,8 @@ impl<C: SchemaRegistryClient> JsonSchemaDecoder<C> {
     ///
     /// Returns an error if decoding fails, or if the value cannot be
     /// deserialised into `T`.
-    pub async fn decode_de<T: DeserializeOwned>(&self, data: Bytes) -> Result<T> {
-        let value = self.decode(data).await?;
+    pub async fn decode_de<T: DeserializeOwned>(&self, record: impl Into<WireRecord>) -> Result<T> {
+        let value = self.decode(record).await?;
         serde_json::from_value(value).map_err(|e| {
             SchemaRegError::wire_format(format!(
                 "failed to deserialise JSON value into target type: {e}"

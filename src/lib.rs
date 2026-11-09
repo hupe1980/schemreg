@@ -25,6 +25,7 @@
 //! | Caching | [`CachedSchemaRegistry`], [`CachedGlueSchemaRegistry`], [`AnySchemaCache`] |
 //! | Codecs | [`AvroSchemaEncoder`], [`AvroSchemaDecoder`], [`JsonSchemaEncoder`], [`JsonSchemaDecoder`], [`ProtobufSchemaEncoder`], [`ProtobufSchemaDecoder`] |
 //! | Producer policy | [`SchemaResolution`] — register, look up, or follow the subject head; [`Framing`] — v0 or v1 |
+//! | Decoder input | [`WireRecord`] — record bytes plus the schema-id header, read header-first |
 //! | Framing-only decode | [`WireFormatDecoder`], [`HeaderFramed`] |
 //! | Resilience | [`RetryPolicy`] — retry budget, jittered back-off, `Retry-After` (with `confluent` or `apicurio`) |
 //!
@@ -42,7 +43,6 @@
 //! | `avro` | Avro serialise/deserialise via `apache-avro`, with schema-reference resolution |
 //! | `json` | JSON Schema validate/serialise via `jsonschema` |
 //! | `protobuf` | Protobuf serialise/deserialise via `prost`, with the message-index path derived from the descriptor |
-//! | `native-tls-roots` | Trust the platform root store in addition to webpki roots |
 //!
 //! # Quick start
 //!
@@ -111,10 +111,20 @@
 //!   URL it chose.
 //! - **Not a Kafka client.** `schemreg` produces and consumes [`bytes::Bytes`];
 //!   wiring them to a broker is the caller's job.
-//! - **Wire-format conformance is verified, not asserted.** The Confluent
-//!   framings are tested against byte sequences produced by the official
-//!   Confluent serializers, decoded *and* re-encoded byte-identically — not
-//!   only against this crate's own reading of the specification.
+//! - **Wire-format conformance is verified, not asserted.** Every Confluent
+//!   placement — the v0 prefix, the v1 prefix and header mode, with every
+//!   Protobuf message-index shape — is tested against bytes produced by the
+//!   official `confluent-kafka` serializers on Confluent Platform 8, decoded
+//!   *and* re-encoded byte-identically. The Glue framing is pinned only by
+//!   vectors derived from its specification.
+//! - **Header-first decoding.** Every decoder takes a [`WireRecord`]; when it
+//!   carries a `__key_schema_id` / `__value_schema_id` header (the last one, if
+//!   repeated) the identifier comes from there, otherwise from the prefix — the
+//!   order Confluent's deserializers use.
+//! - **One crypto provider.** The REST clients use rustls on aws-lc-rs — the
+//!   provider the AWS SDK already links — with the operating system's trust
+//!   store and post-quantum key exchange (X25519MLKEM768) preferred. A refused
+//!   handshake is [`SchemaRegError::Tls`]: permanent, never retried.
 //!
 //! # Error handling
 //!
@@ -138,14 +148,14 @@
 //! ```
 //!
 //! [`is_retryable`](SchemaRegError::is_retryable) is `true` only for transport
-//! failures, HTTP 429, HTTP 5xx, and the registry's own `5xxxx` error codes.
+//! failures (not refused TLS handshakes), HTTP 429, HTTP 5xx, and the registry's own `5xxxx` error codes.
 //! Permanent conditions — not-found, auth, incompatible or invalid schema — are
 //! never marked retryable, on any backend, so an outer retry loop cannot spin
 //! forever.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations)]
-#![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 /// Compiles every non-`ignore` Rust block in `README.md` as a doctest.
 ///
@@ -178,6 +188,15 @@ pub mod glue;
 pub mod resolver;
 #[cfg(any(feature = "confluent", feature = "apicurio"))]
 pub mod retry;
+/// TLS types accepted by the REST client builders.
+///
+/// Re-exported from `reqwest`, so configuring a private CA or a client
+/// certificate needs no direct `reqwest` dependency — and can never pull a
+/// second, mismatched `reqwest` into the build.
+#[cfg(any(feature = "confluent", feature = "apicurio"))]
+pub mod tls {
+    pub use reqwest::{Certificate, Identity};
+}
 pub mod subject;
 pub mod traits;
 pub mod types;
@@ -237,10 +256,10 @@ pub use types::{
 };
 pub use wire::{
     DetectedWireFormat, HeaderFramed, KEY_SCHEMA_ID_HEADER, MAGIC_BYTE_V0, MAGIC_BYTE_V1,
-    PREFIX_LEN_V0, PREFIX_LEN_V1, VALUE_SCHEMA_ID_HEADER, decode_protobuf_message_indexes,
-    decode_schema_id_header, decode_wire_format, decode_wire_format_bytes, decode_wire_prefix,
-    detect_wire_format, encode_protobuf_wire_format, encode_schema_id_header, encode_wire_format,
-    schema_id_header_name,
+    PREFIX_LEN_V0, PREFIX_LEN_V1, SchemaIdPlacement, VALUE_SCHEMA_ID_HEADER, WireRecord,
+    decode_protobuf_message_indexes, decode_schema_id_header, decode_wire_format,
+    decode_wire_format_bytes, decode_wire_prefix, detect_wire_format, encode_protobuf_wire_format,
+    encode_schema_id_header, encode_wire_format, schema_id_header_name,
 };
 
 #[cfg(feature = "glue")]

@@ -1,7 +1,7 @@
 +++
 title = "Migrating to 0.6"
 description = "Upgrade path from schemreg 0.5.x to 0.6.0: the Avro decoder gains a builder, reader schemas resolve their own references, and dependency order stops mattering."
-weight = 12
+weight = 13
 +++
 
 One breaking change, in one place: configuring an `AvroSchemaDecoder`. Two

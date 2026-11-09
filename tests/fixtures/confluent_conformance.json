@@ -1,86 +1,305 @@
 {
-  "_comment": "GENERATED FILE \u2014 do not edit by hand. Produced by conformance/generate_fixtures.py using the official confluent-kafka Python serializers. Regenerate with: docker compose -f conformance/docker-compose.yml up --build --abort-on-container-exit",
-  "generator": "confluent-kafka-python",
+  "_comment": "GENERATED FILE \u2014 do not edit by hand. Produced by conformance/generate_fixtures.py using the official confluent-kafka Python serializers, each fixture read back by the reference deserializer. Regenerate with: just conformance",
+  "generator": "confluent-kafka-python 2.16.1",
+  "registry": "confluentinc/cp-schema-registry:8.4.0",
   "fixtures": [
     {
-      "name": "avro_order",
-      "note": "Plain 5-byte Confluent header; no message-index array for Avro.",
+      "name": "avro_order_prefix_v0_value",
+      "note": "Avro, prefix-v0, value side. No message-index array for Avro.",
       "schema_type": "AVRO",
       "schema": "{\n  \"type\": \"record\",\n  \"name\": \"Order\",\n  \"namespace\": \"shop\",\n  \"fields\": [\n    {\"name\": \"id\", \"type\": \"string\"},\n    {\"name\": \"quantity\", \"type\": \"int\"}\n  ]\n}",
-      "framed_hex": "00000000010e6f726465722d3106",
-      "message_indexes": null
+      "placement": "prefix-v0",
+      "side": "value",
+      "schema_id": 1,
+      "guid": "c49aeaf9-7ca2-8be6-be44-5a9838fe8a9d",
+      "message_indexes": null,
+      "framed_hex": "00000000010e6f726465722d3106"
     },
     {
-      "name": "json_order",
-      "note": "Plain 5-byte Confluent header; JSON Schema uses no message-index either.",
+      "name": "avro_order_header_v1_value",
+      "note": "Avro, header-v1, value side. No message-index array for Avro.",
+      "schema_type": "AVRO",
+      "schema": "{\n  \"type\": \"record\",\n  \"name\": \"Order\",\n  \"namespace\": \"shop\",\n  \"fields\": [\n    {\"name\": \"id\", \"type\": \"string\"},\n    {\"name\": \"quantity\", \"type\": \"int\"}\n  ]\n}",
+      "placement": "header-v1",
+      "side": "value",
+      "schema_id": 1,
+      "guid": "c49aeaf9-7ca2-8be6-be44-5a9838fe8a9d",
+      "message_indexes": null,
+      "header_name": "__value_schema_id",
+      "header_hex": "01c49aeaf97ca28be6be445a9838fe8a9d",
+      "payload_hex": "0e6f726465722d3106"
+    },
+    {
+      "name": "avro_order_header_v1_key",
+      "note": "Avro, header-v1, key side. No message-index array for Avro.",
+      "schema_type": "AVRO",
+      "schema": "{\n  \"type\": \"record\",\n  \"name\": \"Order\",\n  \"namespace\": \"shop\",\n  \"fields\": [\n    {\"name\": \"id\", \"type\": \"string\"},\n    {\"name\": \"quantity\", \"type\": \"int\"}\n  ]\n}",
+      "placement": "header-v1",
+      "side": "key",
+      "schema_id": 1,
+      "guid": "c49aeaf9-7ca2-8be6-be44-5a9838fe8a9d",
+      "message_indexes": null,
+      "header_name": "__key_schema_id",
+      "header_hex": "01c49aeaf97ca28be6be445a9838fe8a9d",
+      "payload_hex": "0e6f726465722d3106"
+    },
+    {
+      "name": "avro_order_prefix_v1_value",
+      "note": "Avro, prefix-v1, value side. No message-index array for Avro.",
+      "schema_type": "AVRO",
+      "schema": "{\n  \"type\": \"record\",\n  \"name\": \"Order\",\n  \"namespace\": \"shop\",\n  \"fields\": [\n    {\"name\": \"id\", \"type\": \"string\"},\n    {\"name\": \"quantity\", \"type\": \"int\"}\n  ]\n}",
+      "placement": "prefix-v1",
+      "side": "value",
+      "schema_id": 1,
+      "guid": "c49aeaf9-7ca2-8be6-be44-5a9838fe8a9d",
+      "message_indexes": null,
+      "framed_hex": "01c49aeaf97ca28be6be445a9838fe8a9d0e6f726465722d3106"
+    },
+    {
+      "name": "json_order_prefix_v0_value",
+      "note": "JSON Schema, prefix-v0. JSON Schema uses no message-index either.",
       "schema_type": "JSON",
       "schema": "{\n  \"$schema\": \"http://json-schema.org/draft-07/schema#\",\n  \"title\": \"Order\",\n  \"type\": \"object\",\n  \"properties\": {\n    \"id\": {\"type\": \"string\"},\n    \"quantity\": {\"type\": \"integer\"}\n  },\n  \"required\": [\"id\", \"quantity\"],\n  \"additionalProperties\": false\n}",
-      "framed_hex": "00000000027b226964223a20226f726465722d32222c20227175616e74697479223a20377d",
-      "message_indexes": null
+      "placement": "prefix-v0",
+      "side": "value",
+      "schema_id": 2,
+      "guid": "21ced8cf-3c72-3043-f4e6-606683938a6d",
+      "message_indexes": null,
+      "framed_hex": "00000000027b226964223a226f726465722d32222c227175616e74697479223a377d"
     },
     {
-      "name": "protobuf_order",
-      "note": "First top-level message \u2014 the mandated single-0x00 optimisation.",
+      "name": "json_order_header_v1_value",
+      "note": "JSON Schema, header-v1. JSON Schema uses no message-index either.",
+      "schema_type": "JSON",
+      "schema": "{\n  \"$schema\": \"http://json-schema.org/draft-07/schema#\",\n  \"title\": \"Order\",\n  \"type\": \"object\",\n  \"properties\": {\n    \"id\": {\"type\": \"string\"},\n    \"quantity\": {\"type\": \"integer\"}\n  },\n  \"required\": [\"id\", \"quantity\"],\n  \"additionalProperties\": false\n}",
+      "placement": "header-v1",
+      "side": "value",
+      "schema_id": 2,
+      "guid": "21ced8cf-3c72-3043-f4e6-606683938a6d",
+      "message_indexes": null,
+      "header_name": "__value_schema_id",
+      "header_hex": "0121ced8cf3c723043f4e6606683938a6d",
+      "payload_hex": "7b226964223a226f726465722d32222c227175616e74697479223a377d"
+    },
+    {
+      "name": "protobuf_order_prefix_v0_value",
+      "note": "First top-level message \u2014 the mandated single-0x00 optimisation. (prefix-v0, value side)",
       "schema_type": "PROTOBUF",
       "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
-      "framed_hex": "0000000003000a076f726465722d331001",
+      "placement": "prefix-v0",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
       "message_indexes": [
         0
-      ]
+      ],
+      "framed_hex": "0000000003000a076f726465722d331001"
     },
     {
-      "name": "protobuf_invoice",
-      "note": "Second top-level message \u2014 ZigZag(count=1)=2, ZigZag(1)=2.",
+      "name": "protobuf_order_header_v1_value",
+      "note": "First top-level message \u2014 the mandated single-0x00 optimisation. (header-v1, value side)",
       "schema_type": "PROTOBUF",
       "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
-      "framed_hex": "000000000302020a05696e762d31",
+      "placement": "header-v1",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
+      "message_indexes": [
+        0
+      ],
+      "header_name": "__value_schema_id",
+      "header_hex": "01ed0dcb5f48eacb6400c60e1bd748aaf100",
+      "payload_hex": "0a076f726465722d331001"
+    },
+    {
+      "name": "protobuf_invoice_prefix_v0_value",
+      "note": "Second top-level message \u2014 ZigZag(count=1)=2, ZigZag(1)=2. (prefix-v0, value side)",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "placement": "prefix-v0",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
       "message_indexes": [
         1
-      ]
+      ],
+      "framed_hex": "000000000302020a05696e762d31"
     },
     {
-      "name": "protobuf_refund",
-      "note": "Third top-level message \u2014 ZigZag(count=1)=2, ZigZag(2)=4.",
+      "name": "protobuf_invoice_header_v1_value",
+      "note": "Second top-level message \u2014 ZigZag(count=1)=2, ZigZag(1)=2. (header-v1, value side)",
       "schema_type": "PROTOBUF",
       "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
-      "framed_hex": "000000000302040a057265662d31",
+      "placement": "header-v1",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
+      "message_indexes": [
+        1
+      ],
+      "header_name": "__value_schema_id",
+      "header_hex": "01ed0dcb5f48eacb6400c60e1bd748aaf10202",
+      "payload_hex": "0a05696e762d31"
+    },
+    {
+      "name": "protobuf_refund_prefix_v0_value",
+      "note": "Third top-level message \u2014 ZigZag(count=1)=2, ZigZag(2)=4. (prefix-v0, value side)",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "placement": "prefix-v0",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
       "message_indexes": [
         2
-      ]
+      ],
+      "framed_hex": "000000000302040a057265662d31"
     },
     {
-      "name": "protobuf_invoice_line",
-      "note": "Nested one level \u2014 ZigZag(count=2)=4, then ZigZag(1), ZigZag(0).",
+      "name": "protobuf_refund_header_v1_value",
+      "note": "Third top-level message \u2014 ZigZag(count=1)=2, ZigZag(2)=4. (header-v1, value side)",
       "schema_type": "PROTOBUF",
       "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
-      "framed_hex": "00000000030402000a05534b552d31",
+      "placement": "header-v1",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
+      "message_indexes": [
+        2
+      ],
+      "header_name": "__value_schema_id",
+      "header_hex": "01ed0dcb5f48eacb6400c60e1bd748aaf10204",
+      "payload_hex": "0a057265662d31"
+    },
+    {
+      "name": "protobuf_invoice_line_prefix_v0_value",
+      "note": "Nested one level \u2014 ZigZag(count=2)=4, then ZigZag(1), ZigZag(0). (prefix-v0, value side)",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "placement": "prefix-v0",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
       "message_indexes": [
         1,
         0
-      ]
+      ],
+      "framed_hex": "00000000030402000a05534b552d31"
     },
     {
-      "name": "protobuf_invoice_tax",
-      "note": "Nested one level, second nested type.",
+      "name": "protobuf_invoice_line_header_v1_value",
+      "note": "Nested one level \u2014 ZigZag(count=2)=4, then ZigZag(1), ZigZag(0). (header-v1, value side)",
       "schema_type": "PROTOBUF",
       "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
-      "framed_hex": "00000000030402020a03564154",
+      "placement": "header-v1",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
+      "message_indexes": [
+        1,
+        0
+      ],
+      "header_name": "__value_schema_id",
+      "header_hex": "01ed0dcb5f48eacb6400c60e1bd748aaf1040200",
+      "payload_hex": "0a05534b552d31"
+    },
+    {
+      "name": "protobuf_invoice_line_header_v1_key",
+      "note": "Nested one level \u2014 ZigZag(count=2)=4, then ZigZag(1), ZigZag(0). (header-v1, key side)",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "placement": "header-v1",
+      "side": "key",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
+      "message_indexes": [
+        1,
+        0
+      ],
+      "header_name": "__key_schema_id",
+      "header_hex": "01ed0dcb5f48eacb6400c60e1bd748aaf1040200",
+      "payload_hex": "0a05534b552d31"
+    },
+    {
+      "name": "protobuf_invoice_line_prefix_v1_value",
+      "note": "Nested one level \u2014 ZigZag(count=2)=4, then ZigZag(1), ZigZag(0). (prefix-v1, value side)",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "placement": "prefix-v1",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
+      "message_indexes": [
+        1,
+        0
+      ],
+      "framed_hex": "01ed0dcb5f48eacb6400c60e1bd748aaf10402000a05534b552d31"
+    },
+    {
+      "name": "protobuf_invoice_tax_prefix_v0_value",
+      "note": "Nested one level, second nested type. (prefix-v0, value side)",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "placement": "prefix-v0",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
       "message_indexes": [
         1,
         1
-      ]
+      ],
+      "framed_hex": "00000000030402020a03564154"
     },
     {
-      "name": "protobuf_invoice_tax_rate",
-      "note": "Nested two levels \u2014 three-segment index path.",
+      "name": "protobuf_invoice_tax_header_v1_value",
+      "note": "Nested one level, second nested type. (header-v1, value side)",
       "schema_type": "PROTOBUF",
       "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
-      "framed_hex": "000000000306020200089e0f",
+      "placement": "header-v1",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
+      "message_indexes": [
+        1,
+        1
+      ],
+      "header_name": "__value_schema_id",
+      "header_hex": "01ed0dcb5f48eacb6400c60e1bd748aaf1040202",
+      "payload_hex": "0a03564154"
+    },
+    {
+      "name": "protobuf_invoice_tax_rate_prefix_v0_value",
+      "note": "Nested two levels \u2014 three-segment index path. (prefix-v0, value side)",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "placement": "prefix-v0",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
       "message_indexes": [
         1,
         1,
         0
-      ]
+      ],
+      "framed_hex": "000000000306020200089e0f"
+    },
+    {
+      "name": "protobuf_invoice_tax_rate_header_v1_value",
+      "note": "Nested two levels \u2014 three-segment index path. (header-v1, value side)",
+      "schema_type": "PROTOBUF",
+      "schema": "syntax = \"proto3\";\npackage shop;\n\n// Message ordering here is load-bearing: it determines the Confluent\n// message-index path, which is exactly what these fixtures pin.\n//\n//   Order            \u2192 [0]      (first top-level, the optimised single 0x00)\n//   Invoice          \u2192 [1]\n//   Invoice.Line     \u2192 [1, 0]\n//   Invoice.Tax      \u2192 [1, 1]\n//   Invoice.Tax.Rate \u2192 [1, 1, 0]\n//   Refund           \u2192 [2]\n\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n\nmessage Invoice {\n  string id = 1;\n\n  message Line {\n    string sku = 1;\n  }\n\n  message Tax {\n    string code = 1;\n    message Rate {\n      int32 basis_points = 1;\n    }\n  }\n}\n\nmessage Refund {\n  string id = 1;\n}",
+      "placement": "header-v1",
+      "side": "value",
+      "schema_id": 3,
+      "guid": "ed0dcb5f-48ea-cb64-00c6-0e1bd748aaf1",
+      "message_indexes": [
+        1,
+        1,
+        0
+      ],
+      "header_name": "__value_schema_id",
+      "header_hex": "01ed0dcb5f48eacb6400c60e1bd748aaf106020200",
+      "payload_hex": "089e0f"
     }
   ]
 }

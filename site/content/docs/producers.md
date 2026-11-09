@@ -76,7 +76,7 @@ encoder.invalidate_subject("orders-value");
 | [`Framing`] | Prefix | Requires |
 |---|---|---|
 | `SchemaId` *(default)* | `0x00` + 4 bytes | anything Confluent-compatible |
-| `SchemaGuid` | `0x01` + 16 bytes | Confluent Platform 8+ |
+| `SchemaGuid` | `0x01` + 16 bytes | Confluent Platform 8+ — on the *consumer* side too |
 
 [`Framing`]: https://docs.rs/schemreg/latest/schemreg/resolver/enum.Framing.html
 
@@ -93,6 +93,12 @@ let encoder = AvroSchemaEncoder::builder()
 A GUID is a fingerprint of the schema rather than a per-registry counter, so
 records framed this way stay readable after a cluster migration or a
 cross-region replication that would otherwise need every prefix rewritten.
+
+In the *prefix*, `SchemaGuid` writes bytes no Confluent serializer writes by
+default — Confluent's own GUID placement is the header. Current Confluent
+deserializers read both; consumers older than Confluent Platform 8 read
+neither. When the consumers are Confluent clients, `encode_with_header` with
+`SchemaGuid` is the placement that matches what they produce themselves.
 
 Against a registry that reports no GUID this is a `NotSupported` error, never a
 frame built from an invented identifier. Combined with `AutoRegister` it costs

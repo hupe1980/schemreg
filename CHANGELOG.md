@@ -8,6 +8,63 @@ one is listed under a `Breaking` heading with the migration it requires.
 
 ---
 
+## [0.7.0] — 2026-11-09
+
+Consumers read Confluent header-mode records through every codec; the TLS stack
+moves to rustls on aws-lc-rs with the OS trust store; every Confluent placement
+is now verified against Confluent's own serializers.
+
+See the [0.7 migration guide](https://hupe1980.github.io/schemreg/docs/migrating-0-7/).
+
+### ✨ Added
+
+- **Header-first decoding.** Every decoder takes a `WireRecord` — record bytes
+  plus the schema-id header. `WireRecord::from_headers(target, value, headers)`
+  picks the last `__value_schema_id` / `__key_schema_id`, and decoding reads it
+  before the payload prefix, as Confluent's deserializers do. Protobuf takes its
+  message-index path from the header too. `DecodedMessage::placement` and
+  `UnframedProtobuf::placement` report which placement was used.
+- **TLS options:** `trust_only_root_certificates`, `require_tls13`, and
+  `schemreg::tls::{Certificate, Identity}` re-exported so no direct `reqwest`
+  dependency is needed.
+- **`SchemaRegError::Tls`** and `is_tls_error()` for a refused handshake.
+- **Reference fixtures for v1 and header mode**, from `confluent-kafka` 2.16.1
+  on Confluent Platform 8.4.0, decoded, re-encoded byte-identically, and decoded
+  through the codecs.
+
+### 🐛 Fixed
+
+- **Permanent errors were retried.** The HTTP retry loop retried every error,
+  so a response over the 16 MiB cap was downloaded four times and a certificate
+  failure retried with back-off. Only retryable errors are retried now.
+- **A refused TLS handshake was `is_retryable()`**, so an outer retry loop spun
+  on an untrusted certificate forever. It is now `Tls`, not retryable.
+- **`detect_wire_format` allocated on a truncated Confluent frame**, formatting an
+  error message it then discarded — 45 ns instead of ~1 ns on input an attacker
+  controls. Detection no longer allocates.
+
+### ⚡ Changed
+
+- **rustls on aws-lc-rs** (from ring), with the platform verifier (OS trust
+  store and revocation) instead of the bundled Mozilla roots, and the hybrid
+  post-quantum key exchange X25519MLKEM768 preferred. A build with every backend
+  now links one crypto library; `ring` is banned in `deny.toml`.
+- `reqwest` 0.13, `apache-avro` 0.22 (on its `GenericDatumReader` /
+  `GenericDatumWriter`), `jsonschema` 0.61, `aws-config` 1.13, `base64` 0.23.
+- `clippy::unwrap_used`, `expect_used` and `panic` are `deny` in the crate.
+
+### 💥 Breaking
+
+- **MSRV 1.94.1** (from 1.88) — the floor `aws-config` ≥ 1.9 requires.
+- **`PayloadDecoder::decode` takes a `WireRecord`** instead of `Bytes`; call it
+  with `payload.into()`. Codec decoders accept `impl Into<WireRecord>`, so
+  `decode(bytes)` call sites are unchanged.
+- **`DecodedMessage`** has a new `placement` field.
+- **Feature `native-tls-roots` removed** — the OS trust store is the default.
+- **Certificate failures are `SchemaRegError::Tls`**, no longer `Network`.
+
+---
+
 ## [0.6.0] — 2026-08-26
 
 Avro schema references, on the side that had been left out: a **reader** schema

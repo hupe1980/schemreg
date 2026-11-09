@@ -15,7 +15,7 @@ use bytes::Bytes;
 use crate::error::{Result, SchemaRegError};
 use crate::traits::{DynSchemaRegistryClient, PayloadDecoder};
 use crate::types::{EncodeTarget, Schema, SchemaType};
-use crate::wire::{decode_protobuf_message_indexes, detect_wire_format};
+use crate::wire::{SchemaIdPlacement, WireRecord, detect_wire_format, locate};
 
 #[cfg(feature = "glue")]
 use crate::glue::{DynGlueSchemaRegistryClient, GlueDataFormat, GlueSchema};
@@ -98,6 +98,9 @@ pub struct DecodedMessage {
     /// messages. Identifies which message type in the `.proto` file was used.
     /// `[0]` means the first top-level message (the common case).
     pub protobuf_message_indexes: Option<Vec<u32>>,
+    /// Where a Confluent record carried its identifier; `None` for Glue and
+    /// unrecognised payloads.
+    pub placement: Option<SchemaIdPlacement>,
 }
 
 // ── WireFormatDecoder ─────────────────────────────────────────────────────
@@ -190,48 +193,24 @@ impl WireFormatDecoder {
         self
     }
 
-    /// Decode a wire-formatted payload.
+    /// Decode a record: strip its framing and fetch its schema.
     ///
-    /// Auto-detects the wire format and strips the header. If a registry client
-    /// is configured, fetches schema metadata.
+    /// A schema-id header, when the [`WireRecord`] has one, is read first —
+    /// Confluent's header-first order; otherwise the payload's wire format is
+    /// auto-detected. Pass plain [`Bytes`] for prefix-framed records.
     ///
     /// Messages that do not match any known wire format are returned with their
     /// original bytes, `schema_format = Unknown`, and `schema_metadata = None`.
-    pub async fn decode(&self, data: Bytes) -> Result<DecodedMessage> {
+    pub async fn decode(&self, record: impl Into<WireRecord>) -> Result<DecodedMessage> {
         use crate::wire::DetectedWireFormat;
 
+        let record = record.into();
+        if record.schema_id_header().is_some() {
+            return self.decode_confluent(&record).await;
+        }
+        let data = record.payload().clone();
         match detect_wire_format(&data) {
-            DetectedWireFormat::Confluent {
-                key,
-                payload_offset,
-            } => {
-                let Some(client) = self.confluent.as_deref() else {
-                    return Err(SchemaRegError::invalid_state(
-                        "Confluent-framed message received but no Confluent registry backend is configured",
-                    ));
-                };
-
-                let after_header = data.slice(payload_offset..);
-                let schema = client.get_schema_by_key(key).await?;
-                let schema_type = schema.schema_type;
-                let schema_format = SchemaFormat::from(schema_type);
-
-                // For Protobuf, strip the message-index array that sits between
-                // the 5-byte header and the serialized proto bytes.
-                let (payload, protobuf_message_indexes) = if schema_type == SchemaType::Protobuf {
-                    let (indexes, consumed) = decode_protobuf_message_indexes(&after_header)?;
-                    (after_header.slice(consumed..), Some(indexes))
-                } else {
-                    (after_header, None)
-                };
-
-                Ok(DecodedMessage {
-                    schema_format,
-                    payload,
-                    schema_metadata: Some(SchemaMetadata::Confluent(schema)),
-                    protobuf_message_indexes,
-                })
-            }
+            DetectedWireFormat::Confluent { .. } => self.decode_confluent(&record).await,
 
             #[cfg(feature = "glue")]
             DetectedWireFormat::Glue {
@@ -263,6 +242,7 @@ impl WireFormatDecoder {
                     payload,
                     schema_metadata: Some(SchemaMetadata::Glue(schema)),
                     protobuf_message_indexes: None,
+                    placement: None,
                 })
             }
 
@@ -280,6 +260,7 @@ impl WireFormatDecoder {
                     payload: data,
                     schema_metadata: None,
                     protobuf_message_indexes: None,
+                    placement: None,
                 })
             }
 
@@ -288,8 +269,30 @@ impl WireFormatDecoder {
                 payload: data,
                 schema_metadata: None,
                 protobuf_message_indexes: None,
+                placement: None,
             }),
         }
+    }
+
+    /// Unframe a Confluent record — header or prefix — via the crate's one
+    /// unframing routine.
+    async fn decode_confluent(&self, record: &WireRecord) -> Result<DecodedMessage> {
+        let Some(client) = self.confluent.as_deref() else {
+            return Err(SchemaRegError::invalid_state(
+                "Confluent-framed message received but no Confluent registry backend is configured",
+            ));
+        };
+        let located = locate(record)?;
+        let schema = client.get_schema_by_key(located.key).await?;
+        let schema_type = schema.schema_type;
+        let unframed = located.finish(schema_type == SchemaType::Protobuf)?;
+        Ok(DecodedMessage {
+            schema_format: SchemaFormat::from(schema_type),
+            payload: unframed.payload,
+            schema_metadata: Some(SchemaMetadata::Confluent(schema)),
+            protobuf_message_indexes: unframed.message_indexes,
+            placement: Some(unframed.placement),
+        })
     }
 }
 
@@ -312,18 +315,17 @@ impl fmt::Debug for WireFormatDecoder {
 /// `WireFormatDecoder` is the object-safe framing stripper: it satisfies
 /// [`PayloadDecoder`] by returning the header-stripped payload bytes.
 ///
-/// `topic` and `target` are accepted for interface compatibility but ignored —
-/// both the Confluent and Glue wire formats are self-describing, so the schema
-/// is located from the header rather than from a derived subject name.
+/// `topic` and `target` are ignored: the record names its own schema, in its
+/// framing or its schema-id header, so no subject name is derived.
 impl PayloadDecoder for WireFormatDecoder {
     fn decode(
         &self,
-        payload: Bytes,
+        record: WireRecord,
         _topic: &str,
         _target: EncodeTarget,
     ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
         Box::pin(async move {
-            WireFormatDecoder::decode(self, payload)
+            WireFormatDecoder::decode(self, record)
                 .await
                 .map(|m| m.payload)
         })

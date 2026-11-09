@@ -1,17 +1,25 @@
 # Cross-language wire-format conformance
 
 The fixtures in [`../tests/fixtures/confluent_conformance.json`](../tests/fixtures/confluent_conformance.json)
-are produced by the **official** `confluent-kafka-python` serializers running
-against a real Confluent Schema Registry. `schemreg` does not participate in
-producing a single byte of them.
+are produced by the **official** `confluent-kafka-python` 2.16.1 serializers
+against Confluent Platform 8.4.0, and each one is read back by the reference's
+own deserializer before it is written. `schemreg` does not produce a single
+byte of them.
 
-[`../tests/conformance_fixtures.rs`](../tests/conformance_fixtures.rs) then asserts,
+| Placement | Written by |
+|---|---|
+| v0 prefix — `0x00` + ID | `prefix_schema_id_serializer`, the default |
+| header mode — `0x01` + GUID (+ Protobuf indexes) in `__value_schema_id` / `__key_schema_id` | `header_schema_id_serializer` |
+| v1 prefix — `0x01` + GUID in the payload | the reference's `SchemaId.guid_to_bytes()`; no Confluent serializer writes it by default |
+
+[`../tests/conformance_fixtures.rs`](../tests/conformance_fixtures.rs) asserts,
 for every fixture, that `schemreg`:
 
-1. **decodes** it — recovering the schema ID, the Protobuf message-index path,
-   and the payload the reference serializer wrote; and
-2. **re-encodes** it byte-identically — which is the direction that catches a
-   decoder that is merely permissive rather than correct.
+1. **decodes** it — the identifier, the Protobuf message-index path, and the
+   payload the reference wrote;
+2. **re-encodes** it byte-identically — the direction that catches a decoder
+   that is merely permissive; and
+3. decodes it **through the codecs** to the value the reference serialized.
 
 ## Why this exists
 
@@ -38,12 +46,13 @@ Avro and JSON Schema fixtures are included too, pinning that those formats carry
 ## Regenerating
 
 ```bash
-docker compose -f conformance/docker-compose.yml up --build --abort-on-container-exit
+just conformance
 ```
 
-This starts Kafka (KRaft) + Schema Registry, registers each schema, serialises a
-sample record with the reference serializer, and writes the hex-encoded frames
-to `tests/fixtures/confluent_conformance.json`.
+This starts Kafka (KRaft) and Schema Registry, serialises a sample record per
+placement and message shape with the reference serializer, writes the
+fixtures, fails if they differ from the committed file, and runs the Rust
+assertions.
 
 CI regenerates the fixtures on every run and fails if the committed file drifts —
 so a change in the reference implementation's framing is caught immediately
@@ -51,9 +60,9 @@ rather than at the next interop incident.
 
 ## Notes
 
-- Schema IDs are registry-assigned and therefore vary between runs. The Rust
-  test asserts on them only relative to the frame they appear in, never against
-  a hard-coded value, so a regenerated fixture set stays valid.
+- IDs are assigned by the registry and GUIDs are fingerprints of the schema, so
+  a fresh stack reproduces the same fixtures. The Rust tests compare against
+  the recorded values, never hard-coded ones.
 - `use.deprecated.format: False` is set explicitly. The deprecated format writes
   the index array as plain unsigned varints; the current one ZigZag-encodes
   them. `schemreg` implements the current format only.

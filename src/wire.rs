@@ -242,6 +242,25 @@ fn put_prefix(buf: &mut BytesMut, key: SchemaKey) {
     }
 }
 
+/// The identifier and prefix length, or `None` — never allocates.
+#[inline]
+fn peek_prefix(data: &[u8]) -> Option<(SchemaKey, usize)> {
+    match *data.first()? {
+        MAGIC_BYTE_V0 => {
+            let id: [u8; 4] = data.get(1..PREFIX_LEN_V0)?.try_into().ok()?;
+            Some((
+                SchemaKey::Id(SchemaId::new(u32::from_be_bytes(id))),
+                PREFIX_LEN_V0,
+            ))
+        }
+        MAGIC_BYTE_V1 => {
+            let guid: [u8; UUID_BYTES] = data.get(1..PREFIX_LEN_V1)?.try_into().ok()?;
+            Some((SchemaKey::Guid(SchemaGuid::from_bytes(guid)), PREFIX_LEN_V1))
+        }
+        _ => None,
+    }
+}
+
 /// Read the magic byte and identifier at the start of `data`.
 ///
 /// Returns the key and the number of prefix bytes consumed.
@@ -251,33 +270,24 @@ fn put_prefix(buf: &mut BytesMut, key: SchemaKey) {
 /// Returns a wire-format error when the buffer is empty, the magic byte is
 /// neither `0x00` nor `0x01`, or the identifier is truncated.
 pub fn decode_wire_prefix(data: &[u8]) -> Result<(SchemaKey, usize)> {
+    if let Some(found) = peek_prefix(data) {
+        return Ok(found);
+    }
+    // Slow path, only to say precisely what is wrong.
     let Some(&magic) = data.first() else {
         return Err(SchemaRegError::wire_format(
             "wire format data is empty: expected a magic byte",
         ));
     };
     match magic {
-        MAGIC_BYTE_V0 => {
-            if data.len() < PREFIX_LEN_V0 {
-                return Err(SchemaRegError::wire_format(format!(
-                    "wire format v0 data too short: expected at least {PREFIX_LEN_V0} bytes, got {}",
-                    data.len()
-                )));
-            }
-            let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-            Ok((SchemaKey::Id(SchemaId::new(id)), PREFIX_LEN_V0))
-        }
-        MAGIC_BYTE_V1 => {
-            if data.len() < PREFIX_LEN_V1 {
-                return Err(SchemaRegError::wire_format(format!(
-                    "wire format v1 data too short: expected at least {PREFIX_LEN_V1} bytes, got {}",
-                    data.len()
-                )));
-            }
-            let mut guid = [0u8; UUID_BYTES];
-            guid.copy_from_slice(&data[1..PREFIX_LEN_V1]);
-            Ok((SchemaKey::Guid(SchemaGuid::from_bytes(guid)), PREFIX_LEN_V1))
-        }
+        MAGIC_BYTE_V0 => Err(SchemaRegError::wire_format(format!(
+            "wire format v0 data too short: expected at least {PREFIX_LEN_V0} bytes, got {}",
+            data.len()
+        ))),
+        MAGIC_BYTE_V1 => Err(SchemaRegError::wire_format(format!(
+            "wire format v1 data too short: expected at least {PREFIX_LEN_V1} bytes, got {}",
+            data.len()
+        ))),
         other => Err(SchemaRegError::wire_format(format!(
             "invalid wire format magic byte: expected 0x{MAGIC_BYTE_V0:02X} (schema ID) or \
              0x{MAGIC_BYTE_V1:02X} (schema GUID), got 0x{other:02X}"
@@ -661,6 +671,232 @@ impl HeaderFramed {
     }
 }
 
+// ── Decoder input ─────────────────────────────────────────────────────────
+
+/// Where a record carried its schema identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SchemaIdPlacement {
+    /// A wire prefix in front of the payload.
+    Prefix,
+    /// A `__key_schema_id` / `__value_schema_id` record header, with the
+    /// payload unframed.
+    Header,
+}
+
+/// What every decoder takes: a record's key or value bytes, plus its
+/// schema-id header when it has one.
+///
+/// Decoding is **header-first**, exactly like Confluent's own deserializers:
+/// with a header, the identifier (and, for Protobuf, the message-index path)
+/// comes from it and the bytes are the payload, whole; without one, the bytes
+/// carry a wire prefix. A plain [`Bytes`] converts into a `WireRecord`, so a
+/// prefix-framed call site is just `decoder.decode(bytes)`.
+///
+/// ```rust
+/// use bytes::Bytes;
+/// use schemreg::{EncodeTarget, SchemaIdPlacement, WireRecord};
+///
+/// // Straight from a Kafka record: its value and its header list.
+/// let headers = [("trace-id", &b"abc"[..]), ("__value_schema_id", &[0, 0, 0, 0, 7][..])];
+/// let record = WireRecord::from_headers(EncodeTarget::Value, Bytes::from_static(b"avro"), headers);
+/// assert_eq!(record.placement(), SchemaIdPlacement::Header);
+///
+/// // Prefix framing: the bytes alone.
+/// let record = WireRecord::from(Bytes::from_static(&[0, 0, 0, 0, 7, 1, 2]));
+/// assert_eq!(record.placement(), SchemaIdPlacement::Prefix);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireRecord {
+    payload: Bytes,
+    schema_id_header: Option<Bytes>,
+}
+
+impl WireRecord {
+    /// A record whose bytes carry a wire prefix.
+    pub fn new(payload: impl Into<Bytes>) -> Self {
+        Self {
+            payload: payload.into(),
+            schema_id_header: None,
+        }
+    }
+
+    /// Attach the value of the record's schema-id header.
+    #[must_use]
+    pub fn with_schema_id_header(mut self, value: impl Into<Bytes>) -> Self {
+        self.schema_id_header = Some(value.into());
+        self
+    }
+
+    /// Build from a record's bytes and its full header list.
+    ///
+    /// Picks `__value_schema_id` or `__key_schema_id` according to `target`
+    /// and ignores every other header. When the header repeats, the **last**
+    /// occurrence wins — the rule Confluent's Java and Python deserializers
+    /// apply.
+    pub fn from_headers<N, V>(
+        target: EncodeTarget,
+        payload: impl Into<Bytes>,
+        headers: impl IntoIterator<Item = (N, V)>,
+    ) -> Self
+    where
+        N: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let wanted = schema_id_header_name(target).as_bytes();
+        let header = headers
+            .into_iter()
+            .filter(|(name, _)| name.as_ref() == wanted)
+            .last()
+            .map(|(_, value)| Bytes::copy_from_slice(value.as_ref()));
+        Self {
+            payload: payload.into(),
+            schema_id_header: header,
+        }
+    }
+
+    /// The record's bytes: prefix-framed, or the bare payload in header mode.
+    pub fn payload(&self) -> &Bytes {
+        &self.payload
+    }
+
+    /// The schema-id header value, if the record had one.
+    pub fn schema_id_header(&self) -> Option<&Bytes> {
+        self.schema_id_header.as_ref()
+    }
+
+    /// Where this record carries its schema identifier.
+    pub fn placement(&self) -> SchemaIdPlacement {
+        if self.schema_id_header.is_some() {
+            SchemaIdPlacement::Header
+        } else {
+            SchemaIdPlacement::Prefix
+        }
+    }
+}
+
+impl From<Bytes> for WireRecord {
+    fn from(payload: Bytes) -> Self {
+        Self::new(payload)
+    }
+}
+
+impl From<&Bytes> for WireRecord {
+    fn from(payload: &Bytes) -> Self {
+        Self::new(payload.clone())
+    }
+}
+
+impl From<Vec<u8>> for WireRecord {
+    fn from(payload: Vec<u8>) -> Self {
+        Self::new(payload)
+    }
+}
+
+impl From<&'static [u8]> for WireRecord {
+    fn from(payload: &'static [u8]) -> Self {
+        Self::new(payload)
+    }
+}
+
+impl From<HeaderFramed> for WireRecord {
+    fn from(framed: HeaderFramed) -> Self {
+        Self::new(framed.payload).with_schema_id_header(framed.header_value)
+    }
+}
+
+/// A Confluent record with its identifier located but its Protobuf
+/// message-index array not yet split off — which needs the schema type.
+pub(crate) struct Located {
+    pub(crate) key: SchemaKey,
+    pub(crate) placement: SchemaIdPlacement,
+    header_indexes: Option<Vec<u32>>,
+    body: Bytes,
+}
+
+/// A fully unframed Confluent record.
+#[derive(Debug)]
+pub(crate) struct Unframed {
+    // Read by the codecs; `WireFormatDecoder` takes the key from `Located`.
+    #[cfg_attr(
+        not(any(feature = "avro", feature = "json", feature = "protobuf")),
+        allow(dead_code)
+    )]
+    pub(crate) key: SchemaKey,
+    pub(crate) message_indexes: Option<Vec<u32>>,
+    pub(crate) payload: Bytes,
+    pub(crate) placement: SchemaIdPlacement,
+}
+
+/// Find the identifier: in the header if there is one, else in the prefix.
+///
+/// The one place in the crate that decides between the two placements; every
+/// decoder goes through it.
+pub(crate) fn locate(record: &WireRecord) -> Result<Located> {
+    match &record.schema_id_header {
+        Some(header) => {
+            let (key, header_indexes) = decode_schema_id_header(header)?;
+            Ok(Located {
+                key,
+                placement: SchemaIdPlacement::Header,
+                header_indexes,
+                body: record.payload.clone(),
+            })
+        }
+        None => {
+            let (key, body) = decode_wire_format_bytes(&record.payload)?;
+            Ok(Located {
+                key,
+                placement: SchemaIdPlacement::Prefix,
+                header_indexes: None,
+                body,
+            })
+        }
+    }
+}
+
+impl Located {
+    /// Split off the Protobuf message-index array — from the header or the
+    /// payload, wherever this placement keeps it.
+    pub(crate) fn finish(self, protobuf: bool) -> Result<Unframed> {
+        let (message_indexes, payload) = match (self.placement, protobuf) {
+            (SchemaIdPlacement::Header, true) => {
+                let indexes = self.header_indexes.ok_or_else(|| {
+                    SchemaRegError::wire_format(
+                        "the schema-id header of a Protobuf record carries no message-index array",
+                    )
+                })?;
+                (Some(indexes), self.body)
+            }
+            (SchemaIdPlacement::Header, false) => {
+                if self.header_indexes.is_some() {
+                    return Err(SchemaRegError::wire_format(
+                        "the schema-id header carries a message-index array, \
+                         which only a Protobuf record may have",
+                    ));
+                }
+                (None, self.body)
+            }
+            (SchemaIdPlacement::Prefix, true) => {
+                let (indexes, consumed) = decode_protobuf_message_indexes(&self.body)?;
+                (Some(indexes), self.body.slice(consumed..))
+            }
+            (SchemaIdPlacement::Prefix, false) => (None, self.body),
+        };
+        Ok(Unframed {
+            key: self.key,
+            message_indexes,
+            payload,
+            placement: self.placement,
+        })
+    }
+}
+
+/// [`locate`] then [`Located::finish`], for a decoder that knows its format.
+#[cfg(any(feature = "avro", feature = "json", feature = "protobuf"))]
+pub(crate) fn unframe(record: &WireRecord, protobuf: bool) -> Result<Unframed> {
+    locate(record)?.finish(protobuf)
+}
+
 // ── Auto-detection ────────────────────────────────────────────────────────
 
 /// Outcome of [`detect_wire_format`] — which framing (if any) a buffer uses.
@@ -731,12 +967,15 @@ pub fn detect_wire_format(data: &[u8]) -> DetectedWireFormat {
     };
 
     match first {
-        MAGIC_BYTE_V0 | MAGIC_BYTE_V1 => match decode_wire_prefix(data) {
-            Ok((key, payload_offset)) => DetectedWireFormat::Confluent {
+        // `peek_prefix`, not `decode_wire_prefix`: detection runs on every
+        // record, and a truncated frame must not pay for formatting an error
+        // message nobody reads.
+        MAGIC_BYTE_V0 | MAGIC_BYTE_V1 => match peek_prefix(data) {
+            Some((key, payload_offset)) => DetectedWireFormat::Confluent {
                 key,
                 payload_offset,
             },
-            Err(_) => DetectedWireFormat::InvalidConfluent,
+            None => DetectedWireFormat::InvalidConfluent,
         },
         GLUE_HEADER_VERSION_BYTE => {
             if data.len() < GLUE_HEADER_SIZE {

@@ -67,7 +67,14 @@ assert_eq!(key.as_id(), None);   // a GUID frame names no numeric ID
 
 The 16 bytes are the GUID in big-endian order — byte-for-byte what Java's
 `putLong(msb); putLong(lsb)` writes, and what the canonical `8-4-4-4-12` text
-form reads left to right.
+form reads left to right. Pinned against bytes from Confluent's own
+`SchemaId.guid_to_bytes()`.
+
+**Who writes it in the payload:** no Confluent serializer does by default —
+their default writes the v0 prefix, and their header serializer puts the v1
+identifier in a *header* (below). Every current Confluent deserializer reads a
+v1 prefix, but a consumer older than Confluent Platform 8 (or `confluent-kafka`
+2.10.1) does not. Prefer header placement when you want GUIDs on the wire.
 
 ### Which version to emit
 
@@ -121,9 +128,22 @@ assert_eq!(msg_indexes, None);
 A header carrying a v0 identifier (`0x00` + 4 bytes) is accepted too, which is
 what a registry without GUID support would put there.
 
-Confluent's deserializer is **header-first**: it looks in the header, and falls
-back to the payload prefix when there is none. A consumer wanting the same
-behaviour checks the header, then calls `decode_wire_format` if it was absent.
+Confluent's deserializer is **header-first**: it looks in the header — the last
+one, if a record carries several — and falls back to the payload prefix when
+there is none. Every decoder in this crate does the same; give it a
+[`WireRecord`](https://docs.rs/schemreg/latest/schemreg/struct.WireRecord.html):
+
+```rust
+use bytes::Bytes;
+use schemreg::{EncodeTarget, SchemaIdPlacement, WireRecord, encode_schema_id_header};
+
+let header = encode_schema_id_header(7u32, None);
+let headers = [("traceparent", Bytes::from_static(b"00-ab")), ("__value_schema_id", header)];
+
+let record = WireRecord::from_headers(EncodeTarget::Value, Bytes::from_static(b"avro"), headers);
+assert_eq!(record.placement(), SchemaIdPlacement::Header);
+// decoder.decode(record).await? — any codec, WireFormatDecoder, or dyn PayloadDecoder
+```
 
 ### From a codec, not by hand
 
@@ -182,7 +202,8 @@ alike, and to the header form.
 
 These are not derived from a reading of the docs — they are the literal bytes
 [`confluent-kafka-python` produces](https://github.com/hupe1980/schemreg/blob/main/conformance/README.md), captured as
-fixtures and asserted in CI.
+fixtures and asserted in CI — in the prefix and, for header mode, in the
+header value after the GUID.
 
 ### Why message indexes are `u32`
 

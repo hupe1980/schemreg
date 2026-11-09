@@ -140,10 +140,8 @@ pub(crate) struct HttpClientConfig {
     /// Set this shorter than `timeout` to fail-fast on network partitions
     /// without reducing read timeouts on large schema payloads.
     pub connect_timeout: Option<Duration>,
-    /// Additional root CA certificates to trust (e.g. private CA bundles).
-    pub root_certificates: Vec<reqwest::Certificate>,
-    /// Client identity for mutual TLS (mTLS).
-    pub identity: Option<reqwest::Identity>,
+    /// Trust anchors, client identity and protocol floor.
+    pub tls: TlsSettings,
     /// Maximum idle connections per host kept in the pool.
     ///
     /// `None` means the reqwest default (no per-host limit). Set to `0` to
@@ -160,6 +158,92 @@ pub(crate) struct HttpClientConfig {
     pub max_concurrent_requests: Option<usize>,
 }
 
+/// Map a reqwest failure to `Tls` when rustls refused the handshake, else
+/// `Network`.
+///
+/// The distinction is the retry contract: a connection reset is transient, an
+/// untrusted certificate is not. rustls surfaces as an `io::Error` wrapping a
+/// `rustls::Error` somewhere down the source chain, and `io::Error::source`
+/// skips its own payload, so the walk looks inside it explicitly.
+fn classify_transport(err: reqwest::Error) -> SchemaRegError {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+    while let Some(e) = cause {
+        let inner = e
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+            .map(|payload| payload as &(dyn std::error::Error + 'static));
+        if e.is::<rustls::Error>() || inner.is_some_and(|p| p.is::<rustls::Error>()) {
+            return SchemaRegError::Tls(crate::error::ArcError::new(err));
+        }
+        cause = inner.or_else(|| e.source());
+    }
+    SchemaRegError::network(err)
+}
+
+/// TLS settings shared by every reqwest-backed builder.
+///
+/// The default is rustls on aws-lc-rs with the platform verifier: the
+/// operating system's trust store, and its revocation checking where the OS
+/// provides one.
+#[derive(Default)]
+pub(crate) struct TlsSettings {
+    /// CAs trusted *in addition to* the platform roots.
+    pub extra_roots: Vec<reqwest::Certificate>,
+    /// CAs trusted *instead of* the platform roots.
+    pub only_roots: Option<Vec<reqwest::Certificate>>,
+    /// Client identity for mutual TLS.
+    pub identity: Option<reqwest::Identity>,
+    /// Refuse anything below TLS 1.3.
+    pub require_tls13: bool,
+}
+
+impl TlsSettings {
+    /// Builder-friendly summary for `Debug` impls: never prints key material.
+    pub(crate) fn describe(&self) -> String {
+        let trust = match &self.only_roots {
+            Some(only) => format!("only {} root(s)", only.len()),
+            None if self.extra_roots.is_empty() => "platform".to_string(),
+            None => format!("platform + {} root(s)", self.extra_roots.len()),
+        };
+        format!(
+            "{trust}{}{}",
+            if self.identity.is_some() {
+                ", mTLS"
+            } else {
+                ""
+            },
+            if self.require_tls13 {
+                ", TLS 1.3 only"
+            } else {
+                ""
+            }
+        )
+    }
+
+    fn apply(self, mut builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder> {
+        match self.only_roots {
+            Some(_) if !self.extra_roots.is_empty() => {
+                return Err(SchemaRegError::config(
+                    "both `add_root_certificate` and `trust_only_root_certificates` were set — \
+                     choose one: add to the platform roots, or replace them",
+                ));
+            }
+            Some(only) => builder = builder.tls_certs_only(only),
+            None if !self.extra_roots.is_empty() => {
+                builder = builder.tls_certs_merge(self.extra_roots);
+            }
+            None => {}
+        }
+        if let Some(identity) = self.identity {
+            builder = builder.identity(identity);
+        }
+        if self.require_tls13 {
+            builder = builder.tls_version_min(reqwest::tls::Version::TLS_1_3);
+        }
+        Ok(builder)
+    }
+}
+
 /// Async HTTP client used by the schema registry connectors.
 ///
 /// Backed by [`reqwest::Client`], which provides connection pooling, automatic
@@ -172,8 +256,8 @@ pub(crate) struct HttpClient {
 }
 
 impl HttpClient {
-    /// Build a client that trusts the platform-bundled WebPKI root CAs.
-    pub fn with_webpki_roots(timeout: Option<Duration>) -> Result<Self> {
+    /// Build a client with default TLS (platform trust) and the given timeout.
+    pub fn with_timeout(timeout: Option<Duration>) -> Result<Self> {
         Self::with_config(HttpClientConfig {
             timeout,
             ..HttpClientConfig::default()
@@ -182,9 +266,6 @@ impl HttpClient {
 
     /// Build a client with full transport configuration.
     ///
-    /// Supports optional custom CA certificates and a client identity for mTLS.
-    /// Falls back to `with_webpki_roots` behaviour when the extra fields are
-    /// left at their defaults.
     pub fn with_config(config: HttpClientConfig) -> Result<Self> {
         let mut builder = Client::builder()
             .user_agent(USER_AGENT)
@@ -200,12 +281,7 @@ impl HttpClient {
         if let Some(ct) = config.connect_timeout {
             builder = builder.connect_timeout(ct);
         }
-        for cert in config.root_certificates {
-            builder = builder.add_root_certificate(cert);
-        }
-        if let Some(identity) = config.identity {
-            builder = builder.identity(identity);
-        }
+        builder = config.tls.apply(builder)?;
         if let Some(n) = config.pool_max_idle_per_host {
             builder = builder.pool_max_idle_per_host(n);
         }
@@ -284,7 +360,7 @@ impl HttpClient {
                     attempt += 1;
                 }
                 Ok(resp) => return Ok(resp),
-                Err(e) if attempt < max_retries => {
+                Err(e) if e.is_retryable() && attempt < max_retries => {
                     let delay = self.retry_policy.delay_for(attempt, None);
                     tracing::warn!(
                         error = %e,
@@ -333,7 +409,7 @@ impl HttpClient {
             builder = builder.body(Bytes::copy_from_slice(b));
         }
 
-        let response = builder.send().await.map_err(SchemaRegError::network)?;
+        let response = builder.send().await.map_err(classify_transport)?;
 
         let status = response.status().as_u16();
         let content_type = response
@@ -386,7 +462,7 @@ impl HttpClient {
         let mut response = response;
 
         loop {
-            let chunk = response.chunk().await.map_err(SchemaRegError::network)?;
+            let chunk = response.chunk().await.map_err(classify_transport)?;
             match chunk {
                 Some(bytes) => {
                     total += bytes.len();

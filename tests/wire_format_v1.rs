@@ -250,7 +250,7 @@ async fn payload_decoder_trait_handles_both_versions() {
         encode_wire_format(guid(), b"body"),
     ] {
         let payload = decoder
-            .decode(framed, "orders", EncodeTarget::Value)
+            .decode(framed.into(), "orders", EncodeTarget::Value)
             .await
             .expect("both wire format versions must unframe");
         assert_eq!(payload, Bytes::from_static(b"body"));

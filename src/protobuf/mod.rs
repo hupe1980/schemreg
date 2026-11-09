@@ -7,7 +7,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.6", features = ["protobuf"] }
+//! schemreg = { version = "0.7", features = ["protobuf"] }
 //! ```
 //!
 //! # Why this module exists
@@ -77,7 +77,7 @@ use crate::resolver::{
 use crate::subject::SubjectNameStrategy;
 use crate::traits::SchemaRegistryClient;
 use crate::types::{EncodeTarget, SchemaId, SchemaKey, SchemaReference, SchemaType};
-use crate::wire::{HeaderFramed, decode_protobuf_message_indexes, decode_wire_format_bytes};
+use crate::wire::{HeaderFramed, SchemaIdPlacement, WireRecord, unframe};
 
 /// Field number of `FileDescriptorProto.message_type`.
 const FILE_MESSAGE_TYPE_FIELD: i32 = 4;
@@ -468,12 +468,14 @@ impl<C: SchemaRegistryClient> ProtobufSchemaEncoderBuilder<C> {
 /// A Confluent-framed Protobuf message, unframed.
 #[derive(Debug, Clone)]
 pub struct UnframedProtobuf {
-    /// The schema identifier the wire prefix named — an ID (v0) or a GUID (v1).
+    /// The schema identifier — an ID (v0) or a GUID (v1).
     pub key: SchemaKey,
     /// Message-index path identifying which message type was serialised.
     pub message_indexes: Vec<u32>,
-    /// The Protobuf payload, header and message-index stripped.
+    /// The Protobuf payload, framing and message-index stripped.
     pub payload: Bytes,
+    /// Whether the identifier came from a wire prefix or a record header.
+    pub placement: SchemaIdPlacement,
 }
 
 /// Strips Confluent framing from a Protobuf message and decodes it with `prost`.
@@ -531,7 +533,7 @@ impl<C: SchemaRegistryClient> ProtobufSchemaDecoder<C> {
         Ok(self)
     }
 
-    /// Strip the Confluent header and message-index without decoding.
+    /// Strip the framing and message-index without decoding.
     ///
     /// Useful for routing: inspect [`message_indexes`](UnframedProtobuf::message_indexes)
     /// to decide which concrete type to decode into.
@@ -540,9 +542,9 @@ impl<C: SchemaRegistryClient> ProtobufSchemaDecoder<C> {
     ///
     /// Returns a wire-format error if the header or the message-index array is
     /// malformed.
-    pub fn unframe(&self, data: &Bytes) -> Result<UnframedProtobuf> {
-        let (key, after_prefix) = decode_wire_format_bytes(data)?;
-        let (message_indexes, offset) = decode_protobuf_message_indexes(&after_prefix)?;
+    pub fn unframe(&self, record: impl Into<WireRecord>) -> Result<UnframedProtobuf> {
+        let unframed = unframe(&record.into(), true)?;
+        let message_indexes = unframed.message_indexes.unwrap_or_default();
 
         if let Some(expected) = &self.expected_indexes
             && message_indexes != *expected
@@ -558,21 +560,23 @@ impl<C: SchemaRegistryClient> ProtobufSchemaDecoder<C> {
         }
 
         Ok(UnframedProtobuf {
-            key,
+            key: unframed.key,
             message_indexes,
-            payload: after_prefix.slice(offset..),
+            payload: unframed.payload,
+            placement: unframed.placement,
         })
     }
 
-    /// Decode a Confluent-framed Protobuf message into `M`.
+    /// Decode a Protobuf record into `M` — prefix-framed bytes, or a
+    /// [`WireRecord`] carrying a schema-id header.
     ///
     /// # Errors
     ///
     /// Returns an error if the framing is invalid, the message-index does not
     /// match a configured expected descriptor, or the payload is not a valid
     /// encoding of `M`.
-    pub async fn decode<M: Message + Default>(&self, data: Bytes) -> Result<M> {
-        let unframed = self.unframe(&data)?;
+    pub async fn decode<M: Message + Default>(&self, record: impl Into<WireRecord>) -> Result<M> {
+        let unframed = self.unframe(record)?;
         M::decode(unframed.payload).map_err(|e| {
             SchemaRegError::wire_format(format!("Protobuf deserialization failed: {e}"))
         })
@@ -583,8 +587,11 @@ impl<C: SchemaRegistryClient> ProtobufSchemaDecoder<C> {
     /// # Errors
     ///
     /// Returns an error if the framing is invalid or the registry lookup fails.
-    pub async fn schema_for(&self, data: &Bytes) -> Result<Arc<crate::types::Schema>> {
-        let unframed = self.unframe(data)?;
+    pub async fn schema_for(
+        &self,
+        record: impl Into<WireRecord>,
+    ) -> Result<Arc<crate::types::Schema>> {
+        let unframed = self.unframe(record)?;
         self.registry.get_schema_by_key(unframed.key).await
     }
 }

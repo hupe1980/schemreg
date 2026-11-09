@@ -1,7 +1,7 @@
 +++
 title = "Migrating to 0.5"
 description = "Upgrade path from schemreg 0.4.x to 0.5.0: SchemaKey decoding, optional schema IDs, producer resolution policy, and the behavioural changes without a compile error."
-weight = 13
+weight = 14
 +++
 
 Most of what follows is a compile error, so the compiler walks you through it.

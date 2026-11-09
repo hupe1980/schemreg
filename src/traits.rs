@@ -563,10 +563,11 @@ pub trait PayloadEncoder: Send + Sync {
 ///
 /// Object-safe: share as `Arc<dyn PayloadDecoder>`.
 pub trait PayloadDecoder: Send + Sync {
-    /// Unframe a wire-formatted payload, returning the raw inner bytes.
+    /// Unframe a record — prefix-framed, or carrying a schema-id header —
+    /// returning the raw inner bytes. `Bytes` converts with `.into()`.
     fn decode(
         &self,
-        payload: Bytes,
+        record: crate::wire::WireRecord,
         topic: &str,
         target: EncodeTarget,
     ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;

@@ -4,30 +4,31 @@ description = "Measured numbers for wire-format decoding, cache hits, Protobuf i
 weight = 10
 +++
 
-Measured on an Apple M-series laptop with `cargo bench --features glue`. Numbers
-are medians; reproduce with `cargo bench`.
+Medians from one `just bench` run on an Apple M4 Pro laptop, 2026-11-09, 0.7.0.
+Absolute numbers move a few percent between runs on a laptop; the *shapes* —
+flat in payload size, flat in schema size — are the claims.
 
 ## Decode is O(1) in payload size
 
 | Payload | `decode_wire_format` | `decode_wire_format_bytes` |
 |---|---|---|
-| 64 B | 1.60 ns | 5.61 ns |
-| 1 KiB | 1.62 ns | 5.58 ns |
-| 64 KiB | 1.61 ns | 5.71 ns |
+| 64 B | 5.00 ns | 9.59 ns |
+| 1 KiB | 5.13 ns | 8.43 ns |
+| 64 KiB | 5.58 ns | 9.35 ns |
 
 Flat across three orders of magnitude — nothing is copied. The `Bytes` variant
 costs ~4 ns more for the refcount bump and is likewise size-independent.
 
-`encode` does scale (28 ns → 755 ns from 64 B to 64 KiB): that is the one
+`encode` does scale (29 ns → 844 ns from 64 B to 64 KiB): that is the one
 unavoidable `memcpy` of the payload into the framed buffer.
 
 ## Cache hits are O(1) in schema size
 
 | Schema text | Cache hit |
 |---|---|
-| 64 B | 14.28 ns |
-| 4 KiB | 14.31 ns |
-| 64 KiB | 14.28 ns |
+| 64 B | 23.5 ns |
+| 4 KiB | 23.1 ns |
+| 64 KiB | 23.9 ns |
 
 This is the `Arc<str>` design paying off. `Schema` holds `Arc<str>` for the
 schema text and the subject, and clients return `Arc<Schema>`, so serving a
@@ -36,24 +37,25 @@ schema text and the subject, and clients return `Arc<Schema>`, so serving a
 A regression here shows up as this benchmark scaling with schema size, which
 means a `String` clone has crept back in.
 
-## Detection is ~1 ns
+## Detection is 1–2 ns
 
 | Input | Time |
 |---|---|
-| Confluent frame | 1.35 ns |
-| Unknown bytes | 1.05 ns |
-| Truncated header | 1.08 ns |
+| Confluent frame | 2.42 ns |
+| Unknown bytes | 1.51 ns |
+| Truncated header | 1.38 ns |
 
-It reads at most 18 bytes and returns `Copy` values.
+It reads at most 18 bytes, returns `Copy` values and never allocates — a truncated or
+hostile frame costs no more than a valid one.
 
 ## Protobuf index handling
 
 | Path | Encode | Decode index |
 |---|---|---|
-| `[0]` (optimised) | 39.7 ns | 16.7 ns |
-| `[2]` | 42.2 ns | 18.3 ns |
-| `[1, 0]` | 44.0 ns | 19.3 ns |
-| `[2, 1, 4, 0]` | 49.6 ns | 20.7 ns |
+| `[0]` (optimised) | 52.1 ns | 17.5 ns |
+| `[2]` | 42.9 ns | 18.5 ns |
+| `[1, 0]` | 45.8 ns | 19.6 ns |
+| `[2, 1, 4, 0]` | 50.8 ns | 21.3 ns |
 
 ## Coalescing scales sub-linearly
 
@@ -61,10 +63,10 @@ Tasks racing for one uncached schema ID, including `tokio::spawn` overhead:
 
 | Concurrent tasks | Total | Per task |
 |---|---|---|
-| 1 | 8.06 µs | 8.06 µs |
-| 8 | 8.57 µs | 1.07 µs |
-| 64 | 21.2 µs | 0.33 µs |
-| 256 | 84.9 µs | 0.33 µs |
+| 1 | 8.16 µs | 8.16 µs |
+| 8 | 9.08 µs | 1.14 µs |
+| 64 | 19.8 µs | 0.31 µs |
+| 256 | 85.6 µs | 0.33 µs |
 
 Per-task cost *falls* as concurrency rises and then flattens — the contended
 section is a `HashMap` lookup plus a channel push, and one backend call is

@@ -316,7 +316,7 @@ async fn wire_format_decoder_is_usable_as_a_schema_decoder_trait_object() {
 
     let framed = confluent_framed(1, b"inner-payload");
     let payload = decoder
-        .decode(framed, "orders", EncodeTarget::Value)
+        .decode(framed.into(), "orders", EncodeTarget::Value)
         .await
         .expect("decode through the trait object");
 

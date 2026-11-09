@@ -1,48 +1,70 @@
 +++
 title = "Testing strategy"
-description = "The eleven test layers behind schemreg, what each one is for, and what it would take to fool it — including the cross-language conformance harness."
+description = "The test layers behind schemreg, what each one is for, and what it would take to fool it — including the cross-language conformance harness and real TLS handshakes."
 weight = 11
 +++
 
-537 tests across eleven layers, each closing a gap the others cannot. This page
-says what each one is for, and what it would take to fool it.
+Thirteen test layers, each closing a gap the others cannot. This page says what
+each one is for, and what it would take to fool it. (`just test` runs them
+across every feature set; counts are deliberately not quoted here, because
+nothing would keep them true.)
 
 The organising principle is that **self-consistency is not conformance**. A
 golden vector written from the same misreading as the implementation agrees with
 it perfectly, and both disagree with every other Kafka client. So the framing is
 pinned to bytes this crate did not produce.
 
-| Layer | Where | Tests |
-|---|---|---|
-| Cross-language conformance | `tests/conformance_fixtures.rs` | 7 |
-| Specification golden vectors | `tests/conformance.rs` | 24 |
-| Property-based | `tests/properties.rs` | 19 |
-| Adversarial corpus | `tests/adversarial.rs` | 26 |
-| REST surface (real server) | `tests/confluent_api.rs`, `tests/apicurio_api.rs`, `tests/http_behaviour.rs` | 55 |
-| Producer configuration | `tests/schema_resolution.rs` | 17 |
-| Concurrency | `tests/cache.rs`, `tests/codec.rs` | 30 |
-| Security boundaries | `tests/security.rs` | 16 |
-| Trait contract | `tests/contract.rs` | 11 |
-| Codec round-trips | `tests/wire_format.rs`, `tests/wire_format_v1.rs`, `tests/protobuf_codec.rs`, `tests/avro_references.rs`, `tests/json_references.rs`, `tests/decoder.rs`, `tests/subject_strategy.rs` | 131 |
-| Unit + doctests | `src/`, `README.md` | 201 |
+| Layer | Where |
+|---|---|
+| Cross-language conformance | `tests/conformance_fixtures.rs` |
+| Specification golden vectors | `tests/conformance.rs` |
+| Property-based | `tests/properties.rs` |
+| Adversarial corpus | `tests/adversarial.rs` |
+| REST surface (real server) | `tests/confluent_api.rs`, `tests/apicurio_api.rs`, `tests/http_behaviour.rs` |
+| TLS handshakes (real server) | `tests/tls.rs` |
+| Header-first decoding | `tests/header_decode.rs` |
+| Producer configuration | `tests/schema_resolution.rs` |
+| Concurrency | `tests/cache.rs`, `tests/codec.rs` |
+| Security boundaries | `tests/security.rs` |
+| Trait contract | `tests/contract.rs` |
+| Codec round-trips | `tests/wire_format.rs`, `tests/wire_format_v1.rs`, `tests/protobuf_codec.rs`, `tests/avro_references.rs`, `tests/json_references.rs`, `tests/decoder.rs`, `tests/subject_strategy.rs` |
+| Unit + doctests | `src/`, `README.md` |
+
+**Every guard has been seen to fail.** A test that has never failed has not
+been shown to test anything, so each new check is run once against a planted
+defect — a little-endian GUID, a swapped key/value header name, first-wins
+instead of last-wins header lookup, prefix-first instead of header-first
+decoding, a missing TLS 1.3 floor, a retry loop that retries permanent errors —
+and kept only if it turns red.
 
 ## 1. Cross-language conformance — `tests/conformance_fixtures.rs`
 
-Fixtures produced by the **official `confluent-kafka-python` serializers**
-running against a real Confluent Schema Registry. schemreg does not produce a
-single byte of them.
+Fixtures produced by the **official `confluent-kafka-python` 2.16.1 serializers**
+running against **Confluent Platform 8.4.0**. schemreg does not produce a
+single byte of them, and the generator reads every fixture back with the
+reference's own deserializer before writing it.
 
-Each fixture is asserted twice:
+| Placement | Written by |
+|---|---|
+| v0 prefix — `0x00` + ID | the default `prefix_schema_id_serializer` |
+| header mode — `0x01` + GUID (+ indexes) in `__value_schema_id` / `__key_schema_id` | the stock `header_schema_id_serializer` |
+| v1 prefix — `0x01` + GUID in the payload | the reference's `SchemaId.guid_to_bytes()` (no Confluent serializer writes it by default) |
 
-1. **Decode** — schemreg recovers the schema ID, message-index path, and payload
-   the reference wrote.
+Each fixture is asserted three ways:
+
+1. **Decode** — schemreg recovers the identifier, message-index path, and
+   payload the reference wrote.
 2. **Re-encode** — feeding those parts back reproduces the reference bytes
    *exactly*. This direction catches a decoder that is merely permissive.
+3. **Through the codecs** — every fixture, in every placement, decodes through
+   `AvroSchemaDecoder`, `JsonSchemaDecoder` or `ProtobufSchemaDecoder` to the
+   value the reference serialized.
 
 The `.proto` covers every message-index shape: `[0]`, `[1]`, `[2]`, `[1,0]`,
-`[1,1]`, `[1,1,0]`. Regenerate with
-`docker compose -f conformance/docker-compose.yml up --build`; CI diffs the
-result so reference drift is caught immediately.
+`[1,1]`, `[1,1,0]`, in both the prefix and header placements. Regenerate with
+`just conformance`; CI diffs the result so reference drift is caught
+immediately. The Glue framing has no reference fixture — it is pinned only by
+specification-derived vectors.
 
 ## 2. Specification golden vectors — `tests/conformance.rs`
 
@@ -87,7 +109,24 @@ easiest to get wrong: `POST /search/versions` for content lookup, the
 `branch=latest` version expression, `/admin/rules` versus artifact rules, and the
 `PUT`-then-`POST` dance Apicurio requires to set a rule that does not exist yet.
 
-## 6. Producer configuration — `tests/schema_resolution.rs`
+## 6. TLS handshakes — `tests/tls.rs`
+
+An in-process rustls server with a CA generated per test, because a TLS option
+nothing connects through is a claim, not a guarantee. It proves the hybrid
+post-quantum group X25519MLKEM768 is what a TLS 1.3 handshake negotiates, that
+trust-only accepts its CA and rejects any other, that an added root extends the
+OS store, that `require_tls13` refuses a TLS 1.2-only server the default
+accepts, that mutual TLS fails without the identity, and that a refused
+handshake is attempted once — `is_tls_error()`, never retried.
+
+## 7. Header-first decoding — `tests/header_decode.rs`
+
+The four Confluent placements (v0/v1 × prefix/header) through every codec,
+`WireFormatDecoder` and `dyn PayloadDecoder`; the last repeated header wins; a
+header beats whatever the payload starts with; a message-index array in an Avro
+header and a Protobuf header without one are refused.
+
+## 8. Producer configuration — `tests/schema_resolution.rs`
 
 `SchemaResolution` and `Framing` decide whether a producer writes to your
 registry and which identifier reaches the topic. Both are settings whose failure
@@ -106,7 +145,7 @@ mode is silent, so the assertions are counters and bytes, not return codes:
 The resolution logic itself is unit-tested in `src/resolver.rs`; this layer
 proves each of the four encoders is actually wired to it.
 
-## 7. Concurrency — `tests/cache.rs`, `tests/codec.rs`
+## 9. Concurrency — `tests/cache.rs`, `tests/codec.rs`
 
 Barrier-synchronised, never timing-based. Mocks park on a `Semaphore` and signal
 via `Notify`, so the test controls exactly when the backend responds:
@@ -118,14 +157,14 @@ via `Notify`, so the test controls exactly when the backend responds:
 Every potentially-blocking assertion is wrapped in a 5-second timeout so a
 regression fails with a message instead of hanging CI.
 
-## 8. Security boundaries — `tests/security.rs`
+## 10. Security boundaries — `tests/security.rs`
 
 Eleven hostile subject names across six Confluent and nine Apicurio operations,
 plus positive controls proving legitimate dotted subjects still work. Clients point at
 `registry.invalid` (RFC 2606, guaranteed not to resolve), so a `Config` error
 proves the guard fired locally and a `Network` error proves it did not.
 
-## 9. Trait contract — `tests/contract.rs`
+## 11. Trait contract — `tests/contract.rs`
 
 That defaulted methods return `NotSupported` — specifically, not something
 retryable — and that every wrapper (`&T`, `Arc<T>`, `CachedSchemaRegistry<T>`,
@@ -135,7 +174,7 @@ The forwarding impls are macro-generated from one signature list, so a
 half-wired method is already unrepresentable. The count assertion still earns
 its place: it catches a method added to the trait but forgotten in that list.
 
-## 10. Documentation — `README.md` and the site
+## 12. Documentation — `README.md` and the site
 
 `README.md` is included in the crate as a doctest, so every non-`ignore` code
 block in it is compiled on every run. A README that no longer compiles is the
@@ -148,7 +187,7 @@ document, and CI runs `zola check` — which resolves every internal link and
 fetches every external one, so a renamed page or a dead upstream link fails the
 build.
 
-## 11. Benchmarks — `benches/wire.rs`
+## 13. Benchmarks — `benches/wire.rs`
 
 Turn performance claims into measurements. The load-bearing one asserts a cache
 hit is size-independent: if it starts scaling with schema size, a `String` clone
@@ -160,21 +199,19 @@ has crept back in.
 
 Every feature is linted and tested **in isolation** as well as together — a
 `cfg`-gated item that only compiles under `--all-features` is a real bug for
-anyone enabling a single backend. CI runs a 14-way clippy matrix with
-`--all-targets`, tests across three operating systems, and a dedicated MSRV job.
+anyone enabling a single backend. `just clippy` lints thirteen feature sets with
+`--all-targets`, `just test` tests eight, CI adds macOS, Windows and Rust beta,
+and `just msrv` builds and tests on the declared minimum.
 
 ---
 
 ## Running it
 
 ```bash
-cargo test --all-features            # everything
-cargo test --no-default-features     # the core, no transport
-cargo bench                          # benchmarks
-cargo clippy --all-features --all-targets -- -D warnings
-
-zola --root site check                # link-check the documentation site
-
-# Regenerate the cross-language fixtures (needs Docker)
-docker compose -f conformance/docker-compose.yml up --build --abort-on-container-exit
+just ci          # everything CI runs, locally
+just ci-full     # plus cargo-deny, cargo-audit, MSRV, and the Docker conformance harness
+just conformance # regenerate the cross-language fixtures (needs Docker) and diff them
 ```
+
+CI calls the same recipes, and `just ci-parity` fails when a gate recipe has no
+CI step, so the two cannot drift.

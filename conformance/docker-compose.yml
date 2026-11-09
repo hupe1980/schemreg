@@ -10,7 +10,7 @@
 
 services:
   kafka:
-    image: confluentinc/cp-kafka:7.7.1
+    image: confluentinc/cp-kafka:8.4.0
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -32,7 +32,7 @@ services:
       retries: 30
 
   schema-registry:
-    image: confluentinc/cp-schema-registry:7.7.1
+    image: confluentinc/cp-schema-registry:8.4.0
     depends_on:
       kafka:
         condition: service_healthy
@@ -41,7 +41,8 @@ services:
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8081/subjects"]
+      # CP 8 images ship no curl; python3 is there.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/subjects')"]
       interval: 5s
       timeout: 10s
       retries: 30
@@ -55,6 +56,7 @@ services:
         condition: service_healthy
     environment:
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      REGISTRY_IMAGE: confluentinc/cp-schema-registry:8.4.0
     volumes:
       - ../tests/fixtures:/out
     command: ["python", "/app/generate_fixtures.py", "/out/confluent_conformance.json"]

@@ -106,7 +106,7 @@ impl<T: PayloadDecoder> Deserializer for SchemaDeserializer<T> {
         let topic = topic.to_owned();
         Box::pin(async move {
             self.0
-                .decode(payload, &topic, target(is_key))
+                .decode(payload.into(), &topic, target(is_key))
                 .await
                 .map_err(to_krafka)
         })
@@ -257,30 +257,34 @@ let record = ProducerRecord::new("orders", framed.payload)   // no prefix
 producer.send_record(record).await?;
 ```
 
-On the consumer side, read the header and fall back to the payload prefix when
-it is absent — the same header-first order Confluent's own deserializer uses, so
-one consumer reads both old and new producers:
+On the consumer side, hand the decoder the record's value **and** its headers.
+`WireRecord::from_headers` picks the side's schema-id header — the last one, if
+a record carries several — and every decoder reads it before falling back to
+the payload prefix: Confluent's own header-first order, so one consumer reads
+old and new producers alike, with reference resolution, reader schemas and
+validation intact.
 
 ```rust,ignore
-use schemreg::{VALUE_SCHEMA_ID_HEADER, decode_schema_id_header, decode_wire_format_bytes};
+use schemreg::{AvroSchemaDecoder, EncodeTarget, WireRecord};
+
+let decoder = AvroSchemaDecoder::new(Arc::clone(&cached));
 
 for record in consumer.poll(Duration::from_secs(1)).await? {
     let Some(value) = record.value.clone() else { continue };
+    // krafka headers are `(String, Option<Bytes>)`; a null header carries no ID.
+    let headers = record.headers.iter().filter_map(|(k, v)| Some((k, v.as_ref()?)));
 
-    let (key, payload) = match record.header(VALUE_SCHEMA_ID_HEADER.as_bytes()).flatten() {
-        // Header framing: the identifier is beside the payload.
-        Some(header) => (decode_schema_id_header(header)?.0, value),
-        // Prefix framing: the identifier is in front of it.
-        None => decode_wire_format_bytes(&value)?,
-    };
-
-    let schema = cached.get_schema_by_key(key).await?;
-    handle(&schema, &payload);
+    let order = decoder
+        .decode(WireRecord::from_headers(EncodeTarget::Value, value, headers))
+        .await?;
+    handle(order);
 }
 ```
 
-`decode_schema_id_header` also returns the Protobuf message-index path when one
-is present; it is `None` for Avro and JSON Schema.
+The serializer hook above sees only the payload, so it handles prefix-framed
+records; header-mode topics go through a loop like this one. For Protobuf the
+message-index path travels in the header too, and the decoder takes it from
+there.
 
 ## Error handling at the boundary
 

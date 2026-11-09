@@ -87,11 +87,21 @@ pub mod error_code {
 #[non_exhaustive]
 #[derive(Debug, Clone, Error)]
 pub enum SchemaRegError {
-    /// Transport-level failure: TLS, DNS, connection timeout, I/O error.
+    /// Transport-level failure: DNS, connection refused or reset, timeout, I/O.
     ///
     /// These are retryable by callers that implement retry / circuit-breaker logic.
     #[error("network error: {0}")]
     Network(ArcError),
+
+    /// The TLS handshake was refused: an untrusted or invalid certificate, no
+    /// shared protocol version, or a client certificate the server rejected.
+    ///
+    /// **Not** retryable — the same trust configuration fails the same way.
+    /// Fix the CA ([`add_root_certificate`]), the identity, or the TLS floor.
+    ///
+    /// [`add_root_certificate`]: https://docs.rs/schemreg/latest/schemreg/struct.ConfluentSchemaRegistryBuilder.html#method.add_root_certificate
+    #[error("TLS handshake failed: {0}")]
+    Tls(ArcError),
 
     /// The registry rejected the request for authentication / authorisation
     /// reasons (HTTP 401 or 403).
@@ -222,6 +232,12 @@ impl SchemaRegError {
         matches!(self, Self::Network(_))
     }
 
+    /// Returns `true` if the TLS handshake was refused — see [`Tls`](Self::Tls).
+    #[must_use]
+    pub fn is_tls_error(&self) -> bool {
+        matches!(self, Self::Tls(_))
+    }
+
     /// Returns `true` if this is an [`Auth`](Self::Auth) error (HTTP 401/403).
     ///
     /// Auth errors require credential rotation and should **not** be retried.
@@ -340,7 +356,7 @@ impl SchemaRegError {
     ///   well-formed would be classified as permanent while an identical 500
     ///   with an HTML body would be retried.
     ///
-    /// Not retryable: [`Auth`](Self::Auth), [`Config`](Self::Config),
+    /// Not retryable: [`Tls`](Self::Tls), [`Auth`](Self::Auth), [`Config`](Self::Config),
     /// [`WireFormat`](Self::WireFormat), [`NotSupported`](Self::NotSupported),
     /// [`InvalidState`](Self::InvalidState), and every 4xx-range
     /// [`Api`](Self::Api) code — retrying those reproduces the same failure and

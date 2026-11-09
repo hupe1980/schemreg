@@ -27,3 +27,21 @@ REVIEW.md
 
 # Zola build output
 /site/public
+
+# Internal architecture notes. Not published: the `D` and `R` numbers they use
+# are resolvable only inside that folder, so nothing in the published tree may
+# cite one.
+/concepts/
+
+# This project's own feature specifications and the Spec Kit machinery that
+# produces them (`/speckit-*` skills, templates, `.specify/memory/constitution.md`).
+# Same rule as `concepts/`: internal, and the published tree may not cite a path
+# its reader does not have.
+/specs/
+/.specify/
+
+# Agent skills and local tooling state.
+.claude/
+
+# Python bytecode from concepts/check.py.
+__pycache__/

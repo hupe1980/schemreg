@@ -3,19 +3,19 @@ title = "schemreg"
 description = "Async schema registry client for Kafka in Rust. Confluent wire format v0 and v1, schema IDs in Kafka headers, Apicurio Registry v3, and AWS Glue — with Avro, JSON Schema, and Protobuf codecs."
 template = "index.html"
 [extra]
-msrv = "1.88"
+msrv = "1.94.1"
 
 facts = [
-  { value = "537", label = "tests, across eleven layers" },
+  { value = "3 / 3", label = "Confluent placements verified against the official serializers" },
   { value = "0", label = "unsafe blocks — the crate forbids them" },
   { value = "0", label = "dependencies with no feature enabled" },
 ]
 
 stats = [
-  { label = "Tests", value = "537" },
+  { label = "Crypto providers", value = "1" },
   { label = "`unsafe` blocks", value = "0" },
-  { label = "Header decode", value = "1.6 ns" },
-  { label = "Cache hit", value = "14.3 ns" },
+  { label = "Header decode", value = "~5 ns" },
+  { label = "Cache hit", value = "~23 ns" },
 ]
 
 hero_code = '''
@@ -72,8 +72,10 @@ __value_schema_id: 01 8f 14 e4 …
 ]
 
 features = [
-  { title = "Zero-copy framing", body = "Decoding slices the input rather than copying it: 1.6 ns regardless of payload size, and flat across three orders of magnitude. Schemas are held behind `Arc<str>`, so a cache hit costs one atomic increment." },
-  { title = "Verified against the reference", body = "The Confluent framings are pinned to byte sequences produced by the official `confluent-kafka-python` serializers — decoded and re-encoded byte-identically, not just checked against this crate's own reading of the spec." },
+  { title = "Zero-copy framing", body = "Decoding slices the input rather than copying it: ~5 ns regardless of payload size, and flat across three orders of magnitude. Schemas are held behind `Arc<str>`, so a cache hit costs one atomic increment." },
+  { title = "Verified against the reference", body = "The v0 prefix, the v1 prefix and header mode — every Protobuf index shape — are pinned to bytes produced by the official `confluent-kafka-python` serializers on Confluent Platform 8, decoded and re-encoded byte-identically." },
+  { title = "Header-first decoding", body = "Every decoder reads a `__value_schema_id` / `__key_schema_id` header before the payload prefix, exactly like Confluent's deserializers. One `WireRecord` input; plain bytes still just work." },
+  { title = "Post-quantum TLS, one provider", body = "rustls on aws-lc-rs negotiates X25519MLKEM768 by default and trusts the OS store. A refused handshake is a typed, non-retryable error — not a retry storm." },
   { title = "Thundering-herd safe", body = "N concurrent cold misses for one schema issue exactly one backend request. If the leading task is cancelled mid-flight, every waiter is woken with an error rather than left parked forever." },
   { title = "Nothing is invented", body = "A field the registry did not report is `None`, never a plausible-looking default. Asking for GUID framing from a registry that has none is a clear error, not a fabricated identifier." },
   { title = "Descriptor-derived Protobuf paths", body = "The message-index path comes from the compiled descriptor, so it cannot drift when someone reorders the `.proto`. Decoding can reject a payload whose message type is not the one you expected." },

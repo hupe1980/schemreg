@@ -671,11 +671,12 @@ async fn the_decoder_handles_a_guid_framed_record() {
         .parse()
         .expect("valid GUID");
     let address = Value::Record(vec![("city".into(), Value::String("Oslo".into()))]);
-    let body = apache_avro::to_avro_datum(
-        &apache_avro::Schema::parse_str(ADDRESS).expect("ADDRESS is self-contained"),
-        address,
-    )
-    .expect("serialisation succeeds");
+    let address_schema =
+        apache_avro::Schema::parse_str(ADDRESS).expect("ADDRESS is self-contained");
+    let body = apache_avro::writer::datum::GenericDatumWriter::builder(&address_schema)
+        .build()
+        .and_then(|w| w.write_value_to_vec(address))
+        .expect("serialisation succeeds");
 
     let decoded = AvroSchemaDecoder::new(GuidOnly)
         .decode(schemreg::encode_wire_format(guid, &body))
