@@ -13,6 +13,12 @@ Two layers sit on top of the wire format.
 
 The framing layer implements the object-safe `PayloadEncoder` / `PayloadDecoder`
 traits, which is what makes it droppable into a Kafka client's serializer hook.
+
+Every decoder takes a [`WireRecord`](https://docs.rs/schemreg/latest/schemreg/struct.WireRecord.html):
+plain `Bytes` convert into one for prefix-framed records, and
+`WireRecord::from_headers(target, value, headers)` adds the record's schema-id
+header, which is then read first — Confluent's own order. The Protobuf
+message-index path is taken from the header in that case too.
 The typed codecs take a value rather than bytes, so they cannot implement those
 traits — call them directly.
 

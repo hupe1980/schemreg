@@ -61,17 +61,19 @@ allow-wildcard-paths = true
 # untrusted bytes at runtime. Recheck on each dependency bump: each should
 # disappear on its own as upstream migrates.
 skip = [
-    # http 0.2 vs 1.x, forced by the AWS SDK; only present with `glue`.
-    { name = "http", reason = "aws-sigv4 / aws-smithy-http pin http 0.2; reqwest+hyper use 1.x" },
-    { name = "http-body", reason = "transitively pinned alongside http 0.2" },
+    # RustCrypto's digest 0.10 → 0.11 transition: aws-config's SSO cache key
+    # uses sha1 0.10; apache-avro and aws-sigv4 are on sha2/hmac 0.11.
+    { name = "digest", reason = "sha1 0.10 (aws-config) vs sha2/hmac 0.11 (apache-avro, aws-sigv4)" },
+    { name = "block-buffer", reason = "follows digest 0.10 vs 0.11" },
+    { name = "crypto-common", reason = "follows digest 0.10 vs 0.11" },
+    { name = "cpufeatures", reason = "follows sha1 0.10 vs sha2 0.11" },
     # getrandom 0.2 / 0.3 / 0.4 all appear, and r-efi is its UEFI backend —
     # a target this crate is never built for.
-    { name = "getrandom", reason = "ring pins 0.2, jsonschema and rand use 0.3, tempfile and jobserver use 0.4" },
-    { name = "r-efi", reason = "UEFI backend of getrandom; its 0.3 and 0.4 lines pull different majors" },
+    { name = "getrandom", reason = "platform deps on 0.2, ahash on 0.3, rand on 0.4" },
+    { name = "r-efi", reason = "UEFI backend of getrandom; its lines pull different majors" },
     # Proc-macro build graph only — neither version reaches the binary.
+    { name = "heck", reason = "ouroboros_macro (via apache-avro) on 0.4; strum_macros on 0.5" },
     { name = "syn", reason = "bon-macros (via apache-avro) is on syn 3; prost-derive and strum_macros are still on syn 2" },
-    { name = "windows-sys", reason = "several crates pin different windows-sys minor lines" },
-    { name = "hashbrown", reason = "indexmap and std-internal versions differ" },
 ]
 deny = [
     # rustls only — openssl introduces native-library coupling, a much larger
@@ -79,6 +81,10 @@ deny = [
     { name = "openssl", reason = "use rustls" },
     { name = "openssl-sys", reason = "use rustls" },
     { name = "native-tls", reason = "use rustls" },
+    # One crypto provider: rustls runs on aws-lc-rs, the provider the AWS SDK
+    # already links. A second provider doubles the audited surface and makes
+    # rustls' process-default provider ambiguous.
+    { name = "ring", reason = "aws-lc-rs is the crate's only crypto provider" },
     # The crate must never grow a second async runtime.
     { name = "async-std", reason = "schemreg targets tokio exclusively" },
 ]

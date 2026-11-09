@@ -1,8 +1,8 @@
 [package]
 name        = "schemreg"
-version     = "0.6.0"
+version     = "0.7.0"
 edition     = "2024"
-rust-version = "1.88"
+rust-version = "1.94.1"
 authors     = ["hupe1980"]
 description = "Async schema registry client for Kafka — Confluent (schema ID, GUID, and header framing), Apicurio v3, and AWS Glue"
 license     = "MIT OR Apache-2.0"
@@ -28,6 +28,7 @@ confluent        = [
     "serde-impls",
     "dep:serde_json",
     "dep:reqwest",
+    "dep:rustls",
     "dep:zeroize",
     "dep:percent-encoding",
     "dep:base64",
@@ -45,10 +46,6 @@ avro             = ["dep:apache-avro", "serde-impls", "dep:serde_json"]
 # always available without this feature. Only the AWS SDK client
 # (AwsGlueSchemaRegistry) and ZLIB compression require it.
 glue             = ["dep:aws-sdk-glue", "dep:aws-config", "dep:flate2"]
-# Add the platform-native root certificate store to the HTTPS trust anchors,
-# in addition to the bundled webpki roots. Applies to every reqwest-backed
-# client (confluent and apicurio); a no-op if neither is enabled.
-native-tls-roots = ["reqwest?/rustls-tls-native-roots"]
 # Enable JSON Schema encode/decode + Confluent wire-format framing.
 # Uses jsonschema (draft 2020-12) for schema validation and serde_json for
 # serialisation. Pairs JsonSchemaEncoder / JsonSchemaDecoder with any
@@ -67,6 +64,7 @@ apicurio         = [
     "serde-impls",
     "dep:serde_json",
     "dep:reqwest",
+    "dep:rustls",
     "dep:zeroize",
     "dep:percent-encoding",
     "dep:base64",
@@ -101,21 +99,28 @@ parking_lot  = "0.12"
 uuid         = { version = "1", default-features = false, features = ["std"] }
 
 # avro feature
-apache-avro  = { version = "0.21", default-features = false, optional = true }
+apache-avro  = { version = "0.22", default-features = false, optional = true }
 
 # confluent + avro feature (serde is shared)
 serde        = { version = "1", features = ["derive"], optional = true }
 serde_json   = { version = "1", optional = true }
-reqwest      = { version = "0.12", features = ["rustls-tls-webpki-roots"], default-features = false, optional = true }
+# TLS: rustls on aws-lc-rs with the platform verifier (OS trust store). The
+# same provider the AWS SDK uses, so a build with every backend links exactly
+# one crypto library. `ring` is banned in deny.toml.
+reqwest      = { version = "0.13", features = ["rustls"], default-features = false, optional = true }
+# Named directly for two things reqwest does not switch on: the hybrid
+# post-quantum key exchange (X25519MLKEM768) offered first, and recognising a
+# refused handshake in an error chain. Same version reqwest uses.
+rustls       = { version = "0.23", default-features = false, features = ["prefer-post-quantum"], optional = true }
 zeroize      = { version = "1.8", features = ["derive"], optional = true }
 percent-encoding = { version = "2.3", optional = true }
-base64       = { version = "0.22", optional = true }
+base64       = { version = "0.23", optional = true }
 
 # glue feature
 aws-config   = { version = "1", optional = true, default-features = false, features = ["credentials-process", "default-https-client", "rt-tokio", "sso"] }
 aws-sdk-glue = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 flate2       = { version = "1", optional = true }
-jsonschema = { version = "0.46.5", optional = true, default-features = false }
+jsonschema = { version = "0.61", optional = true, default-features = false }
 
 # protobuf feature
 prost        = { version = "0.14", optional = true, default-features = false, features = ["std"] }
@@ -131,6 +136,9 @@ prost-reflect = "0.16"
 parking_lot = "0.12"
 proptest = "1.11.0"
 criterion = { version = "0.8.2", features = ["async_tokio"] }
+# In-process TLS server for tests/tls.rs — aws-lc-rs only, so `ring` stays out.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 
 [[bench]]
 name = "wire"

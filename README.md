@@ -4,7 +4,7 @@
 [![docs.rs](https://docs.rs/schemreg/badge.svg)](https://docs.rs/schemreg)
 [![CI](https://github.com/hupe1980/schemreg/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/schemreg/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#-license)
-[![MSRV: 1.88](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://releases.rs/docs/1.88.0/)
+[![MSRV: 1.94.1](https://img.shields.io/badge/MSRV-1.94.1-blue.svg)](https://releases.rs/docs/1.94.1/)
 
 **Kafka wire formats, exactly.** An async Rust schema-registry client for
 **Confluent Schema Registry** (and Karapace, Redpanda), **Apicurio Registry v3**,
@@ -16,10 +16,11 @@ and **AWS Glue Schema Registry**, with Avro, JSON Schema, and Protobuf codecs.
 
 ---
 
-- ⚡ **Zero-copy framing** — Confluent **v0** (schema ID) *and* **v1** (schema GUID), Protobuf message-index, Glue 18-byte header. Decoding costs 1.6 ns regardless of payload size.
-- 📬 **Schema IDs in Kafka headers** (`__key_schema_id` / `__value_schema_id`), the placement Confluent Platform 8 introduced.
+- ⚡ **Zero-copy framing** — Confluent **v0** (schema ID) *and* **v1** (schema GUID), Protobuf message-index, Glue 18-byte header. Decoding costs ~5 ns regardless of payload size.
+- 📬 **Schema IDs in Kafka headers** (`__key_schema_id` / `__value_schema_id`), the placement Confluent Platform 8 introduced — written by every encoder, read **header-first** by every decoder, exactly like Confluent's own deserializers.
 - 🔐 **Read-only producers** — `SchemaResolution::LookupOnly` frames records without ever writing to the registry. The setting the Java serdes spell `auto.register.schemas=false`.
-- ✅ **Verified against the official serializers**, not just against itself — bytes from `confluent-kafka-python`, decoded *and* re-encoded byte-identically ([conformance harness](conformance/README.md)).
+- ✅ **Verified against the official serializers**, not just against itself — v0, v1 *and* header-mode bytes from `confluent-kafka-python` 2.16.1 on Confluent Platform 8.4, every Protobuf index shape, decoded *and* re-encoded byte-identically ([conformance harness](conformance/README.md)).
+- 🛡️ **Modern TLS, one crypto provider** — rustls on aws-lc-rs with post-quantum key exchange (X25519MLKEM768) negotiated by default, the OS trust store, and no OpenSSL. A refused handshake is `is_tls_error()`, never retried.
 - 🚀 **Bounded caching** with thundering-herd coalescing and cancellation safety. No unbounded map on any message-driven path.
 - 🧬 **Protobuf message-index paths derived from the descriptor**, so they cannot drift from the `.proto`.
 - 🔗 **Schema references resolved transitively**, for both Avro and JSON Schema — writer *and* reader schemas, in any dependency order.
@@ -32,13 +33,12 @@ Everything is opt-in; the default feature set pulls in no transport stack at all
 | Feature | Enables |
 |---|---|
 | *(none)* | 🔧 Core types, both wire codecs, traits, caching |
-| `confluent` | 🌐 Confluent HTTP client + framing encoder, TLS via rustls |
+| `confluent` | 🌐 Confluent HTTP client + framing encoder, TLS via rustls on aws-lc-rs |
 | `apicurio` | 🗂️ Native Apicurio Registry v3 client (`/apis/registry/v3/`) |
 | `glue` | ☁️ AWS Glue SDK client, ZLIB compression |
 | `avro` | 🪶 Avro encode / decode, with transitive schema-reference resolution and reader-schema evolution |
 | `json` | 📋 JSON Schema validate / serialise, with cross-subject `$ref` resolution |
 | `protobuf` | 🧬 Protobuf encode / decode, with descriptor-derived message-index paths |
-| `native-tls-roots` | 🔒 Add the platform root store to the HTTPS trust anchors |
 
 The codecs are independent of the transport features — pair the Avro codec with
 an Apicurio client, or use the Glue framing with no AWS SDK at all.
@@ -70,8 +70,8 @@ With a registry, and a producer that never writes to it:
 ```rust,ignore
 use std::sync::Arc;
 use schemreg::{
-    AvroSchemaEncoder, CachedSchemaRegistry, ConfluentSchemaRegistry,
-    EncodeTarget, SchemaResolution, WireFormatDecoder,
+    AvroSchemaDecoder, AvroSchemaEncoder, CachedSchemaRegistry, ConfluentSchemaRegistry,
+    EncodeTarget, SchemaResolution, WireRecord,
 };
 
 let registry = ConfluentSchemaRegistry::builder()
@@ -91,8 +91,11 @@ let encoder = AvroSchemaEncoder::builder()
 let framed = encoder.encode(order, "orders", EncodeTarget::Value).await?;
 
 // Consumer: one path for whichever framing the producer chose.
-let decoder = WireFormatDecoder::confluent(cached);
-let message = decoder.decode(framed).await?;
+let decoder = AvroSchemaDecoder::new(cached);
+let order = decoder.decode(framed).await?;                       // prefix-framed bytes…
+let order = decoder
+    .decode(WireRecord::from_headers(EncodeTarget::Value, value, headers))
+    .await?;                                                     // …or a header-mode record
 ```
 
 → [Quick start guide](https://hupe1980.github.io/schemreg/docs/quickstart/)
@@ -108,7 +111,7 @@ lookup happens.
 |---|---|---|
 | Confluent **v0** | `0x00` + 4-byte schema ID | every Confluent Platform release |
 | Confluent **v1** | `0x01` + 16-byte schema GUID | Confluent Platform 8 |
-| Kafka header | the same prefix in `__value_schema_id`; payload unframed | Confluent Platform 8 |
+| Kafka header | the same prefix in `__value_schema_id` / `__key_schema_id`; payload unframed — read header-first | Confluent Platform 8 |
 | Protobuf | any of the above + a ZigZag varint message-index array | — |
 | AWS Glue | `0x03` + compression byte + 16-byte version UUID | — |
 
@@ -159,13 +162,16 @@ unframed.
 | Registry | Wire format | Status |
 |---|---|---|
 | Confluent Schema Registry | `0x00`, `0x01`, or a Kafka header | ✅ Native client |
-| Karapace | Confluent-compatible REST, v0 framing | ✅ Via `ConfluentSchemaRegistry` |
-| Redpanda Schema Registry | Confluent-compatible REST, v0 framing | ✅ Via `ConfluentSchemaRegistry` |
+| Karapace | Confluent-compatible REST, v0 framing | ✅ Via `ConfluentSchemaRegistry` ¹ |
+| Redpanda Schema Registry | Confluent-compatible REST, v0 framing | ✅ Via `ConfluentSchemaRegistry` ¹ |
 | Apicurio Registry v3 | Confluent framing; group + artifact addressing | ✅ Native v3 client |
 | Apicurio (compat mode) | Confluent framing and REST API | ✅ Via `ConfluentSchemaRegistry` |
 | AWS Glue Schema Registry | `0x03` + compression + 16-byte UUID | ✅ Native SDK client |
 | Azure Event Hubs Schema Registry | Schema ID out-of-band, own REST API | ⬜ Out of scope |
 | Buf Schema Registry | None — build-time only | ⛔ No runtime framing to implement |
+
+¹ Compatible REST APIs; the CI suite runs against Confluent's own registry and
+mocked REST servers, not against Karapace or Redpanda themselves.
 
 Any type implementing `SchemaRegistryClient` works as a backend. Only four
 methods are required; the rest default to `NotSupported`, which is never
@@ -175,20 +181,24 @@ methods are required; the rest default to `NotSupported`, which is never
 
 ## 🔗 Using it with a Kafka client
 
-`schemreg` produces and consumes `Bytes` — wiring them to a broker is the
-client's job. With [krafka](https://github.com/hupe1980/krafka), a pure-Rust
-async Kafka client, that is a newtype bridging `PayloadEncoder` onto krafka's
-`Serializer` hook:
+`schemreg` produces and consumes `Bytes` — moving them to and from a broker is
+the client's job. With [krafka](https://github.com/hupe1980/krafka), a
+pure-Rust async Kafka client: encode, then send; poll, then decode.
 
 ```rust,ignore
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .value_serializer(Arc::new(SchemaSerializer(encoder)))
-    .build()
-    .await?;
+let framed = encoder.encode(order, "orders", EncodeTarget::Value).await?;
+producer.send(Record::new("orders", framed).key("order-1")).await?;
+
+for record in consumer.poll(Duration::from_secs(1)).await? {
+    let Some(value) = record.value.clone() else { continue };
+    let headers = record.headers.iter().filter_map(|(k, v)| Some((k, v.as_ref()?)));
+    let order = decoder
+        .decode(WireRecord::from_headers(EncodeTarget::Value, value, headers))
+        .await?;
+}
 ```
 
-→ [Kafka integration — the adapter, typed codecs, and header framing](https://hupe1980.github.io/schemreg/docs/kafka-integration/)
+→ [Kafka integration — producing, consuming, header framing, error mapping](https://hupe1980.github.io/schemreg/docs/kafka-integration/)
 
 ## 📖 Examples
 
@@ -220,6 +230,7 @@ cargo run --example schema_resolution --features confluent
 | [hupe1980.github.io/schemreg](https://hupe1980.github.io/schemreg/) | Guides: wire formats, producers, codecs, Kafka integration, caching, backends, resilience, security, performance, testing |
 | [docs.rs/schemreg](https://docs.rs/schemreg) | API reference |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes and breaking changes |
+| [Migrating to 0.7](https://hupe1980.github.io/schemreg/docs/migrating-0-7/) | Upgrading from 0.6.x |
 | [Migrating to 0.6](https://hupe1980.github.io/schemreg/docs/migrating-0-6/) | Upgrading from 0.5.x |
 | [Migrating to 0.5](https://hupe1980.github.io/schemreg/docs/migrating-0-5/) | Upgrading from 0.4.x |
 | [conformance/](conformance/README.md) | The cross-language conformance harness |
@@ -227,12 +238,13 @@ cargo run --example schema_resolution --features confluent
 ## 🤝 Contributing
 
 ```sh
-cargo test --all-features
-cargo clippy --all-features --all-targets -- -D warnings
-cargo fmt --check
-
-zola --root site serve      # the documentation site, at http://127.0.0.1:1111
+just ci           # every check CI runs, locally (needs just, zola, nightly for docs)
+just ci-full      # plus cargo-deny, cargo-audit, the MSRV build and the Docker conformance harness
+just site-serve   # the documentation site, at http://127.0.0.1:1111
 ```
+
+`.github/workflows/ci.yml` calls the same recipes, so a check that passes
+locally cannot fail in CI for a different reason.
 
 Issues and pull requests are welcome. The
 [testing strategy](https://hupe1980.github.io/schemreg/docs/testing/) explains

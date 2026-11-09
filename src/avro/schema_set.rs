@@ -20,8 +20,10 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap};
 
 use apache_avro::Schema as AvroSchema;
-use apache_avro::schema::{Name, Namespace};
+use apache_avro::reader::datum::GenericDatumReader;
+use apache_avro::schema::{Name, NamespaceRef};
 use apache_avro::types::Value;
+use apache_avro::writer::datum::GenericDatumWriter;
 use serde_json::Value as JsonValue;
 
 use crate::error::{Result, SchemaRegError};
@@ -190,13 +192,17 @@ impl ResolvedAvroSchema {
     }
 
     pub(crate) fn serialize(&self, value: Value) -> Result<Vec<u8>> {
-        let result = if self.schemata.is_empty() {
+        let writer = if self.schemata.is_empty() {
             // Skips building a name table per encode; byte-identical output.
-            apache_avro::to_avro_datum(&self.root, value)
+            GenericDatumWriter::builder(&self.root).build()
         } else {
-            apache_avro::to_avro_datum_schemata(&self.root, self.codec_schemata(), value)
+            GenericDatumWriter::builder(&self.root)
+                .schemata(self.codec_schemata())
+                .and_then(|b| b.build())
         };
-        result.map_err(|e| SchemaRegError::wire_format(format!("Avro serialization failed: {e}")))
+        writer
+            .and_then(|w| w.write_value_to_vec(value))
+            .map_err(|e| SchemaRegError::wire_format(format!("Avro serialization failed: {e}")))
     }
 
     /// Decode `bytes` written with this schema, optionally resolving to
@@ -209,25 +215,22 @@ impl ResolvedAvroSchema {
         mut bytes: &[u8],
         reader: Option<&ResolvedAvroSchema>,
     ) -> Result<Value> {
-        let result = match reader {
-            None if self.schemata.is_empty() => {
-                apache_avro::from_avro_datum(&self.root, &mut bytes, None)
-            }
-            None => apache_avro::from_avro_datum_schemata(
-                &self.root,
-                self.codec_schemata(),
-                &mut bytes,
-                None,
-            ),
-            Some(reader) => apache_avro::from_avro_datum_reader_schemata(
-                &self.root,
-                self.codec_schemata(),
-                &mut bytes,
-                Some(&reader.root),
-                reader.codec_schemata(),
-            ),
+        let datum_reader = match reader {
+            None if self.schemata.is_empty() => GenericDatumReader::builder(&self.root).build(),
+            None => GenericDatumReader::builder(&self.root)
+                .writer_schemata(self.codec_schemata())
+                .and_then(|b| b.build()),
+            Some(reader) => GenericDatumReader::builder(&self.root)
+                .writer_schemata(self.codec_schemata())
+                .and_then(|b| {
+                    b.reader_schema(&reader.root)
+                        .reader_schemata(reader.codec_schemata())
+                })
+                .and_then(|b| b.build()),
         };
-        result.map_err(|e| SchemaRegError::wire_format(format!("Avro deserialization failed: {e}")))
+        datum_reader
+            .and_then(|r| r.read_value(&mut bytes))
+            .map_err(|e| SchemaRegError::wire_format(format!("Avro deserialization failed: {e}")))
     }
 }
 
@@ -342,13 +345,13 @@ fn order_schemata(parsed: Vec<AvroSchema>, role: SchemaRole) -> Result<Vec<AvroS
 fn names_of(schema: &AvroSchema) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut defines = BTreeSet::new();
     let mut refs = BTreeSet::new();
-    walk_names(schema, &None, &mut defines, &mut refs);
+    walk_names(schema, None, &mut defines, &mut refs);
     (defines, refs)
 }
 
 fn walk_names(
     schema: &AvroSchema,
-    enclosing: &Namespace,
+    enclosing: NamespaceRef<'_>,
     defines: &mut BTreeSet<String>,
     refs: &mut BTreeSet<String>,
 ) {
@@ -370,9 +373,9 @@ fn walk_names(
             let name = inner.name.fully_qualified_name(enclosing);
             defines.insert(name.fullname(None));
             // A record's namespace becomes the default for its fields.
-            let inner_namespace = name.namespace;
+            let inner_namespace = name.namespace();
             for field in &inner.fields {
-                walk_names(&field.schema, &inner_namespace, defines, refs);
+                walk_names(&field.schema, inner_namespace, defines, refs);
             }
         }
         AvroSchema::Ref { name } => {
@@ -382,7 +385,7 @@ fn walk_names(
     }
 }
 
-fn fullname(name: &Name, enclosing: &Namespace) -> String {
+fn fullname(name: &Name, enclosing: NamespaceRef<'_>) -> String {
     name.fully_qualified_name(enclosing).fullname(None)
 }
 
@@ -390,9 +393,9 @@ fn fullname(name: &Name, enclosing: &Namespace) -> String {
 /// `None` for primitives, unions, arrays, and maps.
 pub(crate) fn name_of(schema: &AvroSchema) -> Option<String> {
     match schema {
-        AvroSchema::Record(inner) => Some(inner.name.fullname(inner.name.namespace.clone())),
-        AvroSchema::Enum(inner) => Some(inner.name.fullname(inner.name.namespace.clone())),
-        AvroSchema::Fixed(inner) => Some(inner.name.fullname(inner.name.namespace.clone())),
+        AvroSchema::Record(inner) => Some(inner.name.fullname(inner.name.namespace())),
+        AvroSchema::Enum(inner) => Some(inner.name.fullname(inner.name.namespace())),
+        AvroSchema::Fixed(inner) => Some(inner.name.fullname(inner.name.namespace())),
         _ => None,
     }
 }

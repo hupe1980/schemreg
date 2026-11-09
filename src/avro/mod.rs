@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! schemreg = { version = "0.6", features = ["avro"] }
+//! schemreg = { version = "0.7", features = ["avro"] }
 //! ```
 //!
 //! # Layered model
@@ -104,7 +104,7 @@ use crate::resolver::{
 use crate::subject::SubjectNameStrategy;
 use crate::traits::SchemaRegistryClient;
 use crate::types::{EncodeTarget, SchemaId, SchemaKey, SchemaReference, SchemaType};
-use crate::wire::{HeaderFramed, decode_wire_format_bytes, encode_wire_format};
+use crate::wire::{HeaderFramed, WireRecord, encode_wire_format, unframe};
 
 /// Default bound on the number of parsed writer schemas an
 /// [`AvroSchemaDecoder`] keeps in memory.
@@ -628,19 +628,23 @@ impl<C: SchemaRegistryClient> AvroSchemaDecoder<C> {
             .await
     }
 
-    /// Decode a Confluent-framed Avro message to a [`Value`].
+    /// Decode an Avro record to a [`Value`].
+    ///
+    /// Pass the record's bytes for prefix framing, or a [`WireRecord`] built
+    /// with [`WireRecord::from_headers`] to honour a schema-id header first —
+    /// the order Confluent's deserializers use.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The wire header is invalid (not Confluent-framed or truncated).
+    /// - The framing is invalid (no prefix and no header, or truncated).
     /// - The schema registry lookup fails.
     /// - The Avro bytes do not conform to the schema.
     /// - A reader schema is configured and the writer schema cannot be resolved to it.
-    pub async fn decode(&self, data: Bytes) -> Result<Value> {
-        let (key, payload) = decode_wire_format_bytes(&data)?;
-        let writer_schema = self.get_avro_schema(key).await?;
-        writer_schema.deserialize(&payload, self.reader_schema.as_deref())
+    pub async fn decode(&self, record: impl Into<WireRecord>) -> Result<Value> {
+        let unframed = unframe(&record.into(), false)?;
+        let writer_schema = self.get_avro_schema(unframed.key).await?;
+        writer_schema.deserialize(&unframed.payload, self.reader_schema.as_deref())
     }
 
     /// Decode a Confluent-framed Avro message and deserialise it into `T`.
@@ -652,8 +656,11 @@ impl<C: SchemaRegistryClient> AvroSchemaDecoder<C> {
     ///
     /// Returns an error if decoding fails, or if the decoded value cannot be
     /// mapped to `T`.
-    pub async fn decode_de<T: for<'de> Deserialize<'de>>(&self, data: Bytes) -> Result<T> {
-        let value = self.decode(data).await?;
+    pub async fn decode_de<T: for<'de> Deserialize<'de>>(
+        &self,
+        record: impl Into<WireRecord>,
+    ) -> Result<T> {
+        let value = self.decode(record).await?;
         apache_avro::from_value::<T>(&value).map_err(|e| {
             SchemaRegError::wire_format(format!(
                 "failed to deserialize Avro value into target type: {e}"

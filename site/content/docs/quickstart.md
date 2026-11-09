@@ -16,18 +16,18 @@ cargo add schemreg --features confluent,avro
 | Feature | Adds |
 |---|---|
 | *(none)* | Core types, both wire codecs, traits, caching |
-| `confluent` | Confluent Schema Registry HTTP client + framing encoder |
+| `confluent` | Confluent Schema Registry HTTP client + framing encoder (TLS: rustls on aws-lc-rs) |
 | `apicurio` | Native Apicurio Registry v3 client (`/apis/registry/v3/`) |
 | `glue` | AWS Glue SDK client, plus ZLIB compression |
 | `avro` | Avro encode/decode with transitive schema-reference resolution |
 | `json` | JSON Schema validate/serialise, with cross-subject `$ref` resolution |
 | `protobuf` | Protobuf encode/decode with descriptor-derived message-index paths |
-| `native-tls-roots` | Trust the platform root store in addition to webpki roots |
 
 The codecs are independent of the transport features: pair the Avro codec with
 an Apicurio client, or use the Glue framing with no AWS SDK at all.
 
-Minimum supported Rust version: **1.88**.
+Minimum supported Rust version: **1.94.1** — the floor the current AWS SDK requires.
+Building the REST clients needs a C compiler (for aws-lc-rs); no CMake, no Go, no OpenSSL.
 
 ## Frame and unframe, with no registry
 

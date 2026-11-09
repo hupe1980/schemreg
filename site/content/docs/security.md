@@ -92,25 +92,49 @@ performs those checks, so a route added later cannot skip them by calling
 
 ## TLS
 
-- rustls only. `grep -rn "danger_accept_invalid" src/` returns nothing: there is
-  no bypass path, not even a feature-gated one.
-- Trust anchors: the Mozilla bundle via webpki-roots, optionally plus the
-  platform store via `native-tls-roots`.
-- Custom CAs are **additive** — they extend the trust set, they cannot replace
-  or disable validation.
-- mTLS via `reqwest::Identity`.
-- `openssl`, `openssl-sys`, and `native-tls` are **banned in `deny.toml`**, so
-  no transitive dependency can quietly swap the TLS stack. Enforced in CI.
-- Redirects bounded to 3. reqwest independently strips `Authorization` on
-  cross-origin redirects, so credentials cannot follow a hostile `Location`.
+| | |
+|---|---|
+| Stack | rustls on **aws-lc-rs** — the provider the AWS SDK already links, so a build with every backend has exactly one. `ring`, `openssl`, `openssl-sys` and `native-tls` are banned in `deny.toml` |
+| Key exchange | the hybrid post-quantum group **X25519MLKEM768** is offered first; `tests/tls.rs` asserts it is what a TLS 1.3 server negotiates |
+| Trust | the **operating system's** trust store via the platform verifier, including enterprise-installed roots and the OS's revocation checks |
+| Private CA | `add_root_certificate` trusts it *in addition to* the OS store; `trust_only_root_certificates` trusts *only* the given roots. Setting both is a `Config` error |
+| Client certificates | `identity(Identity::from_pem(..))` for mutual TLS |
+| Protocol floor | TLS 1.2 (the oldest rustls implements); `require_tls13()` refuses anything older |
+| Refused handshake | `SchemaRegError::Tls` — `is_tls_error()` is true, `is_retryable()` is **false**: an untrusted certificate does not become trusted on the next attempt |
+| Bypass | none. `grep -rn "danger_accept_invalid" src/` returns nothing — not even feature-gated |
 
-### Crypto provider
+Redirects are bounded to 3, and reqwest strips `Authorization` on cross-origin
+redirects, so credentials cannot follow a hostile `Location`.
 
-The provider is **ring**, via `reqwest`'s `rustls-tls-webpki-roots`. There is
-deliberately no `aws-lc-rs` feature: `reqwest` pins ring through that feature
-regardless, so such a flag would add a large C build and change nothing. To use
-`aws-lc-rs`, install it as the process-default `CryptoProvider` in your
-application and depend on `reqwest` with a `-no-provider` feature.
+```rust,ignore
+use schemreg::{ConfluentSchemaRegistry, tls::{Certificate, Identity}};
+
+let registry = ConfluentSchemaRegistry::builder()
+    .url("https://registry.internal:8081")
+    .add_root_certificate(Certificate::from_pem(&std::fs::read("ca.pem")?)?)
+    .identity(Identity::from_pem(&std::fs::read("client.pem")?)?)  // cert chain + key
+    .require_tls13()
+    .build()?;
+```
+
+`schemreg::tls` re-exports reqwest's `Certificate` and `Identity`, so none of
+this needs a direct `reqwest` dependency.
+
+### FIPS
+
+aws-lc-rs has a FIPS 140-3 validated mode, but building it needs CMake and Go,
+so schemreg does not switch it on. An application that must run FIPS-validated
+crypto enables `aws-lc-rs/fips` in its own build and installs
+`rustls::crypto::default_fips_provider()` as the process default before
+building any client.
+
+### Every handshake option is tested against a real server
+
+`tests/tls.rs` runs an in-process rustls server with a CA generated per test:
+trust-only accepts its CA and rejects any other, an added root extends the OS
+store, a TLS 1.2-only server is accepted by default and refused under
+`require_tls13`, mutual TLS fails without the identity and succeeds with it, and
+a refused handshake is attempted exactly once even with retries enabled.
 
 ---
 
@@ -178,7 +202,7 @@ hostile or mistaken `Retry-After: 86400` cannot wedge the caller.
 | Gate | Status |
 |---|---|
 | `cargo deny check` | advisories, licences, bans, sources — **with `all-features`** |
-| `cargo audit --deny warnings` | every push, plus nightly |
+| `cargo audit --deny warnings` | every push and pull request |
 | Licence policy | permissive-only allow-list, every entry comment-justified |
 | Duplicate versions | denied, with justified skips naming the upstream cause |
 | Wildcard versions | denied |

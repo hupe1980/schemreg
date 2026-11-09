@@ -381,6 +381,31 @@ async fn oversized_response_body_is_rejected() {
     );
 }
 
+/// The size guard is a permanent refusal: with retries enabled the oversized
+/// response must still be fetched exactly once, not re-downloaded per attempt.
+#[tokio::test]
+async fn oversized_response_body_is_not_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", SR_CONTENT_TYPE)
+                .set_body_bytes(vec![b'x'; 17 * 1024 * 1024]),
+        )
+        .mount(&server)
+        .await;
+
+    let policy = RetryPolicy::new()
+        .max_retries(3)
+        .base_backoff(Duration::from_millis(1));
+    let err = client_for(&server, policy)
+        .get_schema_by_id(SchemaId::from(1u32))
+        .await
+        .expect_err("a 17 MiB response must be refused");
+    assert!(!err.is_retryable(), "{err}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
 /// A response comfortably under the cap must still work — the guard must not
 /// be so eager that it rejects a large-but-legal schema.
 #[tokio::test]

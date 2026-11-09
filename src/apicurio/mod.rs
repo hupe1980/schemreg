@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SchemaRegError};
 use crate::http::{
-    HttpClient, HttpClientConfig, is_loopback_host, normalize_url, percent_encode,
+    HttpClient, HttpClientConfig, TlsSettings, is_loopback_host, normalize_url, percent_encode,
     reject_embedded_credentials, validate_subject,
 };
 use crate::retry::RetryPolicy;
@@ -266,7 +266,7 @@ impl ApicurioSchemaRegistry {
                  transmitted in cleartext; use HTTPS in production"
             );
         }
-        let client = HttpClient::with_webpki_roots(Some(DEFAULT_REQUEST_TIMEOUT))?;
+        let client = HttpClient::with_timeout(Some(DEFAULT_REQUEST_TIMEOUT))?;
         Ok(Self {
             client,
             base_url: url,
@@ -1187,8 +1187,8 @@ pub struct ApicurioSchemaRegistryBuilder {
     auth: ApicurioAuth,
     request_timeout: Option<Duration>,
     connect_timeout: Option<Duration>,
-    root_certificates: Vec<reqwest::Certificate>,
-    identity: Option<reqwest::Identity>,
+    /// Trust anchors, client identity, protocol floor.
+    tls: TlsSettings,
     /// Maximum idle connections per host kept in the connection pool.
     pool_max_idle_per_host: Option<usize>,
     /// Retry behaviour for transient failures.
@@ -1206,8 +1206,7 @@ impl Default for ApicurioSchemaRegistryBuilder {
             auth: ApicurioAuth::None,
             request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
             connect_timeout: None,
-            root_certificates: Vec::new(),
-            identity: None,
+            tls: TlsSettings::default(),
             pool_max_idle_per_host: None,
             retry_policy: RetryPolicy::default(),
             max_concurrent_requests: None,
@@ -1307,18 +1306,49 @@ impl ApicurioSchemaRegistryBuilder {
         self
     }
 
-    /// Add a custom root CA certificate to trust.
+    /// Trust an additional root CA, on top of the operating system's trust
+    /// store — the usual setup for a registry behind an internal PKI. Call it
+    /// once per CA.
     ///
-    /// Useful when the registry uses a private certificate authority (e.g. an
-    /// internal PKI). Can be called multiple times to trust several CAs.
-    pub fn add_root_certificate(mut self, cert: reqwest::Certificate) -> Self {
-        self.root_certificates.push(cert);
+    /// ```rust,no_run
+    /// # fn f() -> Result<(), Box<dyn std::error::Error>> {
+    /// use schemreg::{ApicurioSchemaRegistry, tls::Certificate};
+    ///
+    /// let registry = ApicurioSchemaRegistry::builder()
+    ///     .url("https://registry.internal:8081")
+    ///     .add_root_certificate(Certificate::from_pem(&std::fs::read("ca.pem")?)?)
+    ///     .build()?;
+    /// # let _ = registry; Ok(()) }
+    /// ```
+    pub fn add_root_certificate(mut self, cert: crate::tls::Certificate) -> Self {
+        self.tls.extra_roots.push(cert);
         self
     }
 
-    /// Set a client certificate and private key for mutual TLS (mTLS).
-    pub fn identity(mut self, identity: reqwest::Identity) -> Self {
-        self.identity = Some(identity);
+    /// Trust **only** these root CAs and ignore the operating system's trust
+    /// store — for a registry that must never be reached through a publicly
+    /// trusted certificate. Cannot be combined with
+    /// [`add_root_certificate`](Self::add_root_certificate).
+    pub fn trust_only_root_certificates(
+        mut self,
+        certs: impl IntoIterator<Item = crate::tls::Certificate>,
+    ) -> Self {
+        self.tls.only_roots = Some(certs.into_iter().collect());
+        self
+    }
+
+    /// Present a client certificate for mutual TLS. Build it with
+    /// [`Identity::from_pem`](crate::tls::Identity::from_pem) from a PEM
+    /// bundle holding the certificate chain and the private key.
+    pub fn identity(mut self, identity: crate::tls::Identity) -> Self {
+        self.tls.identity = Some(identity);
+        self
+    }
+
+    /// Refuse to connect over anything older than TLS 1.3. The default floor
+    /// is TLS 1.2, the oldest version rustls implements.
+    pub fn require_tls13(mut self) -> Self {
+        self.tls.require_tls13 = true;
         self
     }
 
@@ -1386,8 +1416,7 @@ impl ApicurioSchemaRegistryBuilder {
         let client = HttpClient::with_config(HttpClientConfig {
             timeout: self.request_timeout,
             connect_timeout: self.connect_timeout,
-            root_certificates: self.root_certificates,
-            identity: self.identity,
+            tls: self.tls,
             pool_max_idle_per_host: self.pool_max_idle_per_host,
             retry_policy: self.retry_policy,
             max_concurrent_requests: self.max_concurrent_requests,
@@ -1424,8 +1453,7 @@ impl fmt::Debug for ApicurioSchemaRegistryBuilder {
             .field("auth", &auth_desc)
             .field("request_timeout", &self.request_timeout)
             .field("connect_timeout", &self.connect_timeout)
-            .field("root_certificates", &self.root_certificates.len())
-            .field("identity", &self.identity.is_some())
+            .field("tls", &self.tls.describe())
             .field("pool_max_idle_per_host", &self.pool_max_idle_per_host)
             .field("dereference", &self.dereference)
             .finish()
@@ -1473,7 +1501,7 @@ mod tests {
     #[test]
     fn test_debug_masks_credentials() {
         let registry = ApicurioSchemaRegistry {
-            client: HttpClient::with_webpki_roots(None).unwrap(),
+            client: HttpClient::with_timeout(None).unwrap(),
             base_url: "http://localhost:8080".to_string(),
             auth: ApicurioAuth::Bearer {
                 token: zeroize::Zeroizing::new("secret".to_string()),

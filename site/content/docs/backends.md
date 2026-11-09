@@ -7,13 +7,21 @@ weight = 7
 | Registry | Wire format | Status |
 |---|---|---|
 | **Confluent Schema Registry** | `0x00` + 4-byte ID, `0x01` + 16-byte GUID, or a Kafka header (+ Protobuf index) | ✅ Native client |
-| **Karapace** | Confluent-compatible REST, v0 framing | ✅ Use `ConfluentSchemaRegistry` |
-| **Redpanda Schema Registry** | Confluent-compatible REST, v0 framing | ✅ Use `ConfluentSchemaRegistry` |
+| **Karapace** | Confluent-compatible REST, v0 framing | ✅ Use `ConfluentSchemaRegistry` ¹ |
+| **Redpanda Schema Registry** | Confluent-compatible REST, v0 framing | ✅ Use `ConfluentSchemaRegistry` ¹ |
 | **Apicurio Registry v3** | Confluent framing; group + artifact addressing | ✅ Native v3 client |
 | **Apicurio (ccompat)** | Confluent framing and REST | ✅ Use `ConfluentSchemaRegistry` against the ccompat base path |
 | **AWS Glue Schema Registry** | `0x03` + compression + 16-byte UUID | ✅ Native SDK client |
 | **Azure Event Hubs SR** | Schema GUID out-of-band, own REST API | ⬜ Out of scope — see below |
 | **Buf Schema Registry** | none — build-time only | ⛔ No runtime framing exists |
+
+¹ Their REST APIs are Confluent-compatible; the CI suite runs against
+Confluent's own registry and mocked REST servers, not against Karapace or
+Redpanda themselves.
+
+Both REST clients share one TLS stack — rustls on aws-lc-rs, the OS trust
+store, `add_root_certificate` / `trust_only_root_certificates` /
+`identity` / `require_tls13` on the builder. See [Security](@/docs/security.md#tls).
 
 ## Confluent vs Apicurio native
 

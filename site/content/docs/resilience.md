@@ -17,7 +17,8 @@ reason.
 | HTTP 5xx | Retried; `Retry-After` honoured, else exponential back-off |
 | Registry `5xxxx` error codes | Retried — a failed backing store, an internal timeout, a leaderless cluster |
 | Transport errors | Retried (connection reset, timeout, DNS) |
-| 4xx, auth, invalid or incompatible schema | **Never** retried |
+| Refused TLS handshake | **Never** retried — an untrusted certificate stays untrusted |
+| 4xx, auth, invalid or incompatible schema, a response over the size cap | **Never** retried |
 
 ```rust,ignore
 use std::time::Duration;
@@ -89,7 +90,8 @@ on Karapace.
 | `is_incompatible` | 40901 — well-formed, but the subject's policy forbids the change |
 | `is_invalid_schema` | 42201, 42209 — malformed, or over the registry's size limit |
 | `is_auth_error` | HTTP 401 / 403 |
-| `is_retryable` | Transport, 429, 5xx, and the registry's `5xxxx` range |
+| `is_tls_error` | The TLS handshake was refused: unknown CA, no shared version, rejected client certificate |
+| `is_retryable` | Transport (not TLS), 429, 5xx, and the registry's `5xxxx` range |
 | `is_not_supported` | The backend does not implement that operation |
 
 `is_incompatible` and `is_invalid_schema` are deliberately distinct: a schema

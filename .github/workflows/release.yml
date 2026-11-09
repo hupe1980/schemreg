@@ -8,74 +8,65 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   # ── Preflight ─────────────────────────────────────────────────────────────
+  #
+  # The same gate CI runs, on the tagged commit — not a smaller copy of it.
   preflight:
-    name: Preflight checks
+    name: Preflight (just ci)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt, clippy
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: rustup default stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,zola@0.23.2,cargo-deny
+      - run: just ci
+      - run: just deny
 
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Clippy (all features)
-        run: cargo clippy --all-features -- -D warnings
-
-      - name: Tests (all features)
-        run: cargo test --all-features
-
-      - name: Docs (all features)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
-
-      - name: Tests (no default features)
-        run: cargo test --no-default-features
+      - name: Verify the tag, Cargo.toml and CHANGELOG agree
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$CRATE_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Cargo.toml version ($CRATE_VERSION) != tag ($TAG_VERSION)"; exit 1
+          fi
+          if ! grep -q "^## \[${TAG_VERSION}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${TAG_VERSION}]' section."; exit 1
+          fi
 
       # A packaged crate can differ from the working tree: `exclude` rules,
-      # missing files, a stale Cargo.lock. Publishing with --no-verify skips
-      # that check, so do it explicitly here instead.
+      # missing files, a stale Cargo.lock.
       - name: Verify the packaged crate builds
         run: cargo publish --dry-run --all-features
 
-      - name: Verify CHANGELOG has an entry for this version
-        run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if ! grep -q "^## \[${TAG_VERSION}\]" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md has no '## [${TAG_VERSION}]' section."
-            echo "Every release needs migration notes — this crate is pre-1.0"
-            echo "and ships deliberate breaking changes."
-            exit 1
-          fi
-          echo "CHANGELOG entry found for ${TAG_VERSION}"
-
-      # Verify the version tag matches the crate version in Cargo.toml.
-      - name: Verify crate version matches tag
-        run: |
-          CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[0].version')
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if [ "$CRATE_VERSION" != "$TAG_VERSION" ]; then
-            echo "ERROR: Cargo.toml version ($CRATE_VERSION) != tag ($TAG_VERSION)"
-            exit 1
-          fi
-          echo "Version OK: $CRATE_VERSION"
-
   # ── Publish ───────────────────────────────────────────────────────────────
+  #
+  # crates.io Trusted Publishing: the job's OIDC identity is exchanged for a
+  # short-lived token, so no long-lived registry secret is needed. Configured on
+  # crates.io for repository hupe1980/schemreg, workflow release.yml,
+  # environment crates-io.
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     needs: preflight
     environment: crates-io
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Publish
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --no-verify
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
