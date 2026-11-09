@@ -1,276 +1,66 @@
 +++
 title = "Using it with a Kafka client"
-description = "Wire schemreg into the krafka Kafka client: a Serializer/Deserializer adapter with production-grade error mapping, typed Avro codecs, and schema IDs in Kafka record headers."
+description = "Wire schemreg into a Kafka client — shown with krafka: encode before the send, decode after the poll, schema IDs in record headers, and error mapping at the boundary."
 weight = 5
 +++
 
-`schemreg` produces and consumes [`bytes::Bytes`]. It is not a Kafka client, and
-it never opens a connection to a broker — wiring the framed bytes to a topic is
-the client's job.
+`schemreg` produces and consumes [`bytes::Bytes`]. It is not a Kafka client and
+never talks to a broker — moving framed bytes to and from a topic is the
+client's job. The examples use [krafka](https://github.com/hupe1980/krafka)
+0.28, a pure-Rust async Kafka client; the pattern is the same for any client.
 
-This page shows that wiring for [krafka], a pure-Rust async Kafka client. The
-same shape applies to any client that exposes a serializer hook; only the trait
-names change.
+[`bytes::Bytes`]: https://docs.rs/bytes/latest/bytes/struct.Bytes.html
 
-[`bytes::Bytes`]: https://docs.rs/bytes
-[krafka]: https://github.com/hupe1980/krafka
+## Produce: encode, then send
 
-## Why they are separate crates
-
-A schema registry is a different service from a Kafka broker: different
-protocol, different auth model, different release cadence. Every mature client
-draws the line in the same place — Java's `kafka-clients` ships no registry
-support (`kafka-avro-serializer` is a separate artifact), librdkafka has none
-(`libschemaregistry` is separate), and franz-go keeps `pkg/sr` out of `kgo`.
-
-What a client owns is the *place* the transformation happens. krafka spells that
-[`Serializer`] and [`Deserializer`], the equivalent of Java's `key.serializer` /
-`value.serializer`. `schemreg` fills it.
-
-[`Serializer`]: https://docs.rs/krafka/latest/krafka/serdes/trait.Serializer.html
-[`Deserializer`]: https://docs.rs/krafka/latest/krafka/serdes/trait.Deserializer.html
-
-```sh
-cargo add krafka
-cargo add schemreg --features confluent,avro
-```
-
-## The adapter
-
-The two traits are the same shape — `Bytes` in, `Bytes` out, plus the topic and
-a key/value flag — so the bridge is a newtype. The error mapping is the only
-part that needs thought.
+schemreg's encoders are async — the first encode for a subject may contact the
+registry, later ones hit the cache. Encode, then hand the bytes to the producer:
 
 ```rust,ignore
-use std::future::Future;
-use std::io;
-use std::pin::Pin;
-
-use bytes::Bytes;
-use krafka::serdes::{Deserializer, Serializer};
-use krafka::KrafkaError;
-use schemreg::{EncodeTarget, PayloadDecoder, PayloadEncoder, SchemaRegError};
-
-/// Bridges a `schemreg` encoder into krafka's producer hook.
-pub struct SchemaSerializer<T>(pub T);
-
-/// Bridges a `schemreg` decoder into krafka's consumer hook.
-pub struct SchemaDeserializer<T>(pub T);
-
-/// Preserve the retry classification across the boundary.
-///
-/// `KrafkaError::is_retriable()` drives krafka's own retry logic, and it reads
-/// `Network` and `Timeout` as transient and everything else as permanent. If
-/// every registry failure collapsed into one variant, an unreachable registry
-/// would be given up on and an incompatible schema would be retried forever —
-/// so map the two classes apart. `SchemaRegError::is_retryable()` already
-/// answers exactly that question.
-fn to_krafka(err: SchemaRegError) -> KrafkaError {
-    if err.is_retryable() {
-        KrafkaError::network(io::Error::other(err.to_string()))
-    } else {
-        KrafkaError::serialization(err.to_string())
-    }
-}
-
-fn target(is_key: bool) -> EncodeTarget {
-    if is_key { EncodeTarget::Key } else { EncodeTarget::Value }
-}
-
-impl<T: PayloadEncoder> Serializer for SchemaSerializer<T> {
-    fn serialize(
-        &self,
-        payload: Bytes,
-        topic: &str,
-        record_name: Option<&str>,
-        is_key: bool,
-    ) -> Pin<Box<dyn Future<Output = krafka::Result<Bytes>> + Send + '_>> {
-        let topic = topic.to_owned();
-        let record_name = record_name.map(str::to_owned);
-        Box::pin(async move {
-            self.0
-                .encode(payload, &topic, record_name.as_deref(), target(is_key))
-                .await
-                .map_err(to_krafka)
-        })
-    }
-}
-
-impl<T: PayloadDecoder> Deserializer for SchemaDeserializer<T> {
-    fn deserialize(
-        &self,
-        payload: Bytes,
-        topic: &str,
-        is_key: bool,
-    ) -> Pin<Box<dyn Future<Output = krafka::Result<Bytes>> + Send + '_>> {
-        let topic = topic.to_owned();
-        Box::pin(async move {
-            self.0
-                .decode(payload.into(), &topic, target(is_key))
-                .await
-                .map_err(to_krafka)
-        })
-    }
-}
-```
-
-`Deserializer` takes no `record_name`: on the read path the framing itself names
-the schema, which is why a registry decoder needs no hint.
-
-## Wiring it in
-
-`ConfluentSchemaEncoder` implements [`PayloadEncoder`] and `WireFormatDecoder`
-implements [`PayloadDecoder`], so both drop straight into the hooks. Share one
-`CachedSchemaRegistry` between them — the producer's subject lookups and the
-consumer's ID lookups then warm the same cache.
-
-[`PayloadEncoder`]: https://docs.rs/schemreg/latest/schemreg/traits/trait.PayloadEncoder.html
-[`PayloadDecoder`]: https://docs.rs/schemreg/latest/schemreg/traits/trait.PayloadDecoder.html
-
-```rust,ignore
-use std::sync::Arc;
-use std::time::Duration;
-
-use krafka::consumer::Consumer;
-use krafka::producer::{Producer, ProducerRecord};
-use schemreg::{
-    CachedSchemaRegistry, ConfluentSchemaEncoder, ConfluentSchemaRegistry,
-    SchemaResolution, SchemaType, WireFormatDecoder,
-};
-
-let registry = ConfluentSchemaRegistry::builder()
-    .url("https://registry.example.com")
-    .basic_auth("user", "password")
-    .build()?;
-let cached = Arc::new(CachedSchemaRegistry::new(registry));
-
-let encoder = ConfluentSchemaEncoder::builder()
-    .registry(Arc::clone(&cached))
-    .schema(ORDER_SCHEMA, SchemaType::Avro)
-    .resolution(SchemaResolution::LookupOnly)   // never writes to the registry
-    .build()?;
-
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .value_serializer(Arc::new(SchemaSerializer(encoder)))
-    .build()
-    .await?;
-
-let consumer = Consumer::builder()
-    .bootstrap_servers("localhost:9092")
-    .group_id("orders")
-    .value_deserializer(Arc::new(SchemaDeserializer(WireFormatDecoder::confluent(cached))))
-    .build()
-    .await?;
-```
-
-From here `send` frames every value on the way out and `poll` unframes it on the
-way in. The application only ever sees payload bytes:
-
-```rust,ignore
-producer.send("orders", Some(b"order-1"), &avro_bytes).await?;
-
-consumer.subscribe(&["orders"]).await?;
-for record in consumer.poll(Duration::from_secs(1)).await? {
-    let Some(payload) = record.value else { continue };   // already unframed
-    handle(&payload);
-}
-```
-
-### Subject strategies that need a record name
-
-`SubjectNameStrategy::RecordName` and `TopicRecordName` derive the subject from
-the record's type, not its topic. krafka carries that through as
-[`ProducerRecord::record_name`], which the adapter above forwards:
-
-[`ProducerRecord::record_name`]: https://docs.rs/krafka/latest/krafka/producer/struct.ProducerRecord.html
-
-```rust,ignore
-let record = ProducerRecord::new("orders", avro_bytes)
-    .with_key("order-1")
-    .with_record_name("com.example.Order");
-
-producer.send_record(record).await?;
-```
-
-Leave it unset for the default `TopicName` strategy, which ignores it.
-
-## Typed codecs
-
-The serializer hook is `Bytes -> Bytes`, so it fits the framing-only encoders.
-The typed codecs — `AvroSchemaEncoder`, `JsonSchemaEncoder`,
-`ProtobufSchemaEncoder` — take a *value*, not bytes, so they cannot implement
-`PayloadEncoder`. Call them directly and send the result:
-
-```rust,ignore
-use apache_avro::types::Value;
-use schemreg::{AvroSchemaDecoder, AvroSchemaEncoder, EncodeTarget};
+use krafka::producer::Record;
+use schemreg::{AvroSchemaEncoder, EncodeTarget, SchemaResolution};
 
 let encoder = AvroSchemaEncoder::builder()
-    .registry(Arc::clone(&cached))
+    .registry(Arc::clone(&registry))           // a CachedSchemaRegistry
     .schema(ORDER_SCHEMA)
-    .resolution(SchemaResolution::LookupOnly)
+    .resolution(SchemaResolution::LookupOnly)  // never writes to the registry
     .build()?;
-let decoder = AvroSchemaDecoder::new(Arc::clone(&cached));
 
-// Producer: serialise and frame in one step, then send the framed bytes.
 let framed = encoder.encode(order, "orders", EncodeTarget::Value).await?;
-producer.send("orders", Some(b"order-1"), &framed).await?;
-
-// Consumer: no value_deserializer configured — decode the raw record instead.
-for record in consumer.poll(Duration::from_secs(1)).await? {
-    let Some(bytes) = record.value else { continue };
-    let value: Value = decoder.decode(bytes).await?;
-}
+producer.send(Record::new("orders", framed).key("order-1")).await?;
 ```
 
-Pick one or the other per topic. Configuring a `value_serializer` *and* framing
-by hand would frame the record twice.
-
-## Schema IDs in Kafka headers
-
-Confluent Platform 8 can carry the identifier in a record header instead of in
-the payload prefix. That placement cannot go through the serializer hook — the
-hook only rewrites the payload, and here the payload is the part that stays
-untouched — so build the record explicitly.
-
-`encode_with_header` returns all three pieces at once, which is what keeps the
-header and the payload from drifting apart:
+To put the schema ID in a record header instead — Confluent Platform 8's
+placement — use `encode_with_header`; the payload stays unframed:
 
 ```rust,ignore
-use schemreg::Framing;
-
-let encoder = AvroSchemaEncoder::builder()
-    .registry(Arc::clone(&cached))
-    .schema(ORDER_SCHEMA)
-    .framing(Framing::SchemaGuid)   // Confluent's header serializer emits GUIDs
-    .build()?;
-
-let framed = encoder
-    .encode_with_header(order, "orders", EncodeTarget::Value)
+let framed = encoder.encode_with_header(order, "orders", EncodeTarget::Value).await?;
+producer
+    .send(
+        Record::new("orders", framed.payload)
+            .key("order-1")
+            .header(framed.header_name, framed.header_value),
+    )
     .await?;
-
-let record = ProducerRecord::new("orders", framed.payload)   // no prefix
-    .with_key("order-1")
-    .with_header(framed.header_name, framed.header_value);
-
-producer.send_record(record).await?;
 ```
 
-On the consumer side, hand the decoder the record's value **and** its headers.
-`WireRecord::from_headers` picks the side's schema-id header — the last one, if
-a record carries several — and every decoder reads it before falling back to
-the payload prefix: Confluent's own header-first order, so one consumer reads
-old and new producers alike, with reference resolution, reader schemas and
-validation intact.
+With `.framing(Framing::SchemaGuid)` the header carries the schema GUID, which
+is what Confluent's own header serializer writes.
+
+## Consume: poll, then decode
+
+Hand each record's value and headers to a decoder. `WireRecord::from_headers`
+picks the schema-id header — the last one, if repeated — and the decoder reads
+it before falling back to the payload prefix, as Confluent's deserializers do.
+One consumer therefore reads prefix-framed and header-framed producers alike.
 
 ```rust,ignore
 use schemreg::{AvroSchemaDecoder, EncodeTarget, WireRecord};
 
-let decoder = AvroSchemaDecoder::new(Arc::clone(&cached));
+let decoder = AvroSchemaDecoder::new(Arc::clone(&registry));
 
 for record in consumer.poll(Duration::from_secs(1)).await? {
-    let Some(value) = record.value.clone() else { continue };
+    let Some(value) = record.value.clone() else { continue };   // tombstone
     // krafka headers are `(String, Option<Bytes>)`; a null header carries no ID.
     let headers = record.headers.iter().filter_map(|(k, v)| Some((k, v.as_ref()?)));
 
@@ -281,29 +71,29 @@ for record in consumer.poll(Duration::from_secs(1)).await? {
 }
 ```
 
-The serializer hook above sees only the payload, so it handles prefix-framed
-records; header-mode topics go through a loop like this one. For Protobuf the
-message-index path travels in the header too, and the decoder takes it from
-there.
+Share one `CachedSchemaRegistry` between producer and consumer: subject lookups
+and ID lookups then warm the same cache.
+
+## Why not the client's serializer hooks?
+
+krafka's `Serializer<T>` and `Deserializer` hooks are synchronous, and
+schemreg's codecs are async — a cold schema means a registry round-trip. Until
+schemreg offers a cache-only synchronous path, encode before the send and
+decode after the poll, as above. Clients with async hooks can wrap the
+object-safe `PayloadEncoder` / `PayloadDecoder` traits directly.
 
 ## Error handling at the boundary
 
-krafka reports a value that could not be decoded as
-`KrafkaError::RecordDeserialization`, carrying the topic, partition, and offset
-— which is what lets a consumer seek past a permanently undecodable record
-rather than stalling the partition on it.
+Classify with the predicates, not by message text:
 
-The mapping in the adapter is what makes that classification meaningful:
+| `schemreg` condition | Predicate | Worth retrying? |
+|---|---|---|
+| Registry unreachable, HTTP 5xx, 429 | `is_retryable()` | yes — schemreg already retried with back-off; one more attempt at a higher level is reasonable |
+| TLS handshake refused | `is_tls_error()` | no — fix the trust configuration |
+| Subject or schema not found | `is_not_found()` | no |
+| Auth rejected | `is_auth_error()` | no |
+| Incompatible or invalid schema | `is_incompatible()`, `is_invalid_schema()` | no |
+| Malformed framing | `WireFormat` | no — skip the record; it will not decode next time either |
 
-| `schemreg` condition | `is_retryable()` | Mapped to | krafka's `is_retriable()` |
-|---|---|---|---|
-| Registry unreachable, HTTP 5xx, 429 | `true` | `KrafkaError::Network` | `true` |
-| Subject or schema not found | `false` | `KrafkaError::Serialization` | `false` |
-| Auth rejected | `false` | `KrafkaError::Serialization` | `false` |
-| Incompatible or invalid schema | `false` | `KrafkaError::Serialization` | `false` |
-
-`schemreg` already retries transport failures internally with jittered back-off
-(see [Resilience](@/docs/resilience.md)), so an error that reaches this boundary
-has usually exhausted that budget. Mapping it to a retriable krafka error gives
-the send one more chance at a higher level; mapping a permanent failure to a
-retriable one would spin forever.
+On the consumer side, a record that fails permanently should be skipped (or
+routed to a dead-letter topic) rather than retried, or it stalls its partition.

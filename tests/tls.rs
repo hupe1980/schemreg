@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair};
 use schemreg::tls::{Certificate, Identity};
 use schemreg::{ConfluentSchemaRegistry, ConfluentSchemaRegistryBuilder, RetryPolicy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -33,20 +33,29 @@ struct Pki {
     client_identity_pem: String,
 }
 
+/// Parameters with their own subject name. rcgen's default subject is the
+/// same for every certificate, and a leaf whose issuer equals its subject is
+/// read as self-signed by Windows' chain builder.
+fn params(common_name: &str, subject_alt_names: Vec<String>) -> CertificateParams {
+    let mut params = CertificateParams::new(subject_alt_names).unwrap();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
+    params
+}
+
 fn pki() -> Pki {
-    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    let mut ca_params = params("schemreg test CA", Vec::new());
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
 
     let server_key = KeyPair::generate().unwrap();
-    let server_cert = CertificateParams::new(vec!["127.0.0.1".to_string()])
-        .unwrap()
+    let server_cert = params("schemreg test server", vec!["127.0.0.1".to_string()])
         .signed_by(&server_key, &ca)
         .unwrap();
 
     let client_key = KeyPair::generate().unwrap();
-    let client_cert = CertificateParams::new(vec!["client".to_string()])
-        .unwrap()
+    let client_cert = params("schemreg test client", vec!["client".to_string()])
         .signed_by(&client_key, &ca)
         .unwrap();
 

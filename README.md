@@ -181,20 +181,24 @@ methods are required; the rest default to `NotSupported`, which is never
 
 ## 🔗 Using it with a Kafka client
 
-`schemreg` produces and consumes `Bytes` — wiring them to a broker is the
-client's job. With [krafka](https://github.com/hupe1980/krafka), a pure-Rust
-async Kafka client, that is a newtype bridging `PayloadEncoder` onto krafka's
-`Serializer` hook:
+`schemreg` produces and consumes `Bytes` — moving them to and from a broker is
+the client's job. With [krafka](https://github.com/hupe1980/krafka), a
+pure-Rust async Kafka client: encode, then send; poll, then decode.
 
 ```rust,ignore
-let producer = Producer::builder()
-    .bootstrap_servers("localhost:9092")
-    .value_serializer(Arc::new(SchemaSerializer(encoder)))
-    .build()
-    .await?;
+let framed = encoder.encode(order, "orders", EncodeTarget::Value).await?;
+producer.send(Record::new("orders", framed).key("order-1")).await?;
+
+for record in consumer.poll(Duration::from_secs(1)).await? {
+    let Some(value) = record.value.clone() else { continue };
+    let headers = record.headers.iter().filter_map(|(k, v)| Some((k, v.as_ref()?)));
+    let order = decoder
+        .decode(WireRecord::from_headers(EncodeTarget::Value, value, headers))
+        .await?;
+}
 ```
 
-→ [Kafka integration — the adapter, typed codecs, and header framing](https://hupe1980.github.io/schemreg/docs/kafka-integration/)
+→ [Kafka integration — producing, consuming, header framing, error mapping](https://hupe1980.github.io/schemreg/docs/kafka-integration/)
 
 ## 📖 Examples
 
